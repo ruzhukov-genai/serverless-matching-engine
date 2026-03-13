@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use sme_shared::{
-    cache, engine::match_order, streams, Order, OrderStatus, OrderType, Pair, Side,
+    cache, engine::match_order, lock, streams, Order, OrderStatus, OrderType, Pair, Side,
     SelfTradePreventionMode, TimeInForce, Trade,
 };
 
@@ -211,19 +211,21 @@ pub async fn create_order(
         updated_at: now,
     };
 
-    // 1. Validate
+    // 1. Validate (outside lock — read-only, fast)
     validate_order_request(&s.pg, &order).await?;
 
-    // 2. Insert to DB
+    // 2. Insert to DB (outside lock — unique ID, idempotent)
     insert_order_db(&s.pg, &order).await?;
 
-    // 3. Lock balance
+    // 3. Lock balance in DB (outside lock — per-user, not per-pair)
     lock_balance(&s.pg, &order).await?;
 
-    // 4. Save to Dragonfly cache
-    cache::save_order_to_book(&s.dragonfly, &order).await?;
+    // ── ACQUIRE PER-PAIR LOCK ─────────────────────────────────────────────
+    // Everything that touches the order book cache must be inside the lock.
+    let worker_id = format!("api-{}", order.id);
+    let guard = lock::acquire_lock(&s.dragonfly, &req.pair_id, &worker_id).await?;
 
-    // 5. Load opposite side of the book
+    // 4. Load opposite side of the book
     let opposite_side = order.side.opposite();
     let mut book = cache::load_order_book(&s.dragonfly, &req.pair_id, opposite_side).await?;
 
@@ -236,20 +238,21 @@ pub async fn create_order(
             .then_with(|| a.created_at.cmp(&b.created_at))
     });
 
-    // 6. Match inline
+    // 5. Match inline
     let result = match_order(&order, &mut book);
     order = result.incoming.clone();
 
-    // 7. Handle FOK rollback
+    // 6. Handle FOK rollback
     if req.order_type == OrderType::Limit
         && tif == TimeInForce::FOK
         && result.trades.is_empty()
         && order.status == OrderStatus::Cancelled
     {
-        // Rollback: cancel order, release locked balance
+        // Release lock before DB cleanup (no book mutation needed)
+        guard.release().await;
+
         cancel_order_in_db(&s.pg, order.id).await?;
         release_locked_balance(&s.pg, &order).await?;
-        cache::remove_order_from_book(&s.dragonfly, &order).await?;
         return Ok((
             StatusCode::OK,
             Json(json!({
@@ -260,18 +263,8 @@ pub async fn create_order(
         ));
     }
 
-    let mut trade_jsons: Vec<Value> = Vec::new();
-
-    // 8. For each trade: insert to DB, update balances
-    for trade in &result.trades {
-        insert_trade_db(&s.pg, trade).await?;
-        settle_trade_balances(&s.pg, trade).await?;
-        trade_jsons.push(trade_to_json(trade));
-    }
-
-    // 9. Update matched resting orders in cache + DB
+    // 7. Update matched resting orders in cache (INSIDE lock)
     for upd in &result.book_updates {
-        update_order_db(&s.pg, upd).await?;
         if upd.status == OrderStatus::Filled || upd.status == OrderStatus::Cancelled {
             cache::remove_order_from_book(&s.dragonfly, upd).await?;
         } else {
@@ -279,17 +272,34 @@ pub async fn create_order(
         }
     }
 
-    // 10. Update incoming order in DB + cache
-    update_order_db(&s.pg, &order).await?;
+    // 8. Update incoming order in cache (INSIDE lock)
+    // Only save to book if it will rest (GTC with remaining qty)
     if order.status == OrderStatus::New || order.status == OrderStatus::PartiallyFilled {
-        // GTC remainder stays in book (already saved in step 4, update with new remaining)
         cache::save_order_to_book(&s.dragonfly, &order).await?;
-    } else {
-        // Filled, Cancelled — remove from book
-        cache::remove_order_from_book(&s.dragonfly, &order).await?;
-        if order.status == OrderStatus::Cancelled || order.status == OrderStatus::Filled {
-            release_remaining_locked(&s.pg, &order).await?;
-        }
+    }
+    // Filled/Cancelled orders do NOT go into the book
+
+    // 9. Bump version counter (INSIDE lock)
+    cache::increment_version(&s.dragonfly, &req.pair_id).await?;
+
+    // ── RELEASE LOCK ──────────────────────────────────────────────────────
+    guard.release().await;
+
+    // 10. Persist to DB (outside lock — DB is the source of truth)
+    let mut trade_jsons: Vec<Value> = Vec::new();
+    for trade in &result.trades {
+        insert_trade_db(&s.pg, trade).await?;
+        settle_trade_balances(&s.pg, trade).await?;
+        trade_jsons.push(trade_to_json(trade));
+    }
+
+    for upd in &result.book_updates {
+        update_order_db(&s.pg, upd).await?;
+    }
+
+    update_order_db(&s.pg, &order).await?;
+    if order.status == OrderStatus::Cancelled || order.status == OrderStatus::Filled {
+        release_remaining_locked(&s.pg, &order).await?;
     }
 
     Ok((
@@ -315,9 +325,25 @@ pub async fn cancel_order(
         return Ok(Json(json!({"error": "order not cancellable", "status": format!("{:?}", order.status)})));
     }
 
+    // Acquire lock — cancel must be atomic with respect to matching
+    let worker_id = format!("cancel-{order_id}");
+    let guard = lock::acquire_lock(&s.dragonfly, &order.pair_id, &worker_id).await?;
+
+    // Re-check status inside lock (order may have been filled between load and lock)
+    let order = load_order_db(&s.pg, order_id).await?
+        .ok_or_else(|| anyhow::anyhow!("order not found"))?;
+    if order.status != OrderStatus::New && order.status != OrderStatus::PartiallyFilled {
+        guard.release().await;
+        return Ok(Json(json!({"error": "order not cancellable", "status": format!("{:?}", order.status)})));
+    }
+
+    cache::remove_order_from_book(&s.dragonfly, &order).await?;
+    cache::increment_version(&s.dragonfly, &order.pair_id).await?;
+    guard.release().await;
+
+    // DB updates outside lock
     cancel_order_in_db(&s.pg, order_id).await?;
     release_locked_balance(&s.pg, &order).await?;
-    cache::remove_order_from_book(&s.dragonfly, &order).await?;
 
     Ok(Json(json!({ "status": "cancelled", "order_id": order_id.to_string() })))
 }
@@ -327,7 +353,7 @@ pub async fn cancel_order(
 pub async fn modify_order(
     Path(order_id): Path<Uuid>,
     State(s): State<AppState>,
-    Json(req): Json<CreateOrderRequest>,
+    Json(_req): Json<CreateOrderRequest>,
 ) -> HandlerResult<impl IntoResponse> {
     // Cancel the old order
     let old_order = load_order_db(&s.pg, order_id).await?
@@ -337,9 +363,25 @@ pub async fn modify_order(
         return Ok(Json(json!({"error": "order not modifiable"})));
     }
 
+    // Acquire lock — must be atomic with respect to matching
+    let worker_id = format!("modify-{order_id}");
+    let guard = lock::acquire_lock(&s.dragonfly, &old_order.pair_id, &worker_id).await?;
+
+    // Re-check inside lock
+    let old_order = load_order_db(&s.pg, order_id).await?
+        .ok_or_else(|| anyhow::anyhow!("order not found"))?;
+    if old_order.status != OrderStatus::New && old_order.status != OrderStatus::PartiallyFilled {
+        guard.release().await;
+        return Ok(Json(json!({"error": "order not modifiable"})));
+    }
+
+    cache::remove_order_from_book(&s.dragonfly, &old_order).await?;
+    cache::increment_version(&s.dragonfly, &old_order.pair_id).await?;
+    guard.release().await;
+
+    // DB updates outside lock
     cancel_order_in_db(&s.pg, order_id).await?;
     release_locked_balance(&s.pg, &old_order).await?;
-    cache::remove_order_from_book(&s.dragonfly, &old_order).await?;
 
     Ok(Json(json!({
         "cancelled_order_id": order_id.to_string(),
@@ -423,10 +465,15 @@ async fn handle_orderbook_ws(pair_id: String, state: AppState, mut socket: WebSo
     loop {
         ticker.tick().await;
 
-        let version = cache::increment_version(&state.dragonfly, &pair_id)
+        // Read version without incrementing — only send snapshot when changed
+        let version = cache::get_version(&state.dragonfly, &pair_id)
             .await
-            .unwrap_or(0)
-            - 1; // get without incrementing: use DECR+INCR trick or just check
+            .unwrap_or(0);
+
+        if version == last_version {
+            continue; // no change, skip
+        }
+        last_version = version;
 
         let bids = cache::load_order_book(&state.dragonfly, &pair_id, Side::Buy)
             .await
@@ -438,6 +485,7 @@ async fn handle_orderbook_ws(pair_id: String, state: AppState, mut socket: WebSo
         let msg = serde_json::to_string(&json!({
             "type": "snapshot",
             "pair": pair_id,
+            "version": version,
             "bids": aggregate_levels(bids),
             "asks": aggregate_levels(asks),
         }))

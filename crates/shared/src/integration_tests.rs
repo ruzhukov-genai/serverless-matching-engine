@@ -54,6 +54,7 @@ mod tests {
             .arg(format!("book:{pair_id}:bids"))
             .arg(format!("book:{pair_id}:asks"))
             .arg(format!("book:{pair_id}:lock"))
+            .arg(format!("book:{pair_id}:fence"))
             .arg(format!("version:{pair_id}"))
             .query_async(&mut *conn)
             .await
@@ -344,7 +345,7 @@ mod tests {
         let _guard = lock::acquire_lock(&pool, pair, "worker-A").await.unwrap();
 
         // Worker-B tries to release — should NOT release worker-A's lock
-        lock::release_lock(&pool, pair, "worker-B").await.unwrap();
+        lock::release_lock(&pool, pair, "worker-B", 999).await.unwrap();
 
         // Lock should still be held by worker-A
         let mut conn = pool.get().await.unwrap();

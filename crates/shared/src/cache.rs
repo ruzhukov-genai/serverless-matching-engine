@@ -162,3 +162,15 @@ pub async fn increment_version(pool: &Pool, pair_id: &str) -> Result<i64> {
         .context("INCR")?;
     Ok(v)
 }
+
+/// Read the current version counter without modifying it.
+pub async fn get_version(pool: &Pool, pair_id: &str) -> Result<i64> {
+    let mut conn = pool.get().await.context("pool.get")?;
+    let key = format!("version:{pair_id}");
+    let v: Option<i64> = redis::cmd("GET")
+        .arg(&key)
+        .query_async(&mut *conn)
+        .await
+        .context("GET version")?;
+    Ok(v.unwrap_or(0))
+}
