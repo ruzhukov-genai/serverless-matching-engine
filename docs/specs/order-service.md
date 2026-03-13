@@ -1,14 +1,37 @@
 # Spec: Order Service
 
+## Crate: `crates/order-service`
+
 ## Responsibilities
 
-- Manage the full order lifecycle (create, update, cancel)
-- Dispatch stat update triggers every minute
-- Process stat update messages
+- Manage the full order lifecycle (create, modify, cancel)
+- Validate orders against pair configuration (tick/lot size, price bands, min/max)
+- Persist orders to PostgreSQL
+- Publish orders to Dragonfly Streams for matching
+- Dispatch stat update triggers
 
 ## Trigger
 
-- Lambda trigger: single order queue
+- Consumes from Dragonfly Stream: `stream:orders`
+- Or receives requests via API (`crates/api`)
+
+## Order Validation
+
+Before accepting an order:
+1. Pair exists and is active
+2. Price aligned to tick size (`price % tick_size == 0`)
+3. Quantity aligned to lot size (`qty % lot_size == 0`)
+4. Quantity within `[min_order_size, max_order_size]`
+5. Price within price band (`|price - last_trade| / last_trade <= price_band_pct`)
+6. Sufficient balance (available >= locked amount)
+7. For market orders: price is `None`, must be IOC or FOK
+
+## Order Modify (Cancel-Replace)
+
+1. Cancel existing resting order (release locked funds)
+2. Validate new parameters
+3. Create new order with new sequence number
+4. Publish to match stream
 
 ## Locking
 
@@ -16,31 +39,20 @@ All messages requiring DB writes must use Order Book Locking (see `common-functi
 
 ## Sub-components
 
-### StatDispatcher (Scheduled Lambda)
+### StatDispatcher (Scheduled Task)
 
-- Runs every 1 minute (EventBridge cron)
-- Entry point: separate handler in same codebase
+- Runs every 1 minute (tokio interval or cron)
 - Logic:
   1. Fetch list of active pairs
-  2. For each pair: `PUBLISH update_stats {pair_id}` to queue
+  2. For each pair: `XADD stream:update_stats {pair_id}`
 
-### StatsUpdater (Queue-triggered Lambda)
+### StatsUpdater (Stream Consumer)
 
-- Listens to `update_stats` queue
-- Entry point: separate handler in same codebase
-- Logic: for each message, execute Update Stat for the pair
-
-## Phases
-
-1. Implement Order Book Locking for all write messages
-2. Refactor to single order queue
-3. Lambda deployment
-4. Implement StatDispatcher (scheduled)
-5. Implement StatsUpdater (queue-triggered)
+- Consumes from `stream:update_stats`
+- For each message: compute and cache 24h stats (high, low, volume, change)
 
 ## TODO
 
-- [ ] Define order schema (fields, status states, versioning)
 - [ ] Define `update_stats` message schema
 - [ ] Define stat computation logic
-- [ ] EventBridge rule for StatDispatcher (1-min schedule)
+- [ ] Balance locking/unlocking on order create/cancel
