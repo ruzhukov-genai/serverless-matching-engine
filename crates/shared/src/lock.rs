@@ -47,8 +47,6 @@ impl LockGuard {
 /// Try to acquire the lock for `pair_id` with exponential backoff + jitter.
 pub async fn acquire_lock(pool: &Pool, pair_id: &str, worker_id: &str) -> Result<LockGuard> {
     let key = format!("book:{pair_id}:lock");
-    let mut rng = rand::thread_rng();
-
     for attempt in 0..MAX_RETRIES {
         let mut conn = pool.get().await?;
         let result: Option<String> = redis::cmd("SET")
@@ -70,7 +68,7 @@ pub async fn acquire_lock(pool: &Pool, pair_id: &str, worker_id: &str) -> Result
 
         // backoff with jitter
         let base_ms = BACKOFF_MS[attempt.min(BACKOFF_MS.len() - 1)];
-        let jitter_ms = rng.gen_range(0..=base_ms / 2 + 1);
+        let jitter_ms = rand::random::<u64>() % (base_ms / 2 + 1);
         sleep(Duration::from_millis(base_ms + jitter_ms)).await;
     }
 

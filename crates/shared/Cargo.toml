@@ -19,5 +19,8 @@ thiserror.workspace = true
 rand.workspace = true
 anyhow.workspace = true
 
+[features]
+integration = []
+
 [dev-dependencies]
 rust_decimal_macros = "1"
