@@ -38,44 +38,47 @@ services:
       timeout: 3s
       retries: 5
 
-  # --- Service containers (uncomment when implementation begins) ---
+  # --- Service containers (uncomment when ready) ---
+  # Build: docker compose build matching-engine
 
   # matching-engine:
-  #   build: ./services/matching-engine
+  #   build:
+  #     context: .
+  #     dockerfile: crates/matching-engine/Dockerfile
   #   container_name: sme-matching-engine
   #   depends_on:
-  #     dragonfly:
-  #       condition: service_healthy
-  #     postgres:
-  #       condition: service_healthy
+  #     dragonfly: { condition: service_healthy }
+  #     postgres: { condition: service_healthy }
   #   environment:
   #     DRAGONFLY_URL: redis://dragonfly:6379
   #     DATABASE_URL: postgres://sme:sme_dev@postgres:5432/matching_engine
-  #     STATELESS_MODE: "true"
+  #     RUST_LOG: matching_engine=debug,sme_shared=debug
 
   # order-service:
-  #   build: ./services/order-service
+  #   build:
+  #     context: .
+  #     dockerfile: crates/order-service/Dockerfile
   #   container_name: sme-order-service
   #   depends_on:
-  #     dragonfly:
-  #       condition: service_healthy
-  #     postgres:
-  #       condition: service_healthy
+  #     dragonfly: { condition: service_healthy }
+  #     postgres: { condition: service_healthy }
   #   environment:
   #     DRAGONFLY_URL: redis://dragonfly:6379
   #     DATABASE_URL: postgres://sme:sme_dev@postgres:5432/matching_engine
+  #     RUST_LOG: order_service=debug,sme_shared=debug
 
   # transaction-service:
-  #   build: ./services/transaction-service
+  #   build:
+  #     context: .
+  #     dockerfile: crates/transaction-service/Dockerfile
   #   container_name: sme-transaction-service
   #   depends_on:
-  #     dragonfly:
-  #       condition: service_healthy
-  #     postgres:
-  #       condition: service_healthy
+  #     dragonfly: { condition: service_healthy }
+  #     postgres: { condition: service_healthy }
   #   environment:
   #     DRAGONFLY_URL: redis://dragonfly:6379
   #     DATABASE_URL: postgres://sme:sme_dev@postgres:5432/matching_engine
+  #     RUST_LOG: transaction_service=debug,sme_shared=debug
 
 volumes:
   dragonfly-data:
