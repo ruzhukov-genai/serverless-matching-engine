@@ -1,37 +1,12 @@
 # Infrastructure
 
-IaC for the serverless matching engine stack.
+> Deferred until PoC is proven (Phase 6).
 
-**Tooling decision:** TBD (AWS CDK / SAM / Terraform)
-→ See [`docs/brainstorm/README.md`](../docs/brainstorm/README.md)
+When the stateless matching pattern is validated, this directory will contain IaC for AWS deployment:
+- Lambda functions (Matching Engine, Order Service, Transaction Service)
+- SQS queues (replacing Dragonfly Streams)
+- ElastiCache / Dragonfly Cloud
+- Aurora PostgreSQL Serverless v2
+- EventBridge (StatDispatcher schedule)
 
-## Planned Resources
-
-| Resource | Purpose |
-|----------|---------|
-| Lambda (Matching Engine) | Order matching |
-| Lambda (Order Service) | Order lifecycle |
-| Lambda (StatDispatcher) | Scheduled stat triggers |
-| Lambda (StatsUpdater) | Stat computation |
-| Lambda (Transaction Service) | Trade persistence |
-| SQS Queues | Service triggers + DLQs |
-| ElastiCache Redis | Locking + order book cache |
-| EventBridge Rule | 1-min StatDispatcher schedule |
-| RDS / DynamoDB | Persistent order + transaction storage (TBD) |
-| CloudWatch | Logs, metrics, alarms |
-| X-Ray | Distributed tracing |
-
-## Structure (planned)
-
-```
-infra/
-├── stacks/
-│   ├── matching-engine-stack.ts
-│   ├── order-service-stack.ts
-│   └── transaction-service-stack.ts
-├── shared/
-│   ├── redis.ts
-│   └── queues.ts
-└── bin/
-    └── app.ts
-```
+For now, the entire stack runs locally via `docker-compose.yml`.
