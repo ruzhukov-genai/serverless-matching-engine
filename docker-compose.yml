@@ -39,7 +39,22 @@ services:
       retries: 5
 
   # --- Service containers (uncomment when ready) ---
-  # Build: docker compose build matching-engine
+  # Run locally with: cargo run --bin <name>
+
+  # api:
+  #   build:
+  #     context: .
+  #     dockerfile: crates/api/Dockerfile
+  #   container_name: sme-api
+  #   ports:
+  #     - "3000:3000"
+  #   depends_on:
+  #     dragonfly: { condition: service_healthy }
+  #     postgres: { condition: service_healthy }
+  #   environment:
+  #     DRAGONFLY_URL: redis://dragonfly:6379
+  #     DATABASE_URL: postgres://sme:sme_dev@postgres:5432/matching_engine
+  #     RUST_LOG: sme_api=debug,sme_shared=debug
 
   # matching-engine:
   #   build:
@@ -52,6 +67,7 @@ services:
   #   environment:
   #     DRAGONFLY_URL: redis://dragonfly:6379
   #     DATABASE_URL: postgres://sme:sme_dev@postgres:5432/matching_engine
+  #     STATELESS_MODE: "true"
   #     RUST_LOG: matching_engine=debug,sme_shared=debug
 
   # order-service:
