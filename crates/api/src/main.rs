@@ -2,7 +2,6 @@ use anyhow::Result;
 use axum::{Router, routing::get};
 use deadpool_redis::Pool as RedisPool;
 use sqlx::PgPool;
-use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
@@ -56,7 +55,9 @@ async fn main() -> Result<()> {
         .route("/api/metrics", get(routes::get_metrics))
         .route("/api/metrics/locks", get(routes::get_lock_metrics))
         .route("/api/metrics/throughput", get(routes::get_throughput))
+        .route("/api/metrics/latency", get(routes::get_latency_percentiles))
         .route("/api/metrics/audit", get(routes::get_audit))
+        .route("/api/audit", get(routes::get_audit))
         // Serve static files
         .nest_service("/trading", ServeDir::new("web/trading"))
         .nest_service("/dashboard", ServeDir::new("web/dashboard"))

@@ -7,14 +7,13 @@ use axum::{
 };
 use chrono::Utc;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
-use std::collections::HashMap;
 use uuid::Uuid;
 
 use sme_shared::{
-    cache, engine::match_order, lock, streams, Order, OrderStatus, OrderType, Pair, Side,
+    cache, engine::match_order, lock, metrics, Order, OrderStatus, OrderType, Side,
     SelfTradePreventionMode, TimeInForce, Trade,
 };
 
@@ -22,22 +21,52 @@ use crate::AppState;
 
 // ── Error helper ─────────────────────────────────────────────────────────────
 
-pub struct AppError(anyhow::Error);
+pub enum AppErrorKind {
+    BadRequest,
+    NotFound,
+    Conflict,
+    Internal,
+}
+
+pub struct AppError {
+    kind: AppErrorKind,
+    inner: anyhow::Error,
+}
+
+impl AppError {
+    pub fn bad_request(e: impl Into<anyhow::Error>) -> Self {
+        AppError { kind: AppErrorKind::BadRequest, inner: e.into() }
+    }
+    pub fn not_found(e: impl Into<anyhow::Error>) -> Self {
+        AppError { kind: AppErrorKind::NotFound, inner: e.into() }
+    }
+    pub fn conflict(e: impl Into<anyhow::Error>) -> Self {
+        AppError { kind: AppErrorKind::Conflict, inner: e.into() }
+    }
+}
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
-        tracing::error!("handler error: {:?}", self.0);
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": self.0.to_string()}))).into_response()
+        let status = match self.kind {
+            AppErrorKind::BadRequest => StatusCode::BAD_REQUEST,
+            AppErrorKind::NotFound => StatusCode::NOT_FOUND,
+            AppErrorKind::Conflict => StatusCode::CONFLICT,
+            AppErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        tracing::error!("handler error: {:?}", self.inner);
+        (status, Json(json!({"error": self.inner.to_string()}))).into_response()
     }
 }
 
 impl<E: Into<anyhow::Error>> From<E> for AppError {
     fn from(e: E) -> Self {
-        AppError(e.into())
+        AppError { kind: AppErrorKind::Internal, inner: e.into() }
     }
 }
 
 type HandlerResult<T> = Result<T, AppError>;
+
+const PAIRS: &[&str] = &["BTC-USDT", "ETH-USDT", "SOL-USDT"];
 
 // ── GET /api/pairs ────────────────────────────────────────────────────────────
 
@@ -77,7 +106,6 @@ pub async fn get_orderbook(
     let bids_raw = cache::load_order_book(&s.dragonfly, &pair_id, Side::Buy).await?;
     let asks_raw = cache::load_order_book(&s.dragonfly, &pair_id, Side::Sell).await?;
 
-    // Aggregate by price level
     let bids = aggregate_levels(bids_raw);
     let asks = aggregate_levels(asks_raw);
 
@@ -188,6 +216,8 @@ pub async fn create_order(
     State(s): State<AppState>,
     Json(req): Json<CreateOrderRequest>,
 ) -> HandlerResult<impl IntoResponse> {
+    let total_start = std::time::Instant::now();
+
     let user_id = req.user_id.unwrap_or_else(|| "user-1".to_string());
     let tif = req.tif.unwrap_or(TimeInForce::GTC);
     let stp_mode = req.stp_mode.unwrap_or(SelfTradePreventionMode::None);
@@ -211,23 +241,34 @@ pub async fn create_order(
         updated_at: now,
     };
 
-    // 1. Validate (outside lock — read-only, fast)
-    validate_order_request(&s.pg, &order).await?;
+    // 1. Validate (outside lock)
+    validate_order_request(&s.pg, &order).await
+        .map_err(AppError::bad_request)?;
 
-    // 2. Insert to DB (outside lock — unique ID, idempotent)
+    // 2. Insert to DB (outside lock)
     insert_order_db(&s.pg, &order).await?;
 
-    // 3. Lock balance in DB (outside lock — per-user, not per-pair)
-    lock_balance(&s.pg, &order).await?;
+    // 3. Lock balance in DB (outside lock)
+    lock_balance(&s.pg, &order).await
+        .map_err(AppError::bad_request)?;
 
     // ── ACQUIRE PER-PAIR LOCK ─────────────────────────────────────────────
-    // Everything that touches the order book cache must be inside the lock.
+    let lock_start = std::time::Instant::now();
     let worker_id = format!("api-{}", order.id);
     let guard = lock::acquire_lock(&s.dragonfly, &req.pair_id, &worker_id).await?;
+    let lock_wait_ms = lock_start.elapsed().as_millis() as u64;
 
     // 4. Load opposite side of the book
+    let book_load_start = std::time::Instant::now();
     let opposite_side = order.side.opposite();
-    let mut book = cache::load_order_book(&s.dragonfly, &req.pair_id, opposite_side).await?;
+    let mut book = cache::load_order_book_filtered(
+        &s.dragonfly,
+        &req.pair_id,
+        opposite_side,
+        order.price,
+    )
+    .await?;
+    let book_load_ms = book_load_start.elapsed().as_millis() as u64;
 
     // Sort book for price-time priority
     book.sort_by(|a, b| {
@@ -239,7 +280,9 @@ pub async fn create_order(
     });
 
     // 5. Match inline
+    let match_start = std::time::Instant::now();
     let result = match_order(&order, &mut book);
+    let match_ms = match_start.elapsed().as_millis() as u64;
     order = result.incoming.clone();
 
     // 6. Handle FOK rollback
@@ -248,9 +291,7 @@ pub async fn create_order(
         && result.trades.is_empty()
         && order.status == OrderStatus::Cancelled
     {
-        // Release lock before DB cleanup (no book mutation needed)
         guard.release().await;
-
         cancel_order_in_db(&s.pg, order.id).await?;
         release_locked_balance(&s.pg, &order).await?;
         return Ok((
@@ -264,6 +305,7 @@ pub async fn create_order(
     }
 
     // 7. Update matched resting orders in cache (INSIDE lock)
+    let cache_write_start = std::time::Instant::now();
     for upd in &result.book_updates {
         if upd.status == OrderStatus::Filled || upd.status == OrderStatus::Cancelled {
             cache::remove_order_from_book(&s.dragonfly, upd).await?;
@@ -273,28 +315,101 @@ pub async fn create_order(
     }
 
     // 8. Update incoming order in cache (INSIDE lock)
-    // Only save to book if it will rest (GTC with remaining qty)
     if order.status == OrderStatus::New || order.status == OrderStatus::PartiallyFilled {
         cache::save_order_to_book(&s.dragonfly, &order).await?;
     }
-    // Filled/Cancelled orders do NOT go into the book
 
     // 9. Bump version counter (INSIDE lock)
     cache::increment_version(&s.dragonfly, &req.pair_id).await?;
+    let cache_write_ms = cache_write_start.elapsed().as_millis() as u64;
 
     // ── RELEASE LOCK ──────────────────────────────────────────────────────
     guard.release().await;
 
-    // 10. Persist to DB (outside lock — DB is the source of truth)
+    let total_ms = total_start.elapsed().as_millis() as u64;
+    let trade_count = result.trades.len();
+
+    tracing::info!(
+        lock_wait_ms = lock_wait_ms,
+        book_load_ms = book_load_ms,
+        match_ms = match_ms,
+        cache_write_ms = cache_write_ms,
+        total_ms = total_ms,
+        trade_count = trade_count,
+        pair_id = %req.pair_id,
+        order_id = %order.id,
+        "order matched"
+    );
+
+    // Write metrics to Dragonfly (best-effort, don't fail the request)
+    {
+        let pool = s.dragonfly.clone();
+        let pair_id = req.pair_id.clone();
+        tokio::spawn(async move {
+            let _ = metrics::record_match_latency(&pool, &pair_id, match_ms).await;
+            let _ = metrics::record_lock_wait(&pool, &pair_id, lock_wait_ms).await;
+            let _ = metrics::increment_order_count(&pool, &pair_id).await;
+            if trade_count > 0 {
+                let _ = metrics::increment_trade_count(&pool, &pair_id, trade_count as u64).await;
+            }
+        });
+    }
+
+    // 10. Persist to DB (outside lock)
+    insert_audit_event(
+        &s.pg,
+        Some(&req.pair_id),
+        "ORDER_CREATED",
+        &json!({
+            "order_id": order.id.to_string(),
+            "user_id": order.user_id,
+            "side": format!("{:?}", order.side),
+            "order_type": format!("{:?}", order.order_type),
+            "price": order.price.map(|v| v.to_string()),
+            "quantity": order.quantity.to_string(),
+        }),
+    )
+    .await
+    .ok();
+
     let mut trade_jsons: Vec<Value> = Vec::new();
     for trade in &result.trades {
         insert_trade_db(&s.pg, trade).await?;
         settle_trade_balances(&s.pg, trade).await?;
         trade_jsons.push(trade_to_json(trade));
+
+        insert_audit_event(
+            &s.pg,
+            Some(&req.pair_id),
+            "TRADE_EXECUTED",
+            &json!({
+                "trade_id": trade.id.to_string(),
+                "buy_order_id": trade.buy_order_id.to_string(),
+                "sell_order_id": trade.sell_order_id.to_string(),
+                "price": trade.price.to_string(),
+                "quantity": trade.quantity.to_string(),
+            }),
+        )
+        .await
+        .ok();
     }
 
     for upd in &result.book_updates {
         update_order_db(&s.pg, upd).await?;
+        let event_type = match upd.status {
+            OrderStatus::Filled => "ORDER_FILLED",
+            OrderStatus::PartiallyFilled => "ORDER_PARTIALLY_FILLED",
+            OrderStatus::Cancelled => "ORDER_CANCELLED",
+            _ => continue,
+        };
+        insert_audit_event(
+            &s.pg,
+            Some(&req.pair_id),
+            event_type,
+            &json!({ "order_id": upd.id.to_string(), "remaining": upd.remaining.to_string() }),
+        )
+        .await
+        .ok();
     }
 
     update_order_db(&s.pg, &order).await?;
@@ -317,33 +432,45 @@ pub async fn cancel_order(
     Path(order_id): Path<Uuid>,
     State(s): State<AppState>,
 ) -> HandlerResult<impl IntoResponse> {
-    // Load from DB
     let order = load_order_db(&s.pg, order_id).await?
-        .ok_or_else(|| anyhow::anyhow!("order not found"))?;
+        .ok_or_else(|| AppError::not_found(anyhow::anyhow!("order not found")))?;
 
     if order.status != OrderStatus::New && order.status != OrderStatus::PartiallyFilled {
-        return Ok(Json(json!({"error": "order not cancellable", "status": format!("{:?}", order.status)})));
+        return Err(AppError::conflict(anyhow::anyhow!(
+            "order not cancellable: status={:?}",
+            order.status
+        )));
     }
 
-    // Acquire lock — cancel must be atomic with respect to matching
     let worker_id = format!("cancel-{order_id}");
     let guard = lock::acquire_lock(&s.dragonfly, &order.pair_id, &worker_id).await?;
 
-    // Re-check status inside lock (order may have been filled between load and lock)
+    // Re-check status inside lock
     let order = load_order_db(&s.pg, order_id).await?
-        .ok_or_else(|| anyhow::anyhow!("order not found"))?;
+        .ok_or_else(|| AppError::not_found(anyhow::anyhow!("order not found")))?;
     if order.status != OrderStatus::New && order.status != OrderStatus::PartiallyFilled {
         guard.release().await;
-        return Ok(Json(json!({"error": "order not cancellable", "status": format!("{:?}", order.status)})));
+        return Err(AppError::conflict(anyhow::anyhow!(
+            "order not cancellable: status={:?}",
+            order.status
+        )));
     }
 
     cache::remove_order_from_book(&s.dragonfly, &order).await?;
     cache::increment_version(&s.dragonfly, &order.pair_id).await?;
     guard.release().await;
 
-    // DB updates outside lock
     cancel_order_in_db(&s.pg, order_id).await?;
     release_locked_balance(&s.pg, &order).await?;
+
+    insert_audit_event(
+        &s.pg,
+        Some(&order.pair_id),
+        "ORDER_CANCELLED",
+        &json!({ "order_id": order_id.to_string(), "user_id": order.user_id }),
+    )
+    .await
+    .ok();
 
     Ok(Json(json!({ "status": "cancelled", "order_id": order_id.to_string() })))
 }
@@ -355,31 +482,27 @@ pub async fn modify_order(
     State(s): State<AppState>,
     Json(_req): Json<CreateOrderRequest>,
 ) -> HandlerResult<impl IntoResponse> {
-    // Cancel the old order
     let old_order = load_order_db(&s.pg, order_id).await?
-        .ok_or_else(|| anyhow::anyhow!("order not found"))?;
+        .ok_or_else(|| AppError::not_found(anyhow::anyhow!("order not found")))?;
 
     if old_order.status != OrderStatus::New && old_order.status != OrderStatus::PartiallyFilled {
-        return Ok(Json(json!({"error": "order not modifiable"})));
+        return Err(AppError::conflict(anyhow::anyhow!("order not modifiable")));
     }
 
-    // Acquire lock — must be atomic with respect to matching
     let worker_id = format!("modify-{order_id}");
     let guard = lock::acquire_lock(&s.dragonfly, &old_order.pair_id, &worker_id).await?;
 
-    // Re-check inside lock
     let old_order = load_order_db(&s.pg, order_id).await?
-        .ok_or_else(|| anyhow::anyhow!("order not found"))?;
+        .ok_or_else(|| AppError::not_found(anyhow::anyhow!("order not found")))?;
     if old_order.status != OrderStatus::New && old_order.status != OrderStatus::PartiallyFilled {
         guard.release().await;
-        return Ok(Json(json!({"error": "order not modifiable"})));
+        return Err(AppError::conflict(anyhow::anyhow!("order not modifiable")));
     }
 
     cache::remove_order_from_book(&s.dragonfly, &old_order).await?;
     cache::increment_version(&s.dragonfly, &old_order.pair_id).await?;
     guard.release().await;
 
-    // DB updates outside lock
     cancel_order_in_db(&s.pg, order_id).await?;
     release_locked_balance(&s.pg, &old_order).await?;
 
@@ -458,20 +581,19 @@ pub async fn ws_orderbook(
 }
 
 async fn handle_orderbook_ws(pair_id: String, state: AppState, mut socket: WebSocket) {
-    use tokio::time::{interval, Duration};
+    use tokio::time::{Duration, interval};
     let mut ticker = interval(Duration::from_millis(500));
     let mut last_version: i64 = -1;
 
     loop {
         ticker.tick().await;
 
-        // Read version without incrementing — only send snapshot when changed
         let version = cache::get_version(&state.dragonfly, &pair_id)
             .await
             .unwrap_or(0);
 
         if version == last_version {
-            continue; // no change, skip
+            continue;
         }
         last_version = version;
 
@@ -506,7 +628,7 @@ pub async fn ws_trades(
 }
 
 async fn handle_trades_ws(pair_id: String, state: AppState, mut socket: WebSocket) {
-    use tokio::time::{interval, Duration};
+    use tokio::time::{Duration, interval};
     let mut ticker = interval(Duration::from_millis(500));
     let mut last_seen: Option<chrono::DateTime<Utc>> = None;
 
@@ -557,40 +679,66 @@ async fn handle_trades_ws(pair_id: String, state: AppState, mut socket: WebSocke
 
 // ── Dashboard API ─────────────────────────────────────────────────────────────
 
+/// GET /api/metrics — aggregate order/trade counts from Dragonfly metrics keys.
 pub async fn get_metrics(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    // Count active orders and recent trades
-    let order_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM orders WHERE status IN ('New','PartiallyFilled')",
-    )
-    .fetch_one(&s.pg)
-    .await
-    .unwrap_or(0);
+    let mut total_orders: i64 = 0;
+    let mut total_trades: i64 = 0;
 
-    let trade_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM trades WHERE created_at >= NOW() - INTERVAL '1 minute'",
-    )
-    .fetch_one(&s.pg)
-    .await
-    .unwrap_or(0);
+    for pair_id in PAIRS {
+        total_orders += metrics::get_order_count(&s.dragonfly, pair_id).await.unwrap_or(0);
+        total_trades += metrics::get_trade_count(&s.dragonfly, pair_id).await.unwrap_or(0);
+    }
+
+    // Also collect latency P50 across all pairs for the KPI "latency" field
+    let mut all_latency: Vec<u64> = Vec::new();
+    for pair_id in PAIRS {
+        let samples = metrics::get_latency_samples(&s.dragonfly, pair_id, 100).await.unwrap_or_default();
+        all_latency.extend(samples);
+    }
+    let (p50, p95, p99) = metrics::compute_percentiles(all_latency);
 
     Ok(Json(json!({
-        "orders_per_sec": order_count,
-        "matches_per_sec": trade_count,
-        "trades_per_sec": trade_count,
+        "orders_per_sec": total_orders,
+        "matches_per_sec": total_trades,
+        "trades_per_sec": total_trades,
         "active_pairs": 3,
         "active_workers": 1,
+        "latency": {
+            "p50": p50,
+            "p95": p95,
+            "p99": p99,
+        },
+        "streams": {},
     })))
 }
 
-pub async fn get_lock_metrics() -> impl IntoResponse {
-    Json(json!({
-        "contention_rate": 0.0,
-        "avg_wait_ms": 0.0,
-        "retry_count": 0,
+/// GET /api/metrics/locks — read from Dragonfly lock_wait lists.
+pub async fn get_lock_metrics(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
+    let mut all_waits: Vec<u64> = Vec::new();
+    for pair_id in PAIRS {
+        let samples = metrics::get_lock_wait_samples(&s.dragonfly, pair_id, 1000).await.unwrap_or_default();
+        all_waits.extend(samples);
+    }
+
+    let (avg_wait_ms, contention_rate) = if all_waits.is_empty() {
+        (0.0f64, 0.0f64)
+    } else {
+        let avg = all_waits.iter().sum::<u64>() as f64 / all_waits.len() as f64;
+        // contention = fraction of waits > 1ms
+        let contended = all_waits.iter().filter(|&&v| v > 1).count();
+        let rate = contended as f64 / all_waits.len() as f64;
+        (avg, rate)
+    };
+
+    Ok(Json(json!({
+        "contention_rate": contention_rate,
+        "avg_wait_ms": avg_wait_ms,
+        "retry_count": all_waits.len(),
         "failures": 0,
-    }))
+    })))
 }
 
+/// GET /api/metrics/throughput — trade counts per minute from DB.
 pub async fn get_throughput(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
     let rows = sqlx::query(
         "SELECT date_trunc('minute', created_at) as bucket, COUNT(*) as count
@@ -613,6 +761,36 @@ pub async fn get_throughput(State(s): State<AppState>) -> HandlerResult<impl Int
     Ok(Json(json!({ "series": series })))
 }
 
+/// GET /api/metrics/latency — P50/P95/P99 from Dragonfly latency samples.
+pub async fn get_latency_percentiles(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
+    let mut all_samples: Vec<u64> = Vec::new();
+    let mut per_pair: Vec<Value> = Vec::new();
+
+    for pair_id in PAIRS {
+        let samples = metrics::get_latency_samples(&s.dragonfly, pair_id, 1000).await.unwrap_or_default();
+        let (p50, p95, p99) = metrics::compute_percentiles(samples.clone());
+        per_pair.push(json!({
+            "pair_id": pair_id,
+            "sample_count": samples.len(),
+            "p50": p50,
+            "p95": p95,
+            "p99": p99,
+        }));
+        all_samples.extend(samples);
+    }
+
+    let (p50, p95, p99) = metrics::compute_percentiles(all_samples.clone());
+
+    Ok(Json(json!({
+        "sample_count": all_samples.len(),
+        "p50": p50,
+        "p95": p95,
+        "p99": p99,
+        "per_pair": per_pair,
+    })))
+}
+
+/// GET /api/audit — last 50 audit events from DB.
 pub async fn get_audit(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
     let rows = sqlx::query(
         "SELECT id, sequence, pair_id, event_type, payload, created_at FROM audit_log ORDER BY created_at DESC LIMIT 50",
@@ -634,7 +812,27 @@ pub async fn get_audit(State(s): State<AppState>) -> HandlerResult<impl IntoResp
         })
         .collect();
 
-    Ok(Json(json!({ "audit": entries })))
+    // Support both /api/audit and /api/metrics/audit paths
+    Ok(Json(json!({ "audit": entries, "events": entries })))
+}
+
+// ── Audit helpers ─────────────────────────────────────────────────────────────
+
+pub async fn insert_audit_event(
+    pg: &sqlx::PgPool,
+    pair_id: Option<&str>,
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO audit_log (pair_id, event_type, payload) VALUES ($1, $2, $3)",
+    )
+    .bind(pair_id)
+    .bind(event_type)
+    .bind(payload)
+    .execute(pg)
+    .await?;
+    Ok(())
 }
 
 // ── DB helpers ─────────────────────────────────────────────────────────────────
@@ -872,7 +1070,6 @@ async fn release_remaining_locked(pg: &sqlx::PgPool, order: &Order) -> anyhow::R
     if order.remaining == Decimal::ZERO {
         return Ok(());
     }
-    // Release only the portion corresponding to remaining qty
     let row = sqlx::query("SELECT base, quote FROM pairs WHERE id = $1")
         .bind(&order.pair_id)
         .fetch_one(pg)
@@ -950,7 +1147,6 @@ async fn settle_trade_balances(pg: &sqlx::PgPool, trade: &Trade) -> anyhow::Resu
 
     let mut tx = pg.begin().await?;
 
-    // Buyer: unlock quote, credit base
     sqlx::query("UPDATE balances SET locked = GREATEST(locked - $1, 0) WHERE user_id = $2 AND asset = $3")
         .bind(cost).bind(&trade.buyer_id).bind(&quote)
         .execute(&mut *tx).await?;
@@ -961,7 +1157,6 @@ async fn settle_trade_balances(pg: &sqlx::PgPool, trade: &Trade) -> anyhow::Resu
     .bind(&trade.buyer_id).bind(&base).bind(trade.quantity)
     .execute(&mut *tx).await?;
 
-    // Seller: unlock base, credit quote
     sqlx::query("UPDATE balances SET locked = GREATEST(locked - $1, 0) WHERE user_id = $2 AND asset = $3")
         .bind(trade.quantity).bind(&trade.seller_id).bind(&base)
         .execute(&mut *tx).await?;
