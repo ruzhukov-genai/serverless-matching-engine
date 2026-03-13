@@ -1,60 +1,50 @@
 # Spec: Matching Engine
 
-## Responsibilities
+## What It Does
 
-- Match incoming orders against the resting order book
-- Manage Order Book state (load, update, persist)
-- Emit trade events to Transaction Service
+Takes an incoming order, loads the relevant side of the order book from cache, matches at price-time priority, and writes results back.
 
-## Trigger
+## Stateless Cycle
 
-- Lambda trigger: SQS / RabbitMQ queue (single consolidated queue — see ADR-003)
-
-## Stateless Mode
-
-Controlled by `STATELESS_MODE` env var / CDK parameter.
-
-When enabled:
-1. Load Order Book on invocation (Redis → DB fallback)
-2. Match order
-3. Finalize all DB writes before returning
-
-## Order Book Loading Optimizations
-
-### Price-filtered loading
-- Limit BUY at $P → load only Sell orders where `price <= P`
-- Limit SELL at $P → load only Buy orders where `price >= P`
-
-### Lazy loading
 ```
-Batch 1:  10 orders
-Batch 2:  20 orders  (if batch 1 fully matched)
-Batch 3:  40 orders
-...
+1. XREADGROUP stream:orders:match (receive order)
+2. SET book:{pair_id}:lock {workerId} NX EX 1 (acquire lock)
+3. ZRANGEBYSCORE book:{pair_id}:{opposite_side} (load matching orders)
+4. Match: walk the book, fill at each price level
+5. Update cache: ZADD/ZREM modified orders
+6. INCR book:{pair_id}:version
+7. Write trades: XADD stream:transactions
+8. Async: persist to PostgreSQL (version-guarded)
+9. DEL book:{pair_id}:lock (release)
+10. XACK stream:orders:match (acknowledge)
 ```
 
-### Redis cache
-- Write-through cache; source of truth for active orders
-- Sorted sets per side: `book:{pair_id}:bids` / `book:{pair_id}:asks` (sorted by price)
+## Matching Logic (Limit Orders)
 
-## Order Persistence
+- **BUY at $P**: match against asks where `price <= P`, lowest price first, then oldest first
+- **SELL at $P**: match against bids where `price >= P`, highest price first, then oldest first
+- Partial fills: reduce quantity, keep resting remainder in book
+- Full fill: remove from book
 
-- Synchronous write-through to Redis
-- Async DB write (version-guarded: only write if `order.version > db.version`)
+## Lock Contention
 
-## Phases
+If lock unavailable:
+- Exponential backoff: `[10, 20, 50, 100, 200, 500]` ms
+- Jitter: `delay *= (1 + 0.2 * random())`
+- Max retries: 10 (then fail + requeue)
 
-1. Load test baseline
-2. Implement `StatelessMode` option
-3. Performance analysis & optimization (loading + saving)
-4. Implement Order Book Locking
-5. Refactor to single instance listening to all pair queues
-6. Refactor to single consolidated queue
-7. Lambda deployment
+## Order Book Cache Structure
 
-## TODO
+```
+book:{pair_id}:bids  → ZSet  (score = price, member = order_id)
+book:{pair_id}:asks  → ZSet  (score = price, member = order_id)
+order:{order_id}     → Hash  {price, quantity, remaining, side, pair_id, timestamp, version}
+```
 
-- [ ] Define order book data model
-- [ ] Define trade/fill event schema
-- [ ] Define `StatelessMode` CDK parameter
-- [ ] Load test harness design
+## What We Need to Prove
+
+- [ ] Correct matching under concurrent load (same pair)
+- [ ] No fills beyond order quantity
+- [ ] Version conflicts handled (stale write rejected)
+- [ ] Lock expiry recovery (worker crash mid-match)
+- [ ] Throughput: matches/sec single pair, scaling across pairs
