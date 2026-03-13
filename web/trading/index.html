@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SME — Trading</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header>
+        <h1>Serverless Matching Engine</h1>
+        <nav>
+            <a href="/trading/" class="active">Trading</a>
+            <a href="/dashboard/">Dashboard</a>
+        </nav>
+    </header>
+
+    <main>
+        <!-- Pair selector -->
+        <section id="pair-selector">
+            <h2>Markets</h2>
+            <div id="pairs-list">
+                <!-- Populated by JS -->
+            </div>
+        </section>
+
+        <div class="trading-layout">
+            <!-- Order Book -->
+            <section id="orderbook">
+                <h2>Order Book — <span id="current-pair">BTC/USDT</span></h2>
+                <div class="book-header">
+                    <span>Price</span>
+                    <span>Quantity</span>
+                    <span>Total</span>
+                </div>
+                <div id="asks" class="book-side asks">
+                    <!-- Ask levels (sells) — sorted high to low -->
+                </div>
+                <div id="spread">
+                    <span id="spread-value">—</span>
+                </div>
+                <div id="bids" class="book-side bids">
+                    <!-- Bid levels (buys) — sorted high to low -->
+                </div>
+            </section>
+
+            <!-- Order Entry -->
+            <section id="order-entry">
+                <h2>Place Order</h2>
+                <div class="order-tabs">
+                    <button class="tab active" data-side="buy">Buy</button>
+                    <button class="tab" data-side="sell">Sell</button>
+                </div>
+                <form id="order-form">
+                    <div class="form-group">
+                        <label>Type</label>
+                        <select id="order-type">
+                            <option value="limit">Limit</option>
+                            <option value="market">Market</option>
+                        </select>
+                    </div>
+                    <div class="form-group" id="price-group">
+                        <label>Price</label>
+                        <input type="number" id="order-price" step="any" placeholder="0.00">
+                    </div>
+                    <div class="form-group">
+                        <label>Quantity</label>
+                        <input type="number" id="order-quantity" step="any" placeholder="0.00">
+                    </div>
+                    <div class="form-group">
+                        <label>Time in Force</label>
+                        <select id="order-tif">
+                            <option value="gtc">GTC</option>
+                            <option value="ioc">IOC</option>
+                            <option value="fok">FOK</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Total</label>
+                        <span id="order-total">0.00</span>
+                    </div>
+                    <button type="submit" id="submit-order" class="btn-buy">Buy</button>
+                </form>
+            </section>
+
+            <!-- Recent Trades -->
+            <section id="trades">
+                <h2>Recent Trades</h2>
+                <div class="trades-header">
+                    <span>Price</span>
+                    <span>Quantity</span>
+                    <span>Time</span>
+                </div>
+                <div id="trades-list">
+                    <!-- Populated by JS/WebSocket -->
+                </div>
+            </section>
+        </div>
+
+        <!-- Portfolio & Open Orders -->
+        <div class="bottom-panels">
+            <section id="portfolio">
+                <h2>Portfolio</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Asset</th>
+                            <th>Available</th>
+                            <th>In Orders</th>
+                            <th>Total</th>
+                        </tr>
+                    </thead>
+                    <tbody id="portfolio-body">
+                        <!-- Populated by JS -->
+                    </tbody>
+                </table>
+            </section>
+
+            <section id="open-orders">
+                <h2>Open Orders</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Pair</th>
+                            <th>Side</th>
+                            <th>Type</th>
+                            <th>Price</th>
+                            <th>Qty</th>
+                            <th>Filled</th>
+                            <th>Status</th>
+                            <th>Time</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody id="orders-body">
+                        <!-- Populated by JS -->
+                    </tbody>
+                </table>
+            </section>
+        </div>
+    </main>
+
+    <script src="app.js"></script>
+</body>
+</html>
