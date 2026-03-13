@@ -5,6 +5,7 @@ members = [
     "crates/matching-engine",
     "crates/order-service",
     "crates/transaction-service",
+    "crates/api",
 ]
 
 [workspace.package]
