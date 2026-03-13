@@ -1,0 +1,20 @@
+[package]
+name = "transaction-service"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sme-shared = { path = "../shared" }
+tokio.workspace = true
+redis.workspace = true
+deadpool-redis.workspace = true
+sqlx.workspace = true
+serde.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+
+[[bin]]
+name = "transaction-service"
+path = "src/main.rs"
