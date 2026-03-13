@@ -1,55 +1,52 @@
-# Serverless Matching / Order Management
+# Serverless Matching Engine — Proof of Concept
 
-> **Status:** 🏗️ Prototype — agentic spec-driven development
+> Can an order matching engine run statelessly, relying on distributed cache locking?
 
-A fully-serverless exchange matching engine and order management system designed for near-infinite scalability (many trading pairs) and significant cost reduction over stateful deployments.
+This project proves (or disproves) that a matching engine can operate without persistent in-memory state — loading the order book from cache on every invocation, matching under a distributed lock, and writing results back. If this works reliably under concurrency, it can run anywhere: Lambda, containers, bare processes.
 
-## Architecture at a Glance
+## The Core Question
 
-```
-RabbitMQ / SQS Queue ──► Lambda (Matching Engine) ──► DB
-                                  │
-                          Redis (Order Book Cache + Locking)
-                                  │
-                     Lambda (Order Service)
-                     Lambda (Transaction Service)
-```
+A traditional matching engine holds the order book in memory. That makes it fast but hard to scale horizontally and impossible to run serverlessly. This PoC tests the alternative:
 
-## Monorepo Structure
+1. **Lock** the order book for a trading pair (Dragonfly/Redis `SET NX EX`)
+2. **Load** the relevant slice from cache (sorted sets)
+3. **Match** the incoming order
+4. **Write** results back to cache + DB
+5. **Release** the lock
+
+If multiple workers can do this concurrently across pairs — and sequentially within a pair — without data corruption, race conditions, or unacceptable latency, the pattern is viable.
+
+## Stack
+
+| Component | Technology |
+|-----------|-----------|
+| Cache + Locking + Queues | **Dragonfly** (Redis-compatible, multi-threaded) |
+| Database | **PostgreSQL** |
+| Services | **Node.js / TypeScript** |
+| Local env | **Docker Compose** |
+
+## Structure
 
 ```
 .
-├── docs/
-│   ├── architecture.md          # System design & data flows
-│   ├── decisions/               # Architecture Decision Records (ADRs)
-│   ├── specs/                   # Per-service detailed specs
-│   ├── brainstorm/              # Open questions & explorations
-│   └── planning/                # Roadmap & phased delivery plan
+├── docs/                        # Specs, ADRs, design notes
 ├── services/
-│   ├── matching-engine/         # Core order matching Lambda
-│   ├── order-service/           # Order lifecycle + StatDispatcher
-│   └── transaction-service/     # Transaction processing Lambda
-├── shared/
-│   └── redis/                   # Shared Redis utilities (locking, cache)
-├── infra/                       # IaC (CDK / SAM / Terraform — TBD)
-└── scripts/                     # Dev & operational scripts
+│   ├── matching-engine/         # Core: stateless order matching
+│   ├── order-service/           # Order lifecycle
+│   └── transaction-service/     # Trade persistence
+├── shared/                      # Dragonfly utilities, locking, streams
+├── tests/                       # Integration & load tests
+├── docker-compose.yml           # Dragonfly + PostgreSQL
+└── scripts/                     # Dev & test scripts
 ```
 
-## Key Design Decisions
+## Quick Start
 
-- **Stateless Matching Engine** — Order Book loaded fresh per invocation (configurable via `STATELESS_MODE`)
-- **Redis Order Book Locking** — Prevents race conditions across concurrent Lambda invocations
-- **RedLock** — Planned post-migration for multi-node Redis resilience
-- **Single Queue per Service** — Simplified fan-in, easier scaling
+```bash
+docker compose up -d             # Start Dragonfly + PostgreSQL
+# (service implementation TBD)
+```
 
-## Getting Started
+## Roadmap
 
-> Implementation not yet started. See [`docs/planning/roadmap.md`](docs/planning/roadmap.md) for phased plan.
-
-## Links
-
-- [Architecture](docs/architecture.md)
-- [Specs](docs/specs/)
-- [ADRs](docs/decisions/)
-- [Brainstorm](docs/brainstorm/)
-- [Roadmap](docs/planning/roadmap.md)
+→ [`docs/planning/roadmap.md`](docs/planning/roadmap.md)
