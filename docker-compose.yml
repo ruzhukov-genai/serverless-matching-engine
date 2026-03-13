@@ -1,0 +1,82 @@
+# Local development environment
+# Usage: docker compose up -d
+
+services:
+  dragonfly:
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
+    container_name: sme-dragonfly
+    ports:
+      - "6379:6379"
+    volumes:
+      - dragonfly-data:/data
+    command: >
+      dragonfly
+      --logtostderr
+      --cache_mode=true
+    ulimits:
+      memlock: -1
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: sme-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: matching_engine
+      POSTGRES_USER: sme
+      POSTGRES_PASSWORD: sme_dev
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sme -d matching_engine"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # --- Service containers (uncomment when implementation begins) ---
+
+  # matching-engine:
+  #   build: ./services/matching-engine
+  #   container_name: sme-matching-engine
+  #   depends_on:
+  #     dragonfly:
+  #       condition: service_healthy
+  #     postgres:
+  #       condition: service_healthy
+  #   environment:
+  #     DRAGONFLY_URL: redis://dragonfly:6379
+  #     DATABASE_URL: postgres://sme:sme_dev@postgres:5432/matching_engine
+  #     STATELESS_MODE: "true"
+
+  # order-service:
+  #   build: ./services/order-service
+  #   container_name: sme-order-service
+  #   depends_on:
+  #     dragonfly:
+  #       condition: service_healthy
+  #     postgres:
+  #       condition: service_healthy
+  #   environment:
+  #     DRAGONFLY_URL: redis://dragonfly:6379
+  #     DATABASE_URL: postgres://sme:sme_dev@postgres:5432/matching_engine
+
+  # transaction-service:
+  #   build: ./services/transaction-service
+  #   container_name: sme-transaction-service
+  #   depends_on:
+  #     dragonfly:
+  #       condition: service_healthy
+  #     postgres:
+  #       condition: service_healthy
+  #   environment:
+  #     DRAGONFLY_URL: redis://dragonfly:6379
+  #     DATABASE_URL: postgres://sme:sme_dev@postgres:5432/matching_engine
+
+volumes:
+  dragonfly-data:
+  postgres-data:
