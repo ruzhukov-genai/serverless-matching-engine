@@ -2,27 +2,15 @@
 
 > Can an order matching engine run statelessly, relying on distributed cache locking?
 
-This project proves (or disproves) that a matching engine can operate without persistent in-memory state — loading the order book from cache on every invocation, matching under a distributed lock, and writing results back. If this works reliably under concurrency, it can run anywhere: Lambda, containers, bare processes.
-
-## The Core Question
-
-A traditional matching engine holds the order book in memory. That makes it fast but hard to scale horizontally and impossible to run serverlessly. This PoC tests the alternative:
-
-1. **Lock** the order book for a trading pair (Dragonfly/Redis `SET NX EX`)
-2. **Load** the relevant slice from cache (sorted sets)
-3. **Match** the incoming order
-4. **Write** results back to cache + DB
-5. **Release** the lock
-
-If multiple workers can do this concurrently across pairs — and sequentially within a pair — without data corruption, race conditions, or unacceptable latency, the pattern is viable.
+A high-performance, stateless matching engine built in **Rust**. Each invocation acquires a per-pair lock, loads the order book from cache, matches, writes results, and releases. If this pattern handles millions of operations without data corruption or race conditions, it can deploy anywhere: Lambda, containers, bare metal.
 
 ## Stack
 
-| Component | Technology |
-|-----------|-----------|
+| Layer | Technology |
+|-------|-----------|
+| Language | **Rust** (tokio async runtime) |
 | Cache + Locking + Queues | **Dragonfly** (Redis-compatible, multi-threaded) |
 | Database | **PostgreSQL** |
-| Services | **Node.js / TypeScript** |
 | Local env | **Docker Compose** |
 
 ## Structure
@@ -30,23 +18,30 @@ If multiple workers can do this concurrently across pairs — and sequentially w
 ```
 .
 ├── docs/                        # Specs, ADRs, design notes
-├── services/
+├── crates/
 │   ├── matching-engine/         # Core: stateless order matching
 │   ├── order-service/           # Order lifecycle
-│   └── transaction-service/     # Trade persistence
-├── shared/                      # Dragonfly utilities, locking, streams
+│   ├── transaction-service/     # Trade persistence
+│   └── shared/                  # Dragonfly client, locking, streams, types
 ├── tests/                       # Integration & load tests
 ├── docker-compose.yml           # Dragonfly + PostgreSQL
+├── Cargo.toml                   # Workspace manifest
 └── scripts/                     # Dev & test scripts
 ```
 
 ## Quick Start
 
 ```bash
-docker compose up -d             # Start Dragonfly + PostgreSQL
-# (service implementation TBD)
+docker compose up -d                    # Start Dragonfly + PostgreSQL
+cargo build                             # Build all crates
+cargo test                              # Run tests
+cargo bench                             # Run benchmarks
 ```
 
 ## Roadmap
 
 → [`docs/planning/roadmap.md`](docs/planning/roadmap.md)
+
+## Decisions
+
+→ [`docs/decisions/`](docs/decisions/)
