@@ -2,40 +2,47 @@
 
 ## Core Concept
 
-Stateless matching engine workers that:
-1. Acquire a per-pair distributed lock
-2. Load the order book slice from cache
-3. Match the incoming order
+Stateless matching engine workers (Rust async tasks) that:
+1. Acquire a per-pair distributed lock (Dragonfly `SET NX EX`)
+2. Load the order book slice from cache (sorted sets)
+3. Match the incoming order (price-time priority)
 4. Write results to cache + DB
 5. Release the lock
 
-Workers are interchangeable — any worker can process any pair. Pairs are isolated by lock.
+Workers are interchangeable. Pairs are isolated by lock.
+
+## Technology Stack
+
+| Layer | Technology | Crate |
+|-------|-----------|-------|
+| Async runtime | tokio (multi-threaded) | `tokio` |
+| Dragonfly client | redis-rs + connection pool | `redis`, `deadpool-redis` |
+| PostgreSQL | sqlx (compile-time checked queries) | `sqlx` |
+| Serialization | serde + MessagePack | `serde`, `rmp-serde` |
+| Logging/Tracing | tracing | `tracing`, `tracing-subscriber` |
 
 ## Components
 
-### Matching Engine
-- Consumes orders from Dragonfly Stream (`stream:orders:match`)
-- Acquires lock for the pair → loads book → matches → writes → releases
+### Matching Engine (`crates/matching-engine`)
+- Consumes orders from Dragonfly Stream
+- Lock → load → match → write → release cycle
 - Stateless: no in-memory state between invocations
 
-### Order Service
-- Receives order requests (create, cancel, update)
+### Order Service (`crates/order-service`)
+- Order lifecycle (create, cancel, update)
 - Validates and persists to PostgreSQL
-- Publishes to `stream:orders:match`
+- Publishes to match stream
 
-### Transaction Service
-- Consumes trade events from `stream:transactions`
+### Transaction Service (`crates/transaction-service`)
+- Consumes trade events
 - Persists trades, updates balances
 
-### Dragonfly (Redis-compatible)
-- **Locking:** `book:{pair_id}:lock` (SET NX EX)
-- **Order Book Cache:** `book:{pair_id}:bids` / `book:{pair_id}:asks` (sorted sets by price)
-- **Versioning:** `book:{pair_id}:version` (INCR)
-- **Queues:** Streams with consumer groups
-
-### PostgreSQL
-- Source of truth for orders, transactions, balances
-- Cache-first reads, async version-guarded writes
+### Shared (`crates/shared`)
+- Dragonfly client factory + health check
+- Order Book Locking (acquire, release, backoff)
+- Stream producer/consumer helpers
+- Common types (Order, Trade, Pair)
+- PostgreSQL connection + migrations
 
 ## Data Flow
 
@@ -49,7 +56,7 @@ Order Request
 XADD stream:orders:match
     │
     ▼
-[Matching Engine Worker]     ← any available worker picks it up
+[Matching Engine Worker]     ← tokio task picks it up
     │
     ├─ SET book:{pair_id}:lock NX EX 1
     ├─ ZRANGEBYSCORE book:{pair_id}:asks (load relevant orders)
@@ -66,7 +73,7 @@ XADD stream:orders:match
 ## Key Invariants to Prove
 
 1. **No duplicate fills** — an order is never matched twice
-2. **No lost orders** — every submitted order is either matched, resting, or explicitly cancelled
-3. **Sequential consistency per pair** — orders within a pair are processed in submission order
+2. **No lost orders** — every order is matched, resting, or cancelled
+3. **Sequential consistency per pair** — processed in submission order
 4. **Cross-pair independence** — pairs never block each other
-5. **Lock safety** — a crashed worker does not permanently block a pair (TTL expiry)
+5. **Lock safety** — crashed worker does not permanently block (TTL expiry)
