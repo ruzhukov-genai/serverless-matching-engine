@@ -1,23 +1,23 @@
 # ADR-003: Stateless Matching Engine Mode
 
-**Status:** Proposed
+**Status:** Accepted
 
 ## Context
 
-To run the Matching Engine as a Lambda, it must not hold in-memory state between invocations. Each invocation should load what it needs, process, and finalize.
+To run the Matching Engine as a stateless worker (Lambda, container, or tokio task), it must not hold in-memory state between invocations. Each invocation should load what it needs, process, and finalize.
 
 ## Decision
 
-Introduce a `StatelessMode` flag (environment variable / CDK stack parameter). When enabled:
-1. Load Order Book from Redis cache (DB fallback) on invocation start
-2. Process the order
-3. Write results before returning
+Introduce a `STATELESS_MODE` flag (environment variable). When enabled:
+1. Load Order Book from Dragonfly cache (PostgreSQL fallback) on invocation start
+2. Process the order (match under lock)
+3. Write results to cache + DB before returning
 
 ## Consequences
 
 **Benefits:**
-- Enables Lambda deployment
-- Simplifies horizontal scaling
+- Enables any deployment model (Lambda, containers, bare tokio tasks)
+- Simplifies horizontal scaling — workers are interchangeable
 
 **Risks:**
 - Higher latency per invocation (load + process + write vs. in-memory)
@@ -27,10 +27,10 @@ Introduce a `StatelessMode` flag (environment variable / CDK stack parameter). W
 
 - Load only relevant side of book (buy/sell) filtered by price
 - Lazy loading: 10 → 20 → 40 orders
-- Redis sorted sets for price-ordered retrieval
+- Dragonfly sorted sets for price-ordered retrieval
 
 ## Follow-ups
 
 - [ ] Benchmark load latency for various order book sizes
 - [ ] Define lazy-load batch sizes
-- [ ] Test with `StatelessMode=false` (backward-compatible)
+- [ ] Test with `STATELESS_MODE=false` (backward-compatible, in-memory book)
