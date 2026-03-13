@@ -1,49 +1,45 @@
 # Roadmap
 
-## Phase 0 — Local Dev Environment *(current)*
-- [x] Create monorepo structure
-- [x] Finalize cache/queue choice → Dragonfly (ADR-004)
-- [x] Finalize DB choice → PostgreSQL (ADR-004)
-- [ ] Docker Compose: Dragonfly + PostgreSQL + service containers
-- [ ] Define data schemas (order, transaction, trade event, pair)
-- [ ] PostgreSQL migrations setup (e.g. node-pg-migrate or Prisma)
-- [ ] Dragonfly connection + health check utility
-- [ ] Basic project scaffolding (TypeScript, shared packages)
+The goal is to prove the stateless matching pattern works — correctness first, then performance, then deployment.
 
-## Phase 1 — Stateless Matching Engine
-- [ ] Implement `StatelessMode` flag
-- [ ] Order Book load from Dragonfly (sorted sets → DB fallback)
-- [ ] Lazy loading implementation
-- [ ] Price-filtered queries
-- [ ] Load test: baseline throughput (matches/sec)
+## Phase 1 — Skeleton + Locking *(start here)*
+- [ ] Docker Compose up (Dragonfly + PostgreSQL)
+- [ ] Shared Dragonfly client + connection health check
+- [ ] Order Book Locking implementation (SET NX EX, backoff with jitter)
+- [ ] Lock correctness test: multiple workers competing for same pair lock
+- [ ] PostgreSQL schema: orders, transactions, pairs (minimal)
 
-## Phase 2 — Distributed Locking
-- [ ] Implement Order Book Locking (per `common-functions.md` spec)
-- [ ] Exponential backoff with jitter
-- [ ] Lock metrics instrumentation
+## Phase 2 — Stateless Matching Engine
+- [ ] Order book load from Dragonfly sorted sets
+- [ ] Basic matching logic (limit orders: price-time priority)
+- [ ] Stateless cycle: lock → load → match → write → release
+- [ ] Single-pair integration test: submit orders, verify matches
+- [ ] Multi-pair test: concurrent matching across different pairs
 
-## Phase 3 — Service Refactoring
-- [ ] Dragonfly Streams for all inter-service communication
+## Phase 3 — Concurrency & Correctness
+- [ ] Stress test: many workers, same pair, rapid-fire orders
+- [ ] Verify no race conditions (duplicate fills, lost orders, version conflicts)
+- [ ] Verify ordering guarantees (earlier orders matched first)
+- [ ] Edge cases: partial fills, cancel during match, empty book
+- [ ] Lock contention metrics: wait time, retry count, failure rate
+
+## Phase 4 — Streams & Service Communication
+- [ ] Dragonfly Streams: order submission → matching → transaction flow
 - [ ] Consumer groups per service
-- [ ] StatDispatcher + StatsUpdater implementation
+- [ ] End-to-end flow: submit order → match → trade → balance update
+- [ ] Dead letter handling for failed messages
 
-## Phase 4 — Lambda Deployment
-- [ ] Lambda packaging (Matching Engine)
-- [ ] Lambda packaging (Order Service + StatDispatcher + StatsUpdater)
-- [ ] Lambda packaging (Transaction Service)
-- [ ] SQS trigger integration (replacing Dragonfly Streams)
-- [ ] End-to-end integration test
+## Phase 5 — Performance
+- [ ] Load test: orders/sec throughput (single pair)
+- [ ] Load test: throughput scaling across N pairs
+- [ ] Lazy loading optimization (batch 10 → 20 → 40)
+- [ ] Price-filtered loading (only relevant side of book)
+- [ ] Identify bottlenecks: locking, DB writes, cache reads
 
-## Phase 5 — Hardening
-- [ ] RedLock implementation (multi-node Dragonfly/Redis)
-- [ ] DLQ handling for all streams
-- [ ] Observability: X-Ray tracing, CloudWatch dashboards
-- [ ] Load test: production-scale throughput target
+## Phase 6 — Production Deployment *(later)*
+- [ ] Lambda packaging + SQS triggers
+- [ ] IaC (CDK/SAM)
+- [ ] Aurora Serverless v2 + ElastiCache/Dragonfly Cloud
+- [ ] Observability, security, runbooks
 
-## Phase 6 — Production Readiness
-- [ ] Security review (IAM least-privilege, VPC placement)
-- [ ] Migration path: Dragonfly → ElastiCache / Dragonfly Cloud
-- [ ] Migration path: PostgreSQL → Aurora Serverless v2
-- [ ] Canary deployment strategy
-- [ ] Runbooks for common failure scenarios
-- [ ] Cost analysis vs. current stateful setup
+> Phases 1-5 are the PoC. Phase 6 happens only after the pattern is proven.
