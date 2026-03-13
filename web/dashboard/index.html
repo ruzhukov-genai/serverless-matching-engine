@@ -8,7 +8,7 @@
 </head>
 <body>
     <header>
-        <h1>Serverless Matching Engine</h1>
+        <h1>⚙ Serverless Matching Engine</h1>
         <nav>
             <a href="/trading/">Trading</a>
             <a href="/dashboard/" class="active">Dashboard</a>
@@ -16,102 +16,124 @@
     </header>
 
     <main>
-        <!-- Key Metrics -->
+
+        <!-- KPI Cards -->
         <section id="kpi-cards">
             <div class="card">
                 <span class="label">Orders/sec</span>
-                <span class="value" id="kpi-orders">0</span>
+                <span class="value" id="kpi-orders">—</span>
             </div>
             <div class="card">
                 <span class="label">Matches/sec</span>
-                <span class="value" id="kpi-matches">0</span>
+                <span class="value" id="kpi-matches">—</span>
             </div>
             <div class="card">
                 <span class="label">Trades/sec</span>
-                <span class="value" id="kpi-trades">0</span>
+                <span class="value" id="kpi-trades">—</span>
             </div>
             <div class="card">
                 <span class="label">Active Pairs</span>
-                <span class="value" id="kpi-pairs">0</span>
+                <span class="value" id="kpi-pairs">—</span>
             </div>
             <div class="card">
                 <span class="label">Workers</span>
-                <span class="value" id="kpi-workers">0</span>
+                <span class="value" id="kpi-workers">—</span>
             </div>
         </section>
 
+        <!-- Throughput + Latency Charts -->
         <div class="grid-2">
-            <!-- Throughput Chart -->
             <section id="throughput">
-                <h2>Throughput (orders/sec)</h2>
-                <canvas id="throughput-chart" height="200"></canvas>
+                <h2>Throughput</h2>
+                <div class="chart-container">
+                    <canvas id="throughput-chart" height="180"></canvas>
+                </div>
             </section>
-
-            <!-- Latency Chart -->
             <section id="latency">
                 <h2>Match Latency (ms)</h2>
-                <canvas id="latency-chart" height="200"></canvas>
+                <div class="chart-container">
+                    <canvas id="latency-chart" height="180"></canvas>
+                </div>
             </section>
         </div>
 
+        <!-- Lock Contention + Stream Depths -->
         <div class="grid-2">
-            <!-- Lock Contention -->
             <section id="locks">
                 <h2>Lock Contention</h2>
                 <div class="metric-row">
-                    <span>Contention Rate</span>
-                    <span id="lock-contention">0%</span>
+                    <span class="mkey">Contention Rate</span>
+                    <span class="mval" id="lock-contention">—</span>
                 </div>
                 <div class="metric-row">
-                    <span>Avg Wait Time</span>
-                    <span id="lock-wait">0 ms</span>
+                    <span class="mkey">Avg Wait Time</span>
+                    <span class="mval" id="lock-wait">—</span>
                 </div>
                 <div class="metric-row">
-                    <span>Total Retries</span>
-                    <span id="lock-retries">0</span>
+                    <span class="mkey">Total Retries</span>
+                    <span class="mval" id="lock-retries">—</span>
                 </div>
                 <div class="metric-row">
-                    <span>Failures</span>
-                    <span id="lock-failures">0</span>
+                    <span class="mkey">Failures</span>
+                    <span class="mval" id="lock-failures">—</span>
                 </div>
             </section>
 
-            <!-- Stream Depths -->
             <section id="streams">
                 <h2>Stream Depths</h2>
-                <div class="metric-row">
-                    <span>stream:orders:match</span>
-                    <span id="stream-orders">0</span>
-                </div>
-                <div class="metric-row">
-                    <span>stream:transactions</span>
-                    <span id="stream-transactions">0</span>
-                </div>
-                <div class="metric-row">
-                    <span>stream:update_stats</span>
-                    <span id="stream-stats">0</span>
+                <div id="stream-list">
+                    <div class="stream-item" id="stream-orders-item">
+                        <div class="stream-header">
+                            <span class="stream-name">stream:orders:match</span>
+                            <span class="stream-count" id="stream-orders">—</span>
+                        </div>
+                        <div class="stream-bar-bg">
+                            <div class="stream-bar-fill" id="stream-orders-bar" style="width:0%"></div>
+                        </div>
+                    </div>
+                    <div class="stream-item" id="stream-transactions-item">
+                        <div class="stream-header">
+                            <span class="stream-name">stream:transactions</span>
+                            <span class="stream-count" id="stream-transactions">—</span>
+                        </div>
+                        <div class="stream-bar-bg">
+                            <div class="stream-bar-fill" id="stream-transactions-bar" style="width:0%"></div>
+                        </div>
+                    </div>
+                    <div class="stream-item" id="stream-stats-item">
+                        <div class="stream-header">
+                            <span class="stream-name">stream:update_stats</span>
+                            <span class="stream-count" id="stream-stats">—</span>
+                        </div>
+                        <div class="stream-bar-bg">
+                            <div class="stream-bar-fill" id="stream-stats-bar" style="width:0%"></div>
+                        </div>
+                    </div>
                 </div>
             </section>
         </div>
 
-        <!-- Audit Log (recent events) -->
+        <!-- Audit Log -->
         <section id="audit">
             <h2>Recent Events</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Seq</th>
-                        <th>Time</th>
-                        <th>Pair</th>
-                        <th>Event</th>
-                        <th>Details</th>
-                    </tr>
-                </thead>
-                <tbody id="audit-body">
-                    <!-- Populated by JS -->
-                </tbody>
-            </table>
+            <div class="audit-scroll">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>Time</th>
+                            <th>Pair</th>
+                            <th>Event</th>
+                            <th>Details</th>
+                        </tr>
+                    </thead>
+                    <tbody id="audit-body">
+                        <tr><td colspan="5" class="empty">Loading…</td></tr>
+                    </tbody>
+                </table>
+            </div>
         </section>
+
     </main>
 
     <script src="app.js"></script>

@@ -29,3 +29,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 anyhow = "1"
 rand = "0.8"
+rust_decimal_macros = "1"
