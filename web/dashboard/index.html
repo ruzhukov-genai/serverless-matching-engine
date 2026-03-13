@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SME — Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header>
+        <h1>Serverless Matching Engine</h1>
+        <nav>
+            <a href="/trading/">Trading</a>
+            <a href="/dashboard/" class="active">Dashboard</a>
+        </nav>
+    </header>
+
+    <main>
+        <!-- Key Metrics -->
+        <section id="kpi-cards">
+            <div class="card">
+                <span class="label">Orders/sec</span>
+                <span class="value" id="kpi-orders">0</span>
+            </div>
+            <div class="card">
+                <span class="label">Matches/sec</span>
+                <span class="value" id="kpi-matches">0</span>
+            </div>
+            <div class="card">
+                <span class="label">Trades/sec</span>
+                <span class="value" id="kpi-trades">0</span>
+            </div>
+            <div class="card">
+                <span class="label">Active Pairs</span>
+                <span class="value" id="kpi-pairs">0</span>
+            </div>
+            <div class="card">
+                <span class="label">Workers</span>
+                <span class="value" id="kpi-workers">0</span>
+            </div>
+        </section>
+
+        <div class="grid-2">
+            <!-- Throughput Chart -->
+            <section id="throughput">
+                <h2>Throughput (orders/sec)</h2>
+                <canvas id="throughput-chart" height="200"></canvas>
+            </section>
+
+            <!-- Latency Chart -->
+            <section id="latency">
+                <h2>Match Latency (ms)</h2>
+                <canvas id="latency-chart" height="200"></canvas>
+            </section>
+        </div>
+
+        <div class="grid-2">
+            <!-- Lock Contention -->
+            <section id="locks">
+                <h2>Lock Contention</h2>
+                <div class="metric-row">
+                    <span>Contention Rate</span>
+                    <span id="lock-contention">0%</span>
+                </div>
+                <div class="metric-row">
+                    <span>Avg Wait Time</span>
+                    <span id="lock-wait">0 ms</span>
+                </div>
+                <div class="metric-row">
+                    <span>Total Retries</span>
+                    <span id="lock-retries">0</span>
+                </div>
+                <div class="metric-row">
+                    <span>Failures</span>
+                    <span id="lock-failures">0</span>
+                </div>
+            </section>
+
+            <!-- Stream Depths -->
+            <section id="streams">
+                <h2>Stream Depths</h2>
+                <div class="metric-row">
+                    <span>stream:orders:match</span>
+                    <span id="stream-orders">0</span>
+                </div>
+                <div class="metric-row">
+                    <span>stream:transactions</span>
+                    <span id="stream-transactions">0</span>
+                </div>
+                <div class="metric-row">
+                    <span>stream:update_stats</span>
+                    <span id="stream-stats">0</span>
+                </div>
+            </section>
+        </div>
+
+        <!-- Audit Log (recent events) -->
+        <section id="audit">
+            <h2>Recent Events</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Seq</th>
+                        <th>Time</th>
+                        <th>Pair</th>
+                        <th>Event</th>
+                        <th>Details</th>
+                    </tr>
+                </thead>
+                <tbody id="audit-body">
+                    <!-- Populated by JS -->
+                </tbody>
+            </table>
+        </section>
+    </main>
+
+    <script src="app.js"></script>
+</body>
+</html>
