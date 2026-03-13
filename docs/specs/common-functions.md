@@ -1,10 +1,13 @@
 # Spec: Common Functions
 
+## Crate: `crates/shared`
+
 ## Order Book Locking
 
 Organizes concurrent access and preserves message sequence per order book.
+Uses Dragonfly (Redis-compatible) distributed locking.
 
-### Redis Keys
+### Dragonfly Keys
 
 | Key | Type | Purpose |
 |-----|------|---------|
@@ -15,10 +18,10 @@ Organizes concurrent access and preserves message sequence per order book.
 ### Algorithm
 
 ```
-1. Receive message from Rabbit queue
+1. Receive message from Dragonfly Stream
 2. RPUSH book:{pair_id}:queue {message}
 3. Obtain Lock:
-   a. res = SET book:{pair_id}:lock {randomId} NX EX 1
+   a. res = SET book:{pair_id}:lock {worker_id} NX EX 1
 4. IF res != null (lock acquired):
    a. message = LPOP book:{pair_id}:queue
    b. Execute order book function (match, update, etc.)
@@ -26,24 +29,24 @@ Organizes concurrent access and preserves message sequence per order book.
    d. INCR book:{pair_id}:version
    e. Release Lock:
       - res = GET book:{pair_id}:lock
-      - IF res == {randomId}: DEL book:{pair_id}:lock
+      - IF res == {worker_id}: DEL book:{pair_id}:lock
 5. ELSE (lock contention):
-   a. AdjustedRetryTime = RetryTime[RetryAttempt]  (exponential backoff)
-   b. AdjustedRetryTime *= (1 + 0.2 * Random())    (jitter)
+   a. AdjustedRetryTime = BACKOFF[attempt]  (exponential: [10, 20, 50, 100, 200, 500] ms)
+   b. AdjustedRetryTime *= (1 + 0.2 * random())  (jitter)
    c. Wait AdjustedRetryTime
-   d. RetryAttempt += 1
-   e. Go to step 3
+   d. attempt += 1
+   e. If attempt > MAX_RETRIES (10): fail + requeue
+   f. Go to step 3
 6. On any error: Release Lock
 ```
 
 ### Notes
 
-- `{randomId}` must be unique per lock holder to prevent accidental release
-- Single-node Redis weakness: mitigated via RedLock post-migration
-- Backoff list (to define): e.g. `[10ms, 20ms, 50ms, 100ms, 200ms, 500ms]`
+- `{worker_id}` must be unique per lock holder to prevent accidental release
+- Single-node Dragonfly weakness: mitigated via RedLock post-migration
+- Lock TTL (1 second) ensures crashed workers do not permanently block a pair
 
 ### TODO
 
-- [ ] Define `RetryTime` backoff array and max attempts
 - [ ] Instrument: lock wait time, contention rate, lock duration
-- [ ] RedLock implementation plan
+- [ ] RedLock implementation plan (multi-node Dragonfly)
