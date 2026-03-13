@@ -11,22 +11,27 @@ A high-performance, stateless matching engine built in **Rust**. Each invocation
 | Language | **Rust** (tokio async runtime) |
 | Cache + Locking + Queues | **Dragonfly** (Redis-compatible, multi-threaded) |
 | Database | **PostgreSQL** |
+| API | **axum** (HTTP + WebSocket) |
+| Frontend | Vanilla HTML/JS (dark theme) |
 | Local env | **Docker Compose** |
 
 ## Structure
 
 ```
 .
-├── docs/                        # Specs, ADRs, design notes
 ├── crates/
+│   ├── shared/                  # Types, locking, cache, streams, DB
 │   ├── matching-engine/         # Core: stateless order matching
 │   ├── order-service/           # Order lifecycle
 │   ├── transaction-service/     # Trade persistence
-│   └── shared/                  # Dragonfly client, locking, streams, types
+│   └── api/                     # REST + WebSocket server (axum)
+├── web/
+│   ├── trading/                 # Trading UI (pairs, portfolio, order entry)
+│   └── dashboard/               # Admin metrics dashboard
 ├── tests/                       # Integration & load tests
+├── docs/                        # Specs, ADRs, design notes
 ├── docker-compose.yml           # Dragonfly + PostgreSQL
-├── Cargo.toml                   # Workspace manifest
-└── scripts/                     # Dev & test scripts
+└── Cargo.toml                   # Workspace manifest
 ```
 
 ## Quick Start
@@ -34,9 +39,14 @@ A high-performance, stateless matching engine built in **Rust**. Each invocation
 ```bash
 docker compose up -d                    # Start Dragonfly + PostgreSQL
 cargo build                             # Build all crates
-cargo test                              # Run tests
-cargo bench                             # Run benchmarks
+cargo run --bin sme-api                 # Start API server
+# http://localhost:3000/trading/        # Trading UI
+# http://localhost:3000/dashboard/      # Metrics dashboard
 ```
+
+## Features
+
+→ [`docs/specs/features.md`](docs/specs/features.md) — complete feature list by tier
 
 ## Roadmap
 
