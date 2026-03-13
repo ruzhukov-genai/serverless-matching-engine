@@ -353,14 +353,18 @@ async function submitOrder() {
         return;
     }
 
+    // Capitalize to match Rust serde enum format (Buy/Sell, Limit/Market)
+    const sideCapital = currentSide.charAt(0).toUpperCase() + currentSide.slice(1);
+    const typeCapital = orderType.charAt(0).toUpperCase() + orderType.slice(1);
+
     const body = {
         pair_id:    currentPair,
-        side:       currentSide,
-        order_type: orderType,
-        quantity:   parseFloat(quantity),
+        side:       sideCapital,
+        order_type: typeCapital,
+        quantity:   quantity,
         tif:        tif.toUpperCase(),
     };
-    if (orderType === 'limit') body.price = parseFloat(price);
+    if (orderType === 'limit') body.price = price;
 
     const btn = document.getElementById('submit-order');
     btn.disabled    = true;
