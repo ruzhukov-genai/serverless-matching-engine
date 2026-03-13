@@ -9,6 +9,7 @@ This directory contains Architecture Decision Records — lightweight docs captu
 | [ADR-001](ADR-001-serverless-architecture.md) | Adopt Serverless (Lambda) Architecture | Accepted |
 | [ADR-002](ADR-002-redis-locking.md) | Redis-based Order Book Locking | Accepted |
 | [ADR-003](ADR-003-stateless-matching-engine.md) | Stateless Matching Engine Mode | Proposed |
+| [ADR-004](ADR-004-dragonfly-postgresql.md) | Dragonfly for Cache/Queue, PostgreSQL for Persistence | Accepted |
 
 ## Format
 
