@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use tokio::sync::mpsc;
+
 use axum::{
     extract::{Path, Query, State, WebSocketUpgrade, ws::Message, ws::WebSocket},
     http::StatusCode,
@@ -69,6 +71,75 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
 type HandlerResult<T> = Result<T, AppError>;
 
 const PAIRS: &[&str] = &["BTC-USDT", "ETH-USDT", "SOL-USDT"];
+
+// ── Async persistence ─────────────────────────────────────────────────────────
+
+/// Job sent to the background persistence worker after a Lua match completes.
+pub struct PersistJob {
+    pub order: Order,
+    pub trades: Vec<Trade>,
+    pub lua_trades: Vec<cache::LuaTrade>,
+}
+
+/// Spawn a background worker that drains `rx` and persists each job to PostgreSQL.
+pub fn spawn_persist_worker(
+    pg: sqlx::PgPool,
+    mut rx: mpsc::Receiver<PersistJob>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(job) = rx.recv().await {
+            if let Err(e) = process_persist_job(&pg, job).await {
+                tracing::error!(error = %e, "async persist failed");
+            }
+        }
+    })
+}
+
+/// Execute all DB writes for a single matched order (off the hot path).
+async fn process_persist_job(pg: &sqlx::PgPool, job: PersistJob) -> anyhow::Result<()> {
+    let persist_start = std::time::Instant::now();
+
+    // 1. Audit: ORDER_CREATED
+    insert_audit_event(
+        pg,
+        Some(&job.order.pair_id),
+        "ORDER_CREATED",
+        &json!({
+            "order_id": job.order.id.to_string(),
+            "user_id": job.order.user_id,
+            "side": format!("{:?}", job.order.side),
+            "order_type": format!("{:?}", job.order.order_type),
+            "price": job.order.price.map(|v| v.to_string()),
+            "quantity": job.order.quantity.to_string(),
+        }),
+    )
+    .await
+    .ok();
+
+    // 2. Persist trades + settle balances (single DB transaction)
+    let _ = persist_trades(pg, &job.trades).await?;
+
+    // 3. Update resting orders' statuses in DB
+    update_resting_orders_after_lua(pg, &job.lua_trades).await?;
+
+    // 4. Update incoming order's remaining + status in DB
+    update_order_db(pg, &job.order).await?;
+
+    // 5. Release balance lock if order is fully resolved
+    if job.order.status == OrderStatus::Cancelled || job.order.status == OrderStatus::Filled {
+        release_remaining_locked(pg, &job.order).await?;
+    }
+
+    let persist_ms = persist_start.elapsed().as_millis() as u64;
+    tracing::info!(
+        persist_ms = persist_ms,
+        trade_count = job.trades.len(),
+        order_id = %job.order.id,
+        "persist complete"
+    );
+
+    Ok(())
+}
 
 // ── GET /api/pairs ────────────────────────────────────────────────────────────
 
@@ -511,7 +582,6 @@ pub async fn create_order(
     order.status = lua_result.status;
 
     let trade_count = lua_result.trades.len();
-    let total_ms = total_start.elapsed().as_millis() as u64;
 
     // Metrics (best-effort)
     {
@@ -527,25 +597,10 @@ pub async fn create_order(
         });
     }
 
-    let post_lock_start = std::time::Instant::now();
+    // ── Respond immediately; persist in background ────────────────────────
+    let respond_start = std::time::Instant::now();
 
-    insert_audit_event(
-        &s.pg,
-        Some(&req.pair_id),
-        "ORDER_CREATED",
-        &json!({
-            "order_id": order.id.to_string(),
-            "user_id": order.user_id,
-            "side": format!("{:?}", order.side),
-            "order_type": format!("{:?}", order.order_type),
-            "price": order.price.map(|v| v.to_string()),
-            "quantity": order.quantity.to_string(),
-        }),
-    )
-    .await
-    .ok();
-
-    // Convert LuaTrades → Trade objects (UUIDs generated in Rust, not Lua)
+    // Build Trade objects (UUIDs generated in Rust, not Lua)
     let trade_now = Utc::now();
     let trades: Vec<Trade> = lua_result.trades.iter().map(|lt| {
         let (buy_order_id, sell_order_id) = match order.side {
@@ -566,26 +621,36 @@ pub async fn create_order(
         }
     }).collect();
 
-    // Persist trades + settle balances (single DB transaction)
-    let trade_jsons = persist_trades(&s.pg, &trades).await?;
+    // Build trade JSON synchronously from Trade structs — no DB round-trip needed
+    let trade_jsons: Vec<Value> = trades.iter().map(trade_to_json).collect();
 
-    // Update resting orders' statuses in DB using arithmetic SQL.
-    // Dragonfly is already correct (Lua committed atomically); this syncs Postgres.
-    update_resting_orders_after_lua(&s.pg, &lua_result.trades).await?;
-
-    // Update incoming order's remaining + status in DB
-    update_order_db(&s.pg, &order).await?;
-
-    if order.status == OrderStatus::Cancelled || order.status == OrderStatus::Filled {
-        release_remaining_locked(&s.pg, &order).await?;
+    // Send persist job to background worker (non-blocking)
+    let job = PersistJob {
+        order: order.clone(),
+        trades,
+        lua_trades: lua_result.trades,
+    };
+    match s.persist_tx.try_send(job) {
+        Ok(()) => {}
+        Err(e) => {
+            // Channel full or closed — bypass channel and spawn directly
+            tracing::warn!("persist channel full, spawning direct persist task");
+            let job = e.into_inner();
+            let pg = s.pg.clone();
+            tokio::spawn(async move {
+                if let Err(err) = process_persist_job(&pg, job).await {
+                    tracing::error!(error = %err, "direct persist task failed");
+                }
+            });
+        }
     }
 
-    let post_lock_ms = post_lock_start.elapsed().as_millis() as u64;
+    let respond_ms = respond_start.elapsed().as_millis() as u64;
+    let total_ms = total_start.elapsed().as_millis() as u64;
 
     tracing::info!(
         lua_ms = lua_ms,
-        match_ms = 0_u64,
-        post_lock_ms = post_lock_ms,
+        respond_ms = respond_ms,
         total_ms = total_ms,
         trade_count = trade_count,
         pair_id = %req.pair_id,

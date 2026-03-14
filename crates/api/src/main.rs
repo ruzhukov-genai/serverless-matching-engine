@@ -5,6 +5,7 @@ use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
@@ -28,6 +29,8 @@ pub struct AppState {
     pub pg: PgPool,
     /// In-memory pairs cache: pair_id → PairConfig
     pub pairs_cache: Arc<HashMap<String, PairConfig>>,
+    /// Channel to the background persistence worker
+    pub persist_tx: mpsc::Sender<routes::PersistJob>,
 }
 
 #[tokio::main]
@@ -55,7 +58,11 @@ async fn main() -> Result<()> {
     let pairs_cache = Arc::new(load_pairs_cache(&pg).await?);
     tracing::info!(count = pairs_cache.len(), "pairs cache loaded");
 
-    let state = AppState { dragonfly, pg, pairs_cache };
+    // Spawn background persistence worker
+    let (persist_tx, persist_rx) = mpsc::channel::<routes::PersistJob>(1000);
+    routes::spawn_persist_worker(pg.clone(), persist_rx);
+
+    let state = AppState { dragonfly, pg, pairs_cache, persist_tx };
 
     let app = Router::new()
         // Trading API
