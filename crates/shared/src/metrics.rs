@@ -147,3 +147,77 @@ pub fn compute_percentiles(mut samples: Vec<u64>) -> (f64, f64, f64) {
     };
     (percentile(50.0), percentile(95.0), percentile(99.0))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percentiles_empty() {
+        let (p50, p95, p99) = compute_percentiles(vec![]);
+        assert_eq!(p50, 0.0);
+        assert_eq!(p95, 0.0);
+        assert_eq!(p99, 0.0);
+    }
+
+    #[test]
+    fn percentiles_single() {
+        let (p50, p95, p99) = compute_percentiles(vec![42]);
+        assert_eq!(p50, 42.0);
+        assert_eq!(p95, 42.0);
+        assert_eq!(p99, 42.0);
+    }
+
+    #[test]
+    fn percentiles_two_values() {
+        let (p50, p95, p99) = compute_percentiles(vec![10, 20]);
+        assert_eq!(p50, 20.0); // idx = round(0.5 * 1) = 1
+        assert_eq!(p95, 20.0);
+        assert_eq!(p99, 20.0);
+    }
+
+    #[test]
+    fn percentiles_100_values() {
+        // 1..=100 → idx = round(pct/100 * 99)
+        let samples: Vec<u64> = (1..=100).collect();
+        let (p50, p95, p99) = compute_percentiles(samples);
+        // p50: round(0.5 * 99) = 50 → samples[49]=50 (0-indexed) or samples[50]=51
+        // Actual: round(49.5) = 50 → samples[50] = 51
+        assert_eq!(p50, 51.0);
+        assert_eq!(p95, 95.0);  // round(94.05) = 94 → samples[94] = 95
+        assert_eq!(p99, 99.0);  // round(98.01) = 98 → samples[98] = 99
+    }
+
+    #[test]
+    fn percentiles_unsorted_input() {
+        // Should sort internally
+        let samples = vec![100, 1, 50, 75, 25, 90, 10, 5, 95, 99];
+        let (p50, p95, p99) = compute_percentiles(samples);
+        assert!(p50 > 0.0);
+        assert!(p95 >= p50);
+        assert!(p99 >= p95);
+    }
+
+    #[test]
+    fn percentiles_all_same() {
+        let samples = vec![7, 7, 7, 7, 7];
+        let (p50, p95, p99) = compute_percentiles(samples);
+        assert_eq!(p50, 7.0);
+        assert_eq!(p95, 7.0);
+        assert_eq!(p99, 7.0);
+    }
+
+    #[test]
+    fn percentiles_large_outlier() {
+        // 99 values of 1, one value of 1000 (at index 99 after sort)
+        let mut samples: Vec<u64> = vec![1; 99];
+        samples.push(1000);
+        let (p50, p95, p99) = compute_percentiles(samples);
+        assert_eq!(p50, 1.0);
+        // p95: round(0.95 * 99) = round(94.05) = 94 → samples[94] = 1
+        assert_eq!(p95, 1.0);
+        // p99: round(0.99 * 99) = round(98.01) = 98 → samples[98] = 1 (outlier is at 99)
+        assert_eq!(p99, 1.0);
+        // The outlier at index 99 is only hit at P100
+    }
+}

@@ -1348,6 +1348,71 @@ mod tests {
     // METRICS
     // ═══════════════════════════════════════════════════════════════════════
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // LOCK DIAGNOSTICS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn lock_is_locked_and_fence() {
+        let pool = dragonfly_pool().await;
+        let pair = "TEST-DIAG";
+        cleanup_pair(&pool, pair).await;
+
+        // Not locked initially
+        assert!(!lock::is_locked(&pool, pair).await.unwrap());
+        let f0 = lock::current_fence(&pool, pair).await.unwrap();
+
+        // Acquire
+        let guard = lock::acquire_lock(&pool, pair, "w1").await.unwrap();
+        assert!(lock::is_locked(&pool, pair).await.unwrap());
+        let f1 = lock::current_fence(&pool, pair).await.unwrap();
+        assert!(f1 > f0);
+        assert_eq!(guard.fence_token, f1);
+
+        // Release
+        guard.release().await;
+        assert!(!lock::is_locked(&pool, pair).await.unwrap());
+
+        // Fence persists after release
+        let f2 = lock::current_fence(&pool, pair).await.unwrap();
+        assert_eq!(f2, f1);
+
+        cleanup_pair(&pool, pair).await;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // CACHE VERSION (non-mutating read)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn cache_get_version_non_mutating() {
+        let pool = dragonfly_pool().await;
+        let pair = "TEST-GETVER";
+        cleanup_pair(&pool, pair).await;
+
+        // Initial version = 0 (key doesn't exist)
+        let v0 = cache::get_version(&pool, pair).await.unwrap();
+        assert_eq!(v0, 0);
+
+        // Increment
+        let v1 = cache::increment_version(&pool, pair).await.unwrap();
+        assert_eq!(v1, 1);
+
+        // get_version should return 1 without incrementing
+        let v1_read = cache::get_version(&pool, pair).await.unwrap();
+        assert_eq!(v1_read, 1);
+
+        // Read again — still 1 (not incrementing)
+        let v1_read2 = cache::get_version(&pool, pair).await.unwrap();
+        assert_eq!(v1_read2, 1);
+
+        cleanup_pair(&pool, pair).await;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // METRICS
+    // ═══════════════════════════════════════════════════════════════════════
+
     #[tokio::test]
     async fn metrics_record_and_read() {
         use crate::metrics;
