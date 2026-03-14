@@ -1,10 +1,9 @@
 use anyhow::Result;
-use chrono::Utc;
 use rust_decimal::Decimal;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use sme_shared::{cache, streams, Config, Order, OrderStatus, Pair, Side, TimeInForce};
+use sme_shared::{cache, streams, Config, Order, Side};
 
 const STREAM_ORDERS: &str = "stream:orders";
 const STREAM_ORDERS_MATCH: &str = "stream:orders:match";

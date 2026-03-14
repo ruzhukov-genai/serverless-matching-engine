@@ -163,6 +163,94 @@ pub async fn increment_version(pool: &Pool, pair_id: &str) -> Result<i64> {
     Ok(v)
 }
 
+/// Load orders from one side with optional price filter.
+///
+/// For a Buy incoming order (price = limit):
+///   - Load asks with score <= buy_price (cheapest asks that qualify).
+/// For a Sell incoming order (price = limit):
+///   - Load bids with score >= -sell_price (i.e. bids where -score <= sell_price → bid price >= sell_price).
+/// If `limit_price` is None (market order), load all orders.
+pub async fn load_order_book_filtered(
+    pool: &Pool,
+    pair_id: &str,
+    side: Side,
+    limit_price: Option<rust_decimal::Decimal>,
+) -> Result<Vec<Order>> {
+    let mut conn = pool.get().await.context("pool.get")?;
+    let key = book_key(pair_id, side);
+
+    let (min_score, max_score) = match limit_price {
+        None => ("-inf".to_string(), "+inf".to_string()),
+        Some(price) => {
+            let f: f64 = price.to_string().parse().unwrap_or(0.0);
+            match side {
+                // asks: score = +price, we want asks where score <= buy_price
+                Side::Sell => ("-inf".to_string(), f.to_string()),
+                // bids: score = -price, we want bids where -score >= sell_price → score <= -sell_price
+                Side::Buy => ("-inf".to_string(), (-f).to_string()),
+            }
+        }
+    };
+
+    let ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
+        .arg(&key)
+        .arg(&min_score)
+        .arg(&max_score)
+        .query_async(&mut *conn)
+        .await
+        .context("ZRANGEBYSCORE filtered")?;
+
+    let mut orders = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let okey = format!("order:{id}");
+        let data: Option<String> = conn.hget(&okey, "data").await.context("HGET")?;
+        if let Some(json) = data {
+            match serde_json::from_str::<Order>(&json) {
+                Ok(order) => orders.push(order),
+                Err(e) => tracing::warn!("bad order json for {id}: {e}"),
+            }
+        }
+    }
+    Ok(orders)
+}
+
+/// Load a batch of orders from one side using ZRANGEBYSCORE with LIMIT (for lazy loading).
+/// `offset` and `count` implement pagination through the book.
+pub async fn load_order_book_batched(
+    pool: &Pool,
+    pair_id: &str,
+    side: Side,
+    offset: isize,
+    count: isize,
+) -> Result<Vec<Order>> {
+    let mut conn = pool.get().await.context("pool.get")?;
+    let key = book_key(pair_id, side);
+
+    let ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
+        .arg(&key)
+        .arg("-inf")
+        .arg("+inf")
+        .arg("LIMIT")
+        .arg(offset)
+        .arg(count)
+        .query_async(&mut *conn)
+        .await
+        .context("ZRANGEBYSCORE batched")?;
+
+    let mut orders = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let okey = format!("order:{id}");
+        let data: Option<String> = conn.hget(&okey, "data").await.context("HGET")?;
+        if let Some(json) = data {
+            match serde_json::from_str::<Order>(&json) {
+                Ok(order) => orders.push(order),
+                Err(e) => tracing::warn!("bad order json for {id}: {e}"),
+            }
+        }
+    }
+    Ok(orders)
+}
+
 /// Read the current version counter without modifying it.
 pub async fn get_version(pool: &Pool, pair_id: &str) -> Result<i64> {
     let mut conn = pool.get().await.context("pool.get")?;

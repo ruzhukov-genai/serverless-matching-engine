@@ -30,3 +30,4 @@ thiserror = "2"
 anyhow = "1"
 rand = "0.8"
 rust_decimal_macros = "1"
+criterion = { version = "0.5", features = ["html_reports"] }

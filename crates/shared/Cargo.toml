@@ -24,3 +24,8 @@ integration = []
 
 [dev-dependencies]
 rust_decimal_macros = "1"
+criterion.workspace = true
+
+[[bench]]
+name = "matching"
+harness = false

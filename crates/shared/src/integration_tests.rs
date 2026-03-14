@@ -1253,4 +1253,153 @@ mod tests {
         cleanup_pair(&pool, pair_btc).await;
         cleanup_pair(&pool, pair_eth).await;
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // PRICE-FILTERED LOADING
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn cache_filtered_asks_by_buy_price() {
+        let pool = dragonfly_pool().await;
+        let pair = "TEST-FILT-ASK";
+        cleanup_pair(&pool, pair).await;
+
+        // Asks at 99, 100, 101, 102
+        let orders: Vec<Order> = vec![
+            test_order(Side::Sell, dec!(99), dec!(1), pair, "s1"),
+            test_order(Side::Sell, dec!(100), dec!(1), pair, "s2"),
+            test_order(Side::Sell, dec!(101), dec!(1), pair, "s3"),
+            test_order(Side::Sell, dec!(102), dec!(1), pair, "s4"),
+        ];
+        for o in &orders { cache::save_order_to_book(&pool, o).await.unwrap(); }
+
+        // Buy at 100: should only get asks <= 100
+        let filtered = cache::load_order_book_filtered(&pool, pair, Side::Sell, Some(dec!(100))).await.unwrap();
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|o| o.price.unwrap() <= dec!(100)));
+
+        // No filter: get all 4
+        let all = cache::load_order_book_filtered(&pool, pair, Side::Sell, None).await.unwrap();
+        assert_eq!(all.len(), 4);
+
+        for o in &orders { cleanup_order(&pool, &o.id).await; }
+        cleanup_pair(&pool, pair).await;
+    }
+
+    #[tokio::test]
+    async fn cache_filtered_bids_by_sell_price() {
+        let pool = dragonfly_pool().await;
+        let pair = "TEST-FILT-BID";
+        cleanup_pair(&pool, pair).await;
+
+        // Bids at 98, 99, 100, 101
+        let orders: Vec<Order> = vec![
+            test_order(Side::Buy, dec!(98), dec!(1), pair, "b1"),
+            test_order(Side::Buy, dec!(99), dec!(1), pair, "b2"),
+            test_order(Side::Buy, dec!(100), dec!(1), pair, "b3"),
+            test_order(Side::Buy, dec!(101), dec!(1), pair, "b4"),
+        ];
+        for o in &orders { cache::save_order_to_book(&pool, o).await.unwrap(); }
+
+        // Sell at 100: should only get bids >= 100
+        let filtered = cache::load_order_book_filtered(&pool, pair, Side::Buy, Some(dec!(100))).await.unwrap();
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|o| o.price.unwrap() >= dec!(100)));
+
+        for o in &orders { cleanup_order(&pool, &o.id).await; }
+        cleanup_pair(&pool, pair).await;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // BATCHED LOADING
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn cache_batched_loading() {
+        let pool = dragonfly_pool().await;
+        let pair = "TEST-BATCH";
+        cleanup_pair(&pool, pair).await;
+
+        // 10 asks at prices 1..10
+        let orders: Vec<Order> = (1..=10)
+            .map(|i| test_order(Side::Sell, Decimal::from(i), dec!(1), pair, &format!("s{i}")))
+            .collect();
+        for o in &orders { cache::save_order_to_book(&pool, o).await.unwrap(); }
+
+        // Batch 1: first 3
+        let b1 = cache::load_order_book_batched(&pool, pair, Side::Sell, 0, 3).await.unwrap();
+        assert_eq!(b1.len(), 3);
+        assert_eq!(b1[0].price, Some(Decimal::from(1)));
+
+        // Batch 2: next 3
+        let b2 = cache::load_order_book_batched(&pool, pair, Side::Sell, 3, 3).await.unwrap();
+        assert_eq!(b2.len(), 3);
+        assert_eq!(b2[0].price, Some(Decimal::from(4)));
+
+        // Batch beyond end: get remaining
+        let b4 = cache::load_order_book_batched(&pool, pair, Side::Sell, 8, 10).await.unwrap();
+        assert_eq!(b4.len(), 2);
+
+        for o in &orders { cleanup_order(&pool, &o.id).await; }
+        cleanup_pair(&pool, pair).await;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // METRICS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn metrics_record_and_read() {
+        use crate::metrics;
+
+        let pool = dragonfly_pool().await;
+        let pair = "TEST-METRICS";
+
+        // Clean up metrics keys
+        let mut conn = pool.get().await.unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg(format!("metrics:{pair}:latency"))
+            .arg(format!("metrics:{pair}:lock_wait"))
+            .arg(format!("metrics:{pair}:orders"))
+            .arg(format!("metrics:{pair}:trades"))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        // Record metrics
+        metrics::record_match_latency(&pool, pair, 5).await.unwrap();
+        metrics::record_match_latency(&pool, pair, 10).await.unwrap();
+        metrics::record_match_latency(&pool, pair, 3).await.unwrap();
+        metrics::record_lock_wait(&pool, pair, 2).await.unwrap();
+        metrics::increment_order_count(&pool, pair).await.unwrap();
+        metrics::increment_order_count(&pool, pair).await.unwrap();
+        metrics::increment_trade_count(&pool, pair, 3).await.unwrap();
+
+        // Read back
+        assert_eq!(metrics::get_order_count(&pool, pair).await.unwrap(), 2);
+        assert_eq!(metrics::get_trade_count(&pool, pair).await.unwrap(), 3);
+
+        let latencies = metrics::get_latency_samples(&pool, pair, 10).await.unwrap();
+        assert_eq!(latencies.len(), 3);
+
+        let lock_waits = metrics::get_lock_wait_samples(&pool, pair, 10).await.unwrap();
+        assert_eq!(lock_waits.len(), 1);
+
+        // Percentiles
+        let (p50, p95, p99) = metrics::compute_percentiles(latencies);
+        assert!(p50 > 0.0);
+        assert!(p99 >= p95);
+
+        // Cleanup
+        let mut conn = pool.get().await.unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg(format!("metrics:{pair}:latency"))
+            .arg(format!("metrics:{pair}:lock_wait"))
+            .arg(format!("metrics:{pair}:orders"))
+            .arg(format!("metrics:{pair}:trades"))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+    }
 }
