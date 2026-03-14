@@ -787,7 +787,15 @@ pub async fn get_portfolio(
     State(s): State<AppState>,
 ) -> HandlerResult<impl IntoResponse> {
     let user_id = q.user_id.unwrap_or_else(|| "user-1".to_string());
-    // Use background pool for read-only queries — keep hot pool free for order writes
+
+    // Serve from in-memory cache (refreshed every 2s)
+    let cache = s.portfolio_cache.read().await;
+    if let Some(cached) = cache.get(&user_id) {
+        return Ok(Json(cached.clone()));
+    }
+    drop(cache);
+
+    // Cache miss — query PG directly (first request for this user)
     let rows = sqlx::query(
         "SELECT user_id, asset, available, locked FROM balances WHERE user_id = $1",
     )
@@ -807,7 +815,13 @@ pub async fn get_portfolio(
         })
         .collect();
 
-    Ok(Json(json!({ "balances": balances })))
+    let result = json!({ "balances": balances });
+
+    // Populate cache for next request
+    let mut w = s.portfolio_cache.write().await;
+    w.insert(user_id, result.clone());
+
+    Ok(Json(result))
 }
 
 // ── WebSocket Feeds ───────────────────────────────────────────────────────────
@@ -1649,6 +1663,46 @@ async fn settle_trade_balances(pg: &sqlx::PgPool, trade: &Trade) -> anyhow::Resu
 
 fn sort_score(order: &Order) -> f64 {
     order.book_score()
+}
+
+// ── Background portfolio refresh ─────────────────────────────────────────────
+
+/// Refreshes all user balances every 2 seconds. Single query, partitioned by user.
+pub async fn portfolio_refresh_loop(
+    pg: sqlx::PgPool,
+    cache: std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, Value>>>,
+) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let rows = match sqlx::query(
+            "SELECT user_id, asset, available, locked FROM balances ORDER BY user_id, asset",
+        )
+        .fetch_all(&pg)
+        .await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let mut by_user: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
+        for r in &rows {
+            let uid: String = r.get("user_id");
+            by_user.entry(uid).or_default().push(json!({
+                "user_id": r.get::<String, _>("user_id"),
+                "asset": r.get::<String, _>("asset"),
+                "available": r.get::<Decimal, _>("available").to_string(),
+                "locked": r.get::<Decimal, _>("locked").to_string(),
+            }));
+        }
+
+        let mut new_cache = std::collections::HashMap::new();
+        for (uid, balances) in by_user {
+            new_cache.insert(uid, json!({ "balances": balances }));
+        }
+
+        let mut w = cache.write().await;
+        *w = new_cache;
+    }
 }
 
 // ── Background ticker refresh ────────────────────────────────────────────────

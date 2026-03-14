@@ -51,6 +51,8 @@ pub struct AppState {
     pub trades_cache: Arc<RwLock<HashMap<String, serde_json::Value>>>,
     /// Order events broadcast — all order state changes pushed here
     pub order_events_tx: broadcast::Sender<String>,
+    /// Cached portfolio balances per user — refreshed every 2s
+    pub portfolio_cache: Arc<RwLock<HashMap<String, serde_json::Value>>>,
 }
 
 #[tokio::main]
@@ -146,11 +148,24 @@ async fn main() -> Result<()> {
     // Order events broadcast — single channel, WS clients filter by user_id
     let (order_events_tx, _) = broadcast::channel::<String>(1024);
 
+    let portfolio_cache: Arc<RwLock<HashMap<String, serde_json::Value>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
+    // Portfolio cache refresh — every 2s, all users with balances
+    {
+        let pc = portfolio_cache.clone();
+        let pg = pg_bg.clone();
+        tokio::spawn(async move {
+            routes::portfolio_refresh_loop(pg, pc).await;
+        });
+    }
+
     let state = AppState {
         dragonfly, pg: pg_hot, pg_bg, pairs_cache,
         pairs_list_cache: Arc::new(RwLock::new(Vec::new())),
         persist_tx,
         book_broadcasts, book_snapshots, metrics_cache, ticker_cache, trades_cache, order_events_tx,
+        portfolio_cache,
     };
 
     let app = Router::new()
