@@ -415,14 +415,16 @@ function renderPortfolio(balances) {
         tbody.innerHTML = '<tr><td colspan="4" class="empty">No balances</td></tr>';
         return;
     }
-    tbody.innerHTML = balances.map(b =>
-        `<tr>` +
-        `<td class="asset-name">${esc(b.asset)}</td>` +
-        `<td>${fmtQty(parseFloat(b.available))}</td>` +
-        `<td>${fmtQty(parseFloat(b.locked))}</td>` +
-        `<td>${fmtQty(parseFloat(b.total))}</td>` +
-        `</tr>`
-    ).join('');
+    tbody.innerHTML = balances.map(b => {
+        const avail = parseFloat(b.available) || 0;
+        const locked = parseFloat(b.locked) || 0;
+        return `<tr>` +
+            `<td class="asset-name">${esc(b.asset)}</td>` +
+            `<td>${fmtQty(avail)}</td>` +
+            `<td>${fmtQty(locked)}</td>` +
+            `<td>${fmtQty(avail + locked)}</td>` +
+            `</tr>`;
+    }).join('');
 }
 
 // ── Open Orders ───────────────────────────────────────────────────────────────
