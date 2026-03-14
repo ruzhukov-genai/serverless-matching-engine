@@ -96,7 +96,7 @@ pub fn spawn_persist_worker(
 }
 
 /// Execute all DB writes for a single matched order (off the hot path).
-async fn process_persist_job(pg: &sqlx::PgPool, job: PersistJob) -> anyhow::Result<()> {
+pub async fn process_persist_job(pg: &sqlx::PgPool, job: PersistJob) -> anyhow::Result<()> {
     let persist_start = std::time::Instant::now();
 
     // 1. Audit: ORDER_CREATED
@@ -1139,7 +1139,7 @@ pub async fn insert_audit_event(
 // ── DB helpers ─────────────────────────────────────────────────────────────────
 
 /// Validate order against the in-memory pairs cache — zero DB round-trips.
-fn validate_order_request(
+pub fn validate_order_request(
     pairs_cache: &HashMap<String, PairConfig>,
     order: &Order,
 ) -> anyhow::Result<()> {
@@ -1165,7 +1165,7 @@ fn validate_order_request(
     Ok(())
 }
 
-async fn insert_order_db(pg: &sqlx::PgPool, order: &Order) -> anyhow::Result<()> {
+pub async fn insert_order_db(pg: &sqlx::PgPool, order: &Order) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, created_at, updated_at, client_order_id)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
@@ -1304,7 +1304,7 @@ fn row_to_order_json(r: &sqlx::postgres::PgRow) -> Value {
     order_to_json(&order)
 }
 
-fn order_to_json(o: &Order) -> Value {
+pub fn order_to_json(o: &Order) -> Value {
     let mut j = json!({
         "id": o.id.to_string(),
         "user_id": o.user_id,
@@ -1327,7 +1327,7 @@ fn order_to_json(o: &Order) -> Value {
     j
 }
 
-fn trade_to_json(t: &Trade) -> Value {
+pub fn trade_to_json(t: &Trade) -> Value {
     json!({
         "id": t.id.to_string(),
         "pair_id": t.pair_id,
@@ -1341,7 +1341,7 @@ fn trade_to_json(t: &Trade) -> Value {
     })
 }
 
-async fn lock_balance(pg: &sqlx::PgPool, order: &Order) -> anyhow::Result<()> {
+pub async fn lock_balance(pg: &sqlx::PgPool, order: &Order) -> anyhow::Result<()> {
     let (asset, amount) = get_lock_asset_amount(pg, order).await?;
     let rows_affected = sqlx::query(
         "UPDATE balances SET available = available - $1, locked = locked + $1
@@ -1667,7 +1667,48 @@ fn sort_score(order: &Order) -> f64 {
 
 // ── Background portfolio refresh ─────────────────────────────────────────────
 
-/// Refreshes all user balances every 2 seconds. Single query, partitioned by user.
+/// Refreshes all user balances every 2 seconds (worker version).
+pub async fn portfolio_refresh_loop_worker(
+    dragonfly: deadpool_redis::Pool,
+    pg: sqlx::PgPool,
+) {
+    use deadpool_redis::redis::AsyncCommands;
+    
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let rows = match sqlx::query(
+            "SELECT user_id, asset, available, locked FROM balances ORDER BY user_id, asset",
+        )
+        .fetch_all(&pg)
+        .await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let mut by_user: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
+        for r in &rows {
+            let uid: String = r.get("user_id");
+            by_user.entry(uid).or_default().push(json!({
+                "user_id": r.get::<String, _>("user_id"),
+                "asset": r.get::<String, _>("asset"),
+                "available": r.get::<Decimal, _>("available").to_string(),
+                "locked": r.get::<Decimal, _>("locked").to_string(),
+            }));
+        }
+
+        // Update portfolio cache in Dragonfly
+        if let Ok(mut conn) = dragonfly.get().await {
+            for (user_id, balances) in by_user {
+                let portfolio_json = json!({ "balances": balances });
+                let portfolio_str = serde_json::to_string(&portfolio_json).unwrap_or("{}".to_string());
+                let _: Result<(), _> = conn.set(format!("cache:portfolio:{}", user_id), &portfolio_str).await;
+            }
+        }
+    }
+}
+
+/// Refreshes all user balances every 2 seconds (original in-memory version).
 pub async fn portfolio_refresh_loop(
     pg: sqlx::PgPool,
     cache: std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, Value>>>,
@@ -1707,7 +1748,104 @@ pub async fn portfolio_refresh_loop(
 
 // ── Background ticker refresh ────────────────────────────────────────────────
 
-/// Runs forever, refreshing ticker + recent trades for all pairs every 2 seconds.
+/// Runs forever, refreshing ticker + recent trades for all pairs every 2 seconds (worker version).
+pub async fn ticker_trades_refresh_loop_worker(
+    dragonfly: deadpool_redis::Pool,
+    pg: sqlx::PgPool,
+) {
+    use deadpool_redis::redis::AsyncCommands;
+    use tokio::time::{Duration, interval};
+    let mut ticker = interval(Duration::from_secs(2));
+
+    loop {
+        ticker.tick().await;
+
+        // Single query for all pairs — one round trip instead of N
+        let rows = sqlx::query(
+            "SELECT pair_id,
+                    MAX(price) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') as high_24h,
+                    MIN(price) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') as low_24h,
+                    SUM(quantity) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') as volume_24h
+             FROM trades GROUP BY pair_id",
+        )
+        .fetch_all(&pg)
+        .await;
+
+        let agg_rows = match rows {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "ticker refresh failed (agg)");
+                continue;
+            }
+        };
+
+        // Get last prices in one query
+        let last_rows = sqlx::query(
+            "SELECT DISTINCT ON (pair_id) pair_id, price as last_price
+             FROM trades ORDER BY pair_id, created_at DESC",
+        )
+        .fetch_all(&pg)
+        .await;
+
+        let last_prices: std::collections::HashMap<String, Decimal> = match last_rows {
+            Ok(r) => r.iter().map(|row| {
+                let pid: String = row.get("pair_id");
+                let price: Decimal = row.get("last_price");
+                (pid, price)
+            }).collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "ticker refresh failed (last)");
+                continue;
+            }
+        };
+
+        // Update ticker cache in Dragonfly
+        if let Ok(mut conn) = dragonfly.get().await {
+            for row in &agg_rows {
+                let pair_id: String = row.get("pair_id");
+                let last = last_prices.get(&pair_id).map(|v| v.to_string());
+                let ticker_json = json!({
+                    "pair": pair_id,
+                    "last": last,
+                    "high_24h": row.get::<Option<Decimal>, _>("high_24h").map(|v| v.to_string()),
+                    "low_24h": row.get::<Option<Decimal>, _>("low_24h").map(|v| v.to_string()),
+                    "volume_24h": row.get::<Option<Decimal>, _>("volume_24h").map(|v| v.to_string()),
+                });
+                let ticker_str = serde_json::to_string(&ticker_json).unwrap_or("{}".to_string());
+                let _: Result<(), _> = conn.set(format!("cache:ticker:{}", pair_id), &ticker_str).await;
+            }
+        }
+
+        // Refresh recent trades for all pairs (single query, last hour, top 150)
+        if let Ok(rows) = sqlx::query(
+            "SELECT id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, sequence, created_at
+             FROM trades WHERE created_at >= NOW() - INTERVAL '1 hour' ORDER BY created_at DESC LIMIT 150",
+        )
+        .fetch_all(&pg)
+        .await {
+            let mut by_pair: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
+            for r in &rows {
+                let pair: String = r.get("pair_id");
+                let entry = by_pair.entry(pair).or_default();
+                if entry.len() < 50 {
+                    entry.push(row_to_trade_json(r));
+                }
+            }
+            
+            // Update trades cache in Dragonfly
+            if let Ok(mut conn) = dragonfly.get().await {
+                for pair_id in PAIRS {
+                    let trades = by_pair.get(*pair_id).cloned().unwrap_or_default();
+                    let trades_json = json!({ "pair": pair_id, "trades": trades });
+                    let trades_str = serde_json::to_string(&trades_json).unwrap_or("{}".to_string());
+                    let _: Result<(), _> = conn.set(format!("cache:trades:{}", pair_id), &trades_str).await;
+                }
+            }
+        }
+    }
+}
+
+/// Runs forever, refreshing ticker + recent trades for all pairs every 2 seconds (original in-memory version).
 pub async fn ticker_trades_refresh_loop(
     pg: sqlx::PgPool,
     cache: std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, Value>>>,
@@ -1800,7 +1938,121 @@ pub async fn ticker_trades_refresh_loop(
 
 // ── Background metrics refresh ───────────────────────────────────────────────
 
-/// Runs forever, refreshing metrics cache every 5 seconds.
+/// Runs forever, refreshing metrics cache every 5 seconds (worker version).
+pub async fn metrics_refresh_loop_worker(
+    dragonfly: deadpool_redis::Pool,
+    pg: sqlx::PgPool,
+) {
+    use deadpool_redis::redis::AsyncCommands;
+    use tokio::time::{Duration, interval};
+    let mut ticker = interval(Duration::from_secs(5));
+
+    loop {
+        ticker.tick().await;
+
+        // ── /api/metrics ──
+        let mut total_orders: i64 = 0;
+        let mut total_trades: i64 = 0;
+        for pair_id in PAIRS {
+            total_orders += metrics::get_order_count(&dragonfly, pair_id).await.unwrap_or(0);
+            total_trades += metrics::get_trade_count(&dragonfly, pair_id).await.unwrap_or(0);
+        }
+        let mut all_latency: Vec<u64> = Vec::new();
+        for pair_id in PAIRS {
+            let samples = metrics::get_latency_samples(&dragonfly, pair_id, 100).await.unwrap_or_default();
+            all_latency.extend(samples);
+        }
+        let (p50, p95, p99) = metrics::compute_percentiles(all_latency);
+
+        let metrics_val = json!({
+            "orders_per_sec": total_orders,
+            "matches_per_sec": total_trades,
+            "trades_per_sec": total_trades,
+            "active_pairs": 3,
+            "active_workers": 1,
+            "latency": { "p50": p50, "p95": p95, "p99": p99 },
+            "streams": {},
+        });
+
+        // ── /api/metrics/locks ──
+        let mut all_waits: Vec<u64> = Vec::new();
+        for pair_id in PAIRS {
+            let samples = metrics::get_lock_wait_samples(&dragonfly, pair_id, 1000).await.unwrap_or_default();
+            all_waits.extend(samples);
+        }
+        let (avg_wait_ms, contention_rate) = if all_waits.is_empty() {
+            (0.0f64, 0.0f64)
+        } else {
+            let avg = all_waits.iter().sum::<u64>() as f64 / all_waits.len() as f64;
+            let contended = all_waits.iter().filter(|&&v| v > 1).count();
+            let rate = contended as f64 / all_waits.len() as f64;
+            (avg, rate)
+        };
+        let locks_val = json!({
+            "contention_rate": contention_rate,
+            "avg_wait_ms": avg_wait_ms,
+            "retry_count": all_waits.len(),
+            "failures": 0,
+        });
+
+        // ── /api/metrics/latency (detailed) ──
+        let mut all_samples: Vec<u64> = Vec::new();
+        let mut per_pair: Vec<Value> = Vec::new();
+        for pair_id in PAIRS {
+            let samples = metrics::get_latency_samples(&dragonfly, pair_id, 1000).await.unwrap_or_default();
+            let (pp50, pp95, pp99) = metrics::compute_percentiles(samples.clone());
+            per_pair.push(json!({
+                "pair_id": pair_id,
+                "sample_count": samples.len(),
+                "p50": pp50, "p95": pp95, "p99": pp99,
+            }));
+            all_samples.extend(samples);
+        }
+        let (lp50, lp95, lp99) = metrics::compute_percentiles(all_samples.clone());
+        let latency_val = json!({
+            "sample_count": all_samples.len(),
+            "p50": lp50, "p95": lp95, "p99": lp99,
+            "per_pair": per_pair,
+        });
+
+        // ── /api/metrics/throughput ──
+        let throughput_val = match sqlx::query(
+            "SELECT date_trunc('minute', created_at) as bucket, COUNT(*) as count
+             FROM trades WHERE created_at >= NOW() - INTERVAL '1 hour'
+             GROUP BY bucket ORDER BY bucket",
+        )
+        .fetch_all(&pg)
+        .await {
+            Ok(rows) => {
+                let series: Vec<Value> = rows.iter().map(|r| {
+                    json!({
+                        "time": r.get::<chrono::DateTime<chrono::Utc>, _>("bucket").to_rfc3339(),
+                        "count": r.get::<i64, _>("count"),
+                    })
+                }).collect();
+                json!({ "series": series })
+            }
+            Err(_) => json!({ "series": [] }),
+        };
+
+        // Write to Dragonfly cache keys
+        if let Ok(mut conn) = dragonfly.get().await {
+            let metrics_str = serde_json::to_string(&metrics_val).unwrap_or("{}".to_string());
+            let _: Result<(), _> = conn.set("cache:metrics", &metrics_str).await;
+            
+            let locks_str = serde_json::to_string(&locks_val).unwrap_or("{}".to_string());
+            let _: Result<(), _> = conn.set("cache:lock_metrics", &locks_str).await;
+            
+            let latency_str = serde_json::to_string(&latency_val).unwrap_or("{}".to_string());
+            let _: Result<(), _> = conn.set("cache:latency_metrics", &latency_str).await;
+            
+            let throughput_str = serde_json::to_string(&throughput_val).unwrap_or("{}".to_string());
+            let _: Result<(), _> = conn.set("cache:throughput", &throughput_str).await;
+        }
+    }
+}
+
+/// Runs forever, refreshing metrics cache every 5 seconds (original in-memory version).
 pub async fn metrics_refresh_loop(
     dragonfly: deadpool_redis::Pool,
     pg: sqlx::PgPool,

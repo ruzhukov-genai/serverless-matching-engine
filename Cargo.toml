@@ -6,6 +6,7 @@ members = [
     "crates/order-service",
     "crates/transaction-service",
     "crates/api",
+    "crates/gateway",
     "tools/loadtest",
 ]
 

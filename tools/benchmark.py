@@ -184,7 +184,7 @@ async def place_orders(session, stats, client_id, deadline):
             async with session.post(f"{BASE_URL}/api/orders", json=body) as resp:
                 await resp.read()
                 ms = (time.monotonic() - t0) * 1000
-                if resp.status in (200, 201): stats.orders.record(ms)
+                if resp.status in (200, 201, 202): stats.orders.record(ms)
                 else: stats.orders.record_error()
         except: stats.orders.record_error()
         seq += 1

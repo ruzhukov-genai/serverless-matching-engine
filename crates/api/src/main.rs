@@ -1,17 +1,17 @@
 use anyhow::Result;
-use axum::{Router, routing::get};
 use deadpool_redis::Pool as RedisPool;
+use deadpool_redis::redis::AsyncCommands;
 use rust_decimal::Decimal;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, RwLock};
-use tower_http::cors::CorsLayer;
-use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
+use serde_json::{json, Value};
 
 mod routes;
+mod worker;
 
 /// Cached pair configuration — loaded once at startup, never re-queried.
 /// Eliminates the SELECT from pairs on every order validation.
@@ -27,32 +27,32 @@ pub struct PairConfig {
 #[derive(Clone)]
 pub struct AppState {
     pub dragonfly: RedisPool,
-    /// Hot path pool — used by create_order, list_orders, cancel_order, get_portfolio, etc.
-    /// Fast, low contention, max 30 connections.
+    /// Hot path pool — used by order writes.
     pub pg: PgPool,
-    /// Background persist pool — used exclusively by the async persist worker.
-    /// Tolerates higher latency, max 20 connections.
+    /// Background pool — async persist + read-only queries.
     pub pg_bg: PgPool,
     /// In-memory pairs cache: pair_id → PairConfig
     pub pairs_cache: Arc<HashMap<String, PairConfig>>,
-    /// Cached /api/pairs response — loaded on first request, never changes
-    pub pairs_list_cache: Arc<RwLock<Vec<serde_json::Value>>>,
     /// Channel to the background persistence worker
     pub persist_tx: mpsc::Sender<routes::PersistJob>,
-    /// Shared orderbook broadcast: one poller per pair, all WS clients subscribe
-    pub book_broadcasts: Arc<HashMap<String, broadcast::Sender<String>>>,
     /// Cached orderbook snapshots — updated by broadcast pollers
     pub book_snapshots: Arc<RwLock<HashMap<String, serde_json::Value>>>,
-    /// Cached metrics — refreshed every 5s by a background task
-    pub metrics_cache: Arc<RwLock<serde_json::Value>>,
-    /// Cached ticker data per pair — refreshed every 2s
-    pub ticker_cache: Arc<RwLock<HashMap<String, serde_json::Value>>>,
-    /// Cached recent trades per pair — refreshed every 2s
-    pub trades_cache: Arc<RwLock<HashMap<String, serde_json::Value>>>,
     /// Order events broadcast — all order state changes pushed here
     pub order_events_tx: broadcast::Sender<String>,
-    /// Cached portfolio balances per user — refreshed every 2s
+    // Legacy fields kept for compile compat with old handlers in routes.rs
+    // These are unused in the worker — gateway reads from Dragonfly cache keys instead
+    #[allow(dead_code)]
+    pub pairs_list_cache: Arc<RwLock<Vec<serde_json::Value>>>,
+    #[allow(dead_code)]
+    pub metrics_cache: Arc<RwLock<serde_json::Value>>,
+    #[allow(dead_code)]
+    pub ticker_cache: Arc<RwLock<HashMap<String, serde_json::Value>>>,
+    #[allow(dead_code)]
+    pub trades_cache: Arc<RwLock<HashMap<String, serde_json::Value>>>,
+    #[allow(dead_code)]
     pub portfolio_cache: Arc<RwLock<HashMap<String, serde_json::Value>>>,
+    #[allow(dead_code)]
+    pub book_broadcasts: Arc<HashMap<String, broadcast::Sender<String>>>,
 }
 
 #[tokio::main]
@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
         .json()
         .init();
 
-    tracing::info!("sme-api starting");
+    tracing::info!("sme-api (worker) starting");
 
     let config = sme_shared::Config::from_env();
     let dragonfly = sme_shared::cache::create_pool(&config.dragonfly_url).await?;
@@ -101,113 +101,76 @@ async fn main() -> Result<()> {
     let pairs_cache = Arc::new(load_pairs_cache(&pg_hot).await?);
     tracing::info!(count = pairs_cache.len(), "pairs cache loaded");
 
+    // Initialize cache keys in Dragonfly
+    tracing::info!("initializing cache keys");
+    initialize_cache_keys(&dragonfly, &pg_hot, &pairs_cache).await?;
+
     // Spawn background persistence worker — uses dedicated pg_bg pool
     let (persist_tx, persist_rx) = mpsc::channel::<routes::PersistJob>(1000);
     routes::spawn_persist_worker(pg_bg.clone(), persist_rx);
 
-    // Shared orderbook broadcast — one poller per pair, fan-out to all WS clients
-    let mut book_broadcasts = HashMap::new();
-    let book_snapshots = Arc::new(RwLock::new(HashMap::<String, serde_json::Value>::new()));
-    for pair_id in ["BTC-USDT", "ETH-USDT", "SOL-USDT"] {
-        let (tx, _) = broadcast::channel::<String>(64);
-        book_broadcasts.insert(pair_id.to_string(), tx.clone());
-
-        // Spawn a single polling task per pair
-        let df = dragonfly.clone();
-        let pair = pair_id.to_string();
-        let snap_cache = book_snapshots.clone();
-        tokio::spawn(async move {
-            routes::orderbook_broadcast_poller(df, pair, tx, snap_cache).await;
-        });
-    }
-    let book_broadcasts = Arc::new(book_broadcasts);
-
-    // Cached metrics — refreshed every 5s by background task
-    let metrics_cache = Arc::new(RwLock::new(serde_json::json!({})));
-    {
-        let cache = metrics_cache.clone();
-        let df = dragonfly.clone();
-        let pg = pg_hot.clone();
-        tokio::spawn(async move {
-            routes::metrics_refresh_loop(df, pg, cache).await;
-        });
-    }
-
-    // Cached ticker + trades — refreshed every 2s by background task
-    let ticker_cache = Arc::new(RwLock::new(HashMap::<String, serde_json::Value>::new()));
-    let trades_cache = Arc::new(RwLock::new(HashMap::<String, serde_json::Value>::new()));
-    {
-        let tc = ticker_cache.clone();
-        let trc = trades_cache.clone();
-        let pg = pg_hot.clone();
-        tokio::spawn(async move {
-            routes::ticker_trades_refresh_loop(pg, tc, trc).await;
-        });
-    }
-
-    // Order events broadcast — single channel, WS clients filter by user_id
+    // Order events broadcast — single channel, gateway WS clients filter by user_id
     let (order_events_tx, _) = broadcast::channel::<String>(1024);
+    let book_snapshots = Arc::new(RwLock::new(HashMap::<String, serde_json::Value>::new()));
 
-    let portfolio_cache: Arc<RwLock<HashMap<String, serde_json::Value>>> =
-        Arc::new(RwLock::new(HashMap::new()));
-
-    // Portfolio cache refresh — every 2s, all users with balances
-    {
-        let pc = portfolio_cache.clone();
-        let pg = pg_bg.clone();
-        tokio::spawn(async move {
-            routes::portfolio_refresh_loop(pg, pc).await;
-        });
-    }
+    let book_broadcasts = Arc::new(HashMap::<String, broadcast::Sender<String>>::new());
 
     let state = AppState {
-        dragonfly, pg: pg_hot, pg_bg, pairs_cache,
-        pairs_list_cache: Arc::new(RwLock::new(Vec::new())),
+        dragonfly: dragonfly.clone(), pg: pg_hot, pg_bg: pg_bg.clone(), pairs_cache,
         persist_tx,
-        book_broadcasts, book_snapshots, metrics_cache, ticker_cache, trades_cache, order_events_tx,
-        portfolio_cache,
+        book_snapshots, order_events_tx,
+        // Legacy (unused by worker, kept for compile compat)
+        pairs_list_cache: Arc::new(RwLock::new(Vec::new())),
+        metrics_cache: Arc::new(RwLock::new(json!({}))),
+        ticker_cache: Arc::new(RwLock::new(HashMap::new())),
+        trades_cache: Arc::new(RwLock::new(HashMap::new())),
+        portfolio_cache: Arc::new(RwLock::new(HashMap::new())),
+        book_broadcasts,
     };
 
-    let app = Router::new()
-        // Trading API
-        .route("/api/pairs", get(routes::list_pairs))
-        .route("/api/orderbook/{pair_id}", get(routes::get_orderbook))
-        .route("/api/trades/{pair_id}", get(routes::get_trades))
-        .route("/api/ticker/{pair_id}", get(routes::get_ticker))
-        .route("/api/orders", get(routes::list_orders).post(routes::create_order).delete(routes::cancel_all_orders))
-        .route(
-            "/api/orders/{order_id}",
-            axum::routing::delete(routes::cancel_order).put(routes::modify_order),
-        )
-        .route("/api/portfolio", get(routes::get_portfolio))
-        // WebSocket feeds
-        .route("/ws/orderbook/{pair_id}", get(routes::ws_orderbook))
-        .route("/ws/trades/{pair_id}", get(routes::ws_trades))
-        .route("/ws/orders/{user_id}", get(routes::ws_orders))
-        // Dashboard API
-        .route("/api/metrics", get(routes::get_metrics))
-        .route("/api/metrics/locks", get(routes::get_lock_metrics))
-        .route("/api/metrics/throughput", get(routes::get_throughput))
-        .route("/api/metrics/latency", get(routes::get_latency_percentiles))
-        .route("/api/metrics/audit", get(routes::get_audit))
-        .route("/api/audit", get(routes::get_audit))
-        // Serve static files
-        .nest_service("/trading", ServeDir::new("web/trading"))
-        .nest_service("/dashboard", ServeDir::new("web/dashboard"))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+    // Start the order queue consumer
+    let worker_state = state.clone();
+    tokio::spawn(async move {
+        worker::order_queue_consumer(worker_state).await;
+    });
 
-    let port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
-    let addr = format!("0.0.0.0:{}", port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("listening on http://{}", addr);
-    axum::serve(listener, app).await?;
+    // Start cache refresh workers
+    let cache_state = state.clone();
+    tokio::spawn(async move {
+        worker::cache_refresh_worker(cache_state).await;
+    });
+
+    // Background metrics refresh (same as before)
+    let metrics_dragonfly = dragonfly.clone();
+    let metrics_pg = pg_bg.clone();
+    tokio::spawn(async move {
+        routes::metrics_refresh_loop_worker(metrics_dragonfly, metrics_pg).await;
+    });
+
+    // Background ticker + trades refresh (same as before)
+    let ticker_dragonfly = dragonfly.clone();
+    let ticker_pg = pg_bg.clone();
+    tokio::spawn(async move {
+        routes::ticker_trades_refresh_loop_worker(ticker_dragonfly, ticker_pg).await;
+    });
+
+    // Background portfolio refresh (same as before)
+    let portfolio_dragonfly = dragonfly.clone();
+    let portfolio_pg = pg_bg.clone();
+    tokio::spawn(async move {
+        routes::portfolio_refresh_loop_worker(portfolio_dragonfly, portfolio_pg).await;
+    });
+
+    tracing::info!("worker started, listening for orders on queue:orders");
+
+    // Keep the worker alive
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("shutting down worker");
 
     Ok(())
 }
 
 async fn load_pairs_cache(pg: &PgPool) -> Result<HashMap<String, PairConfig>> {
-    use sqlx::Row;
     let rows = sqlx::query(
         "SELECT id, tick_size, lot_size, min_order_size, max_order_size, active FROM pairs",
     )
@@ -271,5 +234,82 @@ async fn run_seed(pg: &PgPool) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn initialize_cache_keys(
+    dragonfly: &RedisPool,
+    pg: &PgPool,
+    pairs_cache: &HashMap<String, PairConfig>,
+) -> Result<()> {
+    let mut conn = dragonfly.get().await?;
+
+    // Initialize cache:pairs
+    let rows = sqlx::query("SELECT id, base, quote, tick_size, lot_size, min_order_size, max_order_size, price_precision, qty_precision, price_band_pct, active FROM pairs WHERE active = true")
+        .fetch_all(pg)
+        .await?;
+
+    let pairs: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.get::<String, _>("id"),
+                "base": r.get::<String, _>("base"),
+                "quote": r.get::<String, _>("quote"),
+                "tick_size": r.get::<Decimal, _>("tick_size").to_string(),
+                "lot_size": r.get::<Decimal, _>("lot_size").to_string(),
+                "min_order_size": r.get::<Decimal, _>("min_order_size").to_string(),
+                "max_order_size": r.get::<Decimal, _>("max_order_size").to_string(),
+                "price_precision": r.get::<i16, _>("price_precision"),
+                "qty_precision": r.get::<i16, _>("qty_precision"),
+                "price_band_pct": r.get::<Decimal, _>("price_band_pct").to_string(),
+                "active": r.get::<bool, _>("active"),
+            })
+        })
+        .collect();
+
+    let pairs_json = json!({"pairs": pairs});
+    let pairs_str = serde_json::to_string(&pairs_json)?;
+    conn.set::<_, _, ()>("cache:pairs", &pairs_str).await?;
+
+    // Initialize empty caches for each pair
+    for pair_id in pairs_cache.keys() {
+        // Empty orderbook
+        let empty_book = json!({
+            "pair": pair_id,
+            "bids": [],
+            "asks": []
+        });
+        let book_str = serde_json::to_string(&empty_book)?;
+        conn.set::<_, _, ()>(format!("cache:orderbook:{}", pair_id), &book_str).await?;
+
+        // Empty ticker
+        let empty_ticker = json!({
+            "pair": pair_id,
+            "last": null,
+            "high_24h": null,
+            "low_24h": null,
+            "volume_24h": null
+        });
+        let ticker_str = serde_json::to_string(&empty_ticker)?;
+        conn.set::<_, _, ()>(format!("cache:ticker:{}", pair_id), &ticker_str).await?;
+
+        // Empty trades
+        let empty_trades = json!({
+            "pair": pair_id,
+            "trades": []
+        });
+        let trades_str = serde_json::to_string(&empty_trades)?;
+        conn.set::<_, _, ()>(format!("cache:trades:{}", pair_id), &trades_str).await?;
+    }
+
+    // Empty metrics caches
+    conn.set::<_, _, ()>("cache:metrics", "{}").await?;
+    conn.set::<_, _, ()>("cache:lock_metrics", "{}").await?;
+    conn.set::<_, _, ()>("cache:throughput", "{\"series\": []}").await?;
+    conn.set::<_, _, ()>("cache:latency_metrics", "{}").await?;
+    conn.set::<_, _, ()>("cache:audit", "{\"audit\": [], \"events\": []}").await?;
+
+    tracing::info!("cache keys initialized");
     Ok(())
 }
