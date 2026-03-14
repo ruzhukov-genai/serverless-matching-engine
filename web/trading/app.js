@@ -10,6 +10,11 @@ let ws = { orderbook: null, trades: null };
 let fallbackPolls = {};
 let feedbackTimer = null;
 
+// Pagination state for open orders
+let ordersPage = 0;
+const ORDERS_PER_PAGE = 20;
+let ordersTotal = 0;
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 async function init() {
@@ -26,8 +31,11 @@ async function loadPairs() {
         const res = await fetch(`${API}/api/pairs`);
         const data = await res.json();
         const pairs = data.pairs || [];
-        renderPairs(pairs);
-        if (pairs.length > 0) selectPair(pairs[0]);
+        // Deduplicate: only keep real trading pairs (unique by id)
+        // Filter out test pairs (BAL-*) for the UI
+        const tradingPairs = pairs.filter(p => !p.id.startsWith('BAL-'));
+        renderPairs(tradingPairs);
+        if (tradingPairs.length > 0) selectPair(tradingPairs[0]);
     } catch (e) {
         console.error('Failed to load pairs:', e);
         showFeedback('Failed to load trading pairs', 'error');
@@ -37,9 +45,8 @@ async function loadPairs() {
 function renderPairs(pairs) {
     const el = document.getElementById('pairs-list');
     el.innerHTML = pairs.map(p =>
-        `<button data-pair="${p.id}" onclick="selectPairById('${p.id}')">${p.base}/${p.quote}</button>`
+        `<button data-pair="${p.id}" onclick="selectPairById('${p.id}')">${p.id}</button>`
     ).join('');
-    // store pairs for lookup
     el._pairs = pairs;
 }
 
@@ -53,24 +60,23 @@ function selectPair(pair) {
     const pairId = pair.id;
     currentPair = pairId;
 
-    document.getElementById('current-pair').textContent =
-        pair.base && pair.quote ? `${pair.base}/${pair.quote}` : pairId;
+    document.getElementById('current-pair').textContent = pairId;
 
     document.querySelectorAll('#pairs-list button').forEach(b =>
         b.classList.toggle('active', b.dataset.pair === pairId)
     );
 
-    // Reset local state
     orderbook = { bids: [], asks: [] };
     tradesList = [];
+    ordersPage = 0;
 
-    // Clear fallback polls from previous pair
     clearFallbackPoll('orderbook');
     clearFallbackPoll('trades');
 
     loadOrderbook(pairId);
     loadTrades(pairId);
     connectWebSockets(pairId);
+    loadOpenOrders();
 }
 
 // ── Order Book ────────────────────────────────────────────────────────────────
@@ -92,16 +98,13 @@ function renderOrderbook() {
     const bidsEl = document.getElementById('bids');
     const spreadEl = document.getElementById('spread-value');
 
-    // Asks: sort high→low (highest at top, lowest near spread)
     const sortedAsks = [...orderbook.asks].sort((a, b) =>
         parseFloat(b.price) - parseFloat(a.price)
     );
-    // Bids: sort high→low (highest near spread)
     const sortedBids = [...orderbook.bids].sort((a, b) =>
         parseFloat(b.price) - parseFloat(a.price)
     );
 
-    // Max total for depth bar sizing
     const maxTotal = Math.max(
         ...sortedAsks.map(l => parseFloat(l.total) || 0),
         ...sortedBids.map(l => parseFloat(l.total) || 0),
@@ -111,7 +114,6 @@ function renderOrderbook() {
     asksEl.innerHTML = sortedAsks.map(l => renderLevel(l, 'ask', maxTotal)).join('');
     bidsEl.innerHTML = sortedBids.map(l => renderLevel(l, 'bid', maxTotal)).join('');
 
-    // Compute spread
     if (sortedAsks.length > 0 && sortedBids.length > 0) {
         const bestAsk = parseFloat(sortedAsks[sortedAsks.length - 1].price);
         const bestBid = parseFloat(sortedBids[0].price);
@@ -165,7 +167,7 @@ function renderTrades() {
         el.innerHTML = '<div class="empty-state">No recent trades</div>';
         return;
     }
-    el.innerHTML = tradesList.slice(0, 60).map(t => {
+    el.innerHTML = tradesList.slice(0, 50).map(t => {
         const side = (t.side || 'buy').toLowerCase();
         return `<div class="trade-row ${side}">` +
             `<span class="trade-price">${fmtPrice(parseFloat(t.price))}</span>` +
@@ -209,7 +211,6 @@ function connectOrderbookWS(wsBase, pairId) {
                 } else if (msg.type === 'update') {
                     applyBookUpdate(msg);
                 } else {
-                    // Unknown shape — treat as snapshot if has bids/asks
                     if (msg.bids || msg.asks) {
                         orderbook.bids = msg.bids || orderbook.bids;
                         orderbook.asks = msg.asks || orderbook.asks;
@@ -279,7 +280,7 @@ function applyLevel(arr, level) {
 }
 
 function startFallbackPoll(key, fn, interval) {
-    if (fallbackPolls[key]) return; // already polling
+    if (fallbackPolls[key]) return;
     fn();
     fallbackPolls[key] = setInterval(fn, interval);
 }
@@ -353,7 +354,6 @@ async function submitOrder() {
         return;
     }
 
-    // Capitalize to match Rust serde enum format (Buy/Sell, Limit/Market)
     const sideCapital = currentSide.charAt(0).toUpperCase() + currentSide.slice(1);
     const typeCapital = orderType.charAt(0).toUpperCase() + orderType.slice(1);
 
@@ -429,8 +429,10 @@ function renderPortfolio(balances) {
 
 async function loadOpenOrders() {
     try {
-        const res = await fetch(`${API}/api/orders`);
+        const offset = ordersPage * ORDERS_PER_PAGE;
+        const res = await fetch(`${API}/api/orders?limit=${ORDERS_PER_PAGE}&offset=${offset}`);
         const data = await res.json();
+        ordersTotal = data.total || 0;
         renderOpenOrders(data.orders || []);
     } catch (e) {
         console.error('Failed to load orders:', e);
@@ -439,10 +441,14 @@ async function loadOpenOrders() {
 
 function renderOpenOrders(orders) {
     const tbody = document.getElementById('orders-body');
-    if (orders.length === 0) {
+    const totalPages = Math.ceil(ordersTotal / ORDERS_PER_PAGE);
+
+    if (orders.length === 0 && ordersTotal === 0) {
         tbody.innerHTML = '<tr><td colspan="9" class="empty">No open orders</td></tr>';
+        renderOrdersPagination(0);
         return;
     }
+
     tbody.innerHTML = orders.map(o => {
         const qty    = parseFloat(o.quantity) || 0;
         const rem    = parseFloat(o.remaining != null ? o.remaining : o.filled != null ? qty - o.filled : qty);
@@ -461,7 +467,35 @@ function renderOpenOrders(orders) {
             `<td><button class="cancel-btn" onclick="cancelOrder('${esc(o.id)}')">✕</button></td>` +
             `</tr>`;
     }).join('');
+
+    renderOrdersPagination(totalPages);
 }
+
+function renderOrdersPagination(totalPages) {
+    const container = document.getElementById('orders-pagination');
+    if (!container) return;
+
+    if (ordersTotal <= ORDERS_PER_PAGE) {
+        container.innerHTML = ordersTotal > 0
+            ? `<span class="page-info">${ordersTotal} orders</span>`
+            : '';
+        return;
+    }
+
+    const start = ordersPage * ORDERS_PER_PAGE + 1;
+    const end = Math.min((ordersPage + 1) * ORDERS_PER_PAGE, ordersTotal);
+
+    container.innerHTML =
+        `<button class="page-btn" onclick="ordersPageNav(-1)" ${ordersPage === 0 ? 'disabled' : ''}>‹ Prev</button>` +
+        `<span class="page-info">${start}–${end} of ${ordersTotal.toLocaleString()}</span>` +
+        `<button class="page-btn" onclick="ordersPageNav(1)" ${ordersPage >= totalPages - 1 ? 'disabled' : ''}>Next ›</button>`;
+}
+
+window.ordersPageNav = function(delta) {
+    const totalPages = Math.ceil(ordersTotal / ORDERS_PER_PAGE);
+    ordersPage = Math.max(0, Math.min(totalPages - 1, ordersPage + delta));
+    loadOpenOrders();
+};
 
 window.cancelOrder = async function(orderId) {
     try {
@@ -477,6 +511,23 @@ window.cancelOrder = async function(orderId) {
     }
 };
 
+window.cancelAllOrders = async function() {
+    if (!confirm(`Cancel all ${ordersTotal.toLocaleString()} open orders?`)) return;
+    try {
+        const res = await fetch(`${API}/api/orders`, { method: 'DELETE' });
+        if (res.ok) {
+            const data = await res.json();
+            showFeedback(`Cancelled ${data.cancelled.toLocaleString()} orders`, 'success');
+            ordersPage = 0;
+            await Promise.all([loadOpenOrders(), loadPortfolio()]);
+        } else {
+            showFeedback('Failed to cancel orders', 'error');
+        }
+    } catch (e) {
+        showFeedback(`Cancel failed: ${e.message}`, 'error');
+    }
+};
+
 // ── Auto Refresh ──────────────────────────────────────────────────────────────
 
 function startAutoRefresh() {
@@ -485,7 +536,7 @@ function startAutoRefresh() {
     setInterval(() => {
         loadPortfolio();
         loadOpenOrders();
-    }, 3000);
+    }, 5000);
 }
 
 // ── Feedback Toast ────────────────────────────────────────────────────────────

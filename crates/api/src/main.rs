@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
         .route("/api/orderbook/{pair_id}", get(routes::get_orderbook))
         .route("/api/trades/{pair_id}", get(routes::get_trades))
         .route("/api/ticker/{pair_id}", get(routes::get_ticker))
-        .route("/api/orders", get(routes::list_orders).post(routes::create_order))
+        .route("/api/orders", get(routes::list_orders).post(routes::create_order).delete(routes::cancel_all_orders))
         .route(
             "/api/orders/{order_id}",
             axum::routing::delete(routes::cancel_order).put(routes::modify_order),

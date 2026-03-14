@@ -641,6 +641,9 @@ pub async fn modify_order(
 #[derive(Deserialize)]
 pub struct OrdersQuery {
     pub user_id: Option<String>,
+    pub pair_id: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
 }
 
 pub async fn list_orders(
@@ -648,16 +651,53 @@ pub async fn list_orders(
     State(s): State<AppState>,
 ) -> HandlerResult<impl IntoResponse> {
     let user_id = q.user_id.unwrap_or_else(|| "user-1".to_string());
-    let rows = sqlx::query(
-        "SELECT id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, sequence, created_at, updated_at, client_order_id
-         FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled') ORDER BY created_at DESC",
-    )
-    .bind(&user_id)
-    .fetch_all(&s.pg)
-    .await?;
+    let limit = q.limit.unwrap_or(50).min(500);
+    let offset = q.offset.unwrap_or(0).max(0);
 
+    let (count_row, rows) = if let Some(ref pair_id) = q.pair_id {
+        let c = sqlx::query("SELECT COUNT(*) as cnt FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled') AND pair_id = $2")
+            .bind(&user_id).bind(pair_id).fetch_one(&s.pg).await?;
+        let r = sqlx::query(
+            "SELECT id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, sequence, created_at, updated_at, client_order_id
+             FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled') AND pair_id = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4",
+        ).bind(&user_id).bind(pair_id).bind(limit).bind(offset).fetch_all(&s.pg).await?;
+        (c, r)
+    } else {
+        let c = sqlx::query("SELECT COUNT(*) as cnt FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled')")
+            .bind(&user_id).fetch_one(&s.pg).await?;
+        let r = sqlx::query(
+            "SELECT id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, sequence, created_at, updated_at, client_order_id
+             FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled') ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+        ).bind(&user_id).bind(limit).bind(offset).fetch_all(&s.pg).await?;
+        (c, r)
+    };
+
+    let total: i64 = count_row.get("cnt");
     let orders: Vec<Value> = rows.iter().map(row_to_order_json).collect();
-    Ok(Json(json!({ "orders": orders })))
+    Ok(Json(json!({ "orders": orders, "total": total, "limit": limit, "offset": offset })))
+}
+
+// ── DELETE /api/orders (cancel all) ───────────────────────────────────────────
+
+pub async fn cancel_all_orders(
+    Query(q): Query<OrdersQuery>,
+    State(s): State<AppState>,
+) -> HandlerResult<impl IntoResponse> {
+    let user_id = q.user_id.unwrap_or_else(|| "user-1".to_string());
+
+    let result = if let Some(ref pair_id) = q.pair_id {
+        sqlx::query("UPDATE orders SET status = 'Cancelled', updated_at = NOW() WHERE user_id = $1 AND status IN ('New','PartiallyFilled') AND pair_id = $2")
+            .bind(&user_id).bind(pair_id).execute(&s.pg).await?
+    } else {
+        sqlx::query("UPDATE orders SET status = 'Cancelled', updated_at = NOW() WHERE user_id = $1 AND status IN ('New','PartiallyFilled')")
+            .bind(&user_id).execute(&s.pg).await?
+    };
+
+    // Also release locked balances
+    sqlx::query("UPDATE balances SET available = available + locked, locked = 0 WHERE user_id = $1 AND locked > 0")
+        .bind(&user_id).execute(&s.pg).await?;
+
+    Ok(Json(json!({ "cancelled": result.rows_affected() })))
 }
 
 // ── GET /api/portfolio ────────────────────────────────────────────────────────

@@ -382,6 +382,65 @@ td.empty {
 .feedback-error { background: rgba(248,81,73,0.2); border: 1px solid var(--red); color: var(--red); }
 .feedback-info { background: rgba(88,166,255,0.2); border: 1px solid var(--blue); color: var(--blue); }
 
+/* ── Section Header ─────────────────────────────────────────────────────── */
+.section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+}
+.section-header h2 { margin-bottom: 0; }
+
+.cancel-all-btn {
+    padding: 4px 10px;
+    border: 1px solid var(--red);
+    border-radius: 4px;
+    background: rgba(248, 81, 73, 0.1);
+    color: var(--red);
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+.cancel-all-btn:hover {
+    background: rgba(248, 81, 73, 0.25);
+}
+
+/* ── Pagination ─────────────────────────────────────────────────────────── */
+.pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 10px 0 4px;
+    font-size: 12px;
+}
+
+.page-btn {
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--text-muted);
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+.page-btn:hover:not(:disabled) {
+    border-color: var(--blue);
+    color: var(--text);
+}
+.page-btn:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+}
+
+.page-info {
+    color: var(--text-muted);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+}
+
 /* ── Scrollbars ─────────────────────────────────────────────────────────── */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
