@@ -3,6 +3,7 @@
 
 const API = window.location.origin;
 let currentPair = null;
+let currentPairConfig = null;
 let currentSide = 'buy';
 let orderbook = { bids: [], asks: [] };
 let tradesList = [];
@@ -10,7 +11,7 @@ let ws = { orderbook: null, trades: null };
 let fallbackPolls = {};
 let feedbackTimer = null;
 
-// Pagination state for open orders
+// Pagination state
 let ordersPage = 0;
 const ORDERS_PER_PAGE = 20;
 let ordersTotal = 0;
@@ -31,8 +32,6 @@ async function loadPairs() {
         const res = await fetch(`${API}/api/pairs`);
         const data = await res.json();
         const pairs = data.pairs || [];
-        // Deduplicate: only keep real trading pairs (unique by id)
-        // Filter out test pairs (BAL-*) for the UI
         const tradingPairs = pairs.filter(p => !p.id.startsWith('BAL-'));
         renderPairs(tradingPairs);
         if (tradingPairs.length > 0) selectPair(tradingPairs[0]);
@@ -57,13 +56,12 @@ window.selectPairById = function(pairId) {
 };
 
 function selectPair(pair) {
-    const pairId = pair.id;
-    currentPair = pairId;
+    currentPair = pair.id;
+    currentPairConfig = pair;
 
-    document.getElementById('current-pair').textContent = pairId;
-
-    document.querySelectorAll('#pairs-list button').forEach(b =>
-        b.classList.toggle('active', b.dataset.pair === pairId)
+    document.getElementById('current-pair').textContent = pair.id;
+    document.querySelectorAll('.pairs-bar button').forEach(b =>
+        b.classList.toggle('active', b.dataset.pair === pair.id)
     );
 
     orderbook = { bids: [], asks: [] };
@@ -73,9 +71,9 @@ function selectPair(pair) {
     clearFallbackPoll('orderbook');
     clearFallbackPoll('trades');
 
-    loadOrderbook(pairId);
-    loadTrades(pairId);
-    connectWebSockets(pairId);
+    loadOrderbook(pair.id);
+    loadTrades(pair.id);
+    connectWebSockets(pair.id);
     loadOpenOrders();
 }
 
@@ -97,48 +95,81 @@ function renderOrderbook() {
     const asksEl = document.getElementById('asks');
     const bidsEl = document.getElementById('bids');
     const spreadEl = document.getElementById('spread-value');
+    const lastPriceEl = document.getElementById('last-price');
 
-    const sortedAsks = [...orderbook.asks].sort((a, b) =>
-        parseFloat(b.price) - parseFloat(a.price)
-    );
-    const sortedBids = [...orderbook.bids].sort((a, b) =>
-        parseFloat(b.price) - parseFloat(a.price)
-    );
+    // Sort asks low→high (best ask at bottom, near spread)
+    const sortedAsks = [...orderbook.asks]
+        .sort((a, b) => parseFloat(a.price) - parseFloat(b.price))
+        .slice(0, 25);
 
-    const maxTotal = Math.max(
-        ...sortedAsks.map(l => parseFloat(l.total) || 0),
-        ...sortedBids.map(l => parseFloat(l.total) || 0),
+    // Sort bids high→low (best bid at top, near spread)
+    const sortedBids = [...orderbook.bids]
+        .sort((a, b) => parseFloat(b.price) - parseFloat(a.price))
+        .slice(0, 25);
+
+    // Compute cumulative totals
+    const asksCum = computeCumulative(sortedAsks);
+    const bidsCum = computeCumulative(sortedBids);
+
+    // Max cumulative for depth bar sizing
+    const maxCum = Math.max(
+        asksCum.length > 0 ? asksCum[asksCum.length - 1].cum : 0,
+        bidsCum.length > 0 ? bidsCum[bidsCum.length - 1].cum : 0,
         1
     );
 
-    asksEl.innerHTML = sortedAsks.map(l => renderLevel(l, 'ask', maxTotal)).join('');
-    bidsEl.innerHTML = sortedBids.map(l => renderLevel(l, 'bid', maxTotal)).join('');
+    // Asks: reverse so highest price is at top, lowest (best) near spread
+    const asksReversed = [...asksCum].reverse();
 
+    asksEl.innerHTML = asksReversed.map(l =>
+        renderLevel(l, 'ask', maxCum)
+    ).join('');
+
+    bidsEl.innerHTML = bidsCum.map(l =>
+        renderLevel(l, 'bid', maxCum)
+    ).join('');
+
+    // Spread
     if (sortedAsks.length > 0 && sortedBids.length > 0) {
-        const bestAsk = parseFloat(sortedAsks[sortedAsks.length - 1].price);
+        const bestAsk = parseFloat(sortedAsks[0].price);
         const bestBid = parseFloat(sortedBids[0].price);
         const spread = bestAsk - bestBid;
-        const pct = bestBid > 0 ? ((spread / bestBid) * 100).toFixed(3) : '0.000';
-        spreadEl.textContent = `${fmtPrice(spread)} (${pct}%)`;
+        const pct = bestBid > 0 ? ((spread / bestBid) * 100).toFixed(2) : '0.00';
+        spreadEl.textContent = `Spread: ${fmtPrice(spread)} (${pct}%)`;
+
+        // Last price = midpoint for display
+        if (lastPriceEl) {
+            lastPriceEl.textContent = fmtPrice((bestAsk + bestBid) / 2);
+        }
     } else {
         spreadEl.textContent = '—';
     }
+
+    // Auto-scroll asks to bottom (near spread)
+    asksEl.scrollTop = asksEl.scrollHeight;
 }
 
-function renderLevel(level, side, maxTotal) {
+function computeCumulative(levels) {
+    let cum = 0;
+    return levels.map(l => {
+        const qty = parseFloat(l.quantity) || 0;
+        cum += qty;
+        return { ...l, cum };
+    });
+}
+
+function renderLevel(level, side, maxCum) {
     const price = parseFloat(level.price);
     const qty   = parseFloat(level.quantity);
-    const total = parseFloat(level.total) || 0;
-    const depthPct = Math.min(100, (total / maxTotal) * 100).toFixed(1);
-    const bgColor  = side === 'ask'
-        ? 'rgba(248,81,73,0.1)'
-        : 'rgba(63,185,80,0.1)';
+    const cum   = level.cum || 0;
+    const depthPct = Math.min(100, (cum / maxCum) * 100).toFixed(1);
+    const color = side === 'ask' ? 'rgba(248,81,73,0.25)' : 'rgba(63,185,80,0.25)';
+    const bg = `linear-gradient(to left, ${color} ${depthPct}%, transparent ${depthPct}%)`;
 
-    return `<div class="level ${side}" onclick="fillPrice(${price})"` +
-        ` style="--depth:${depthPct}%;--depth-bg:${bgColor}">` +
+    return `<div class="level ${side}" onclick="fillPrice(${price})" style="background:${bg}">` +
         `<span class="level-price">${fmtPrice(price)}</span>` +
         `<span class="level-qty">${fmtQty(qty)}</span>` +
-        `<span class="level-total">${fmtQty(total)}</span>` +
+        `<span class="level-cum">${fmtQty(cum)}</span>` +
         `</div>`;
 }
 
@@ -199,9 +230,7 @@ function connectOrderbookWS(wsBase, pairId) {
     try {
         const sock = new WebSocket(`${wsBase}/ws/orderbook/${pairId}`);
         ws.orderbook = sock;
-
         sock.onopen = () => clearFallbackPoll('orderbook');
-
         sock.onmessage = e => {
             try {
                 const msg = JSON.parse(e.data);
@@ -210,16 +239,13 @@ function connectOrderbookWS(wsBase, pairId) {
                     orderbook.asks = msg.asks || [];
                 } else if (msg.type === 'update') {
                     applyBookUpdate(msg);
-                } else {
-                    if (msg.bids || msg.asks) {
-                        orderbook.bids = msg.bids || orderbook.bids;
-                        orderbook.asks = msg.asks || orderbook.asks;
-                    }
+                } else if (msg.bids || msg.asks) {
+                    orderbook.bids = msg.bids || orderbook.bids;
+                    orderbook.asks = msg.asks || orderbook.asks;
                 }
                 renderOrderbook();
             } catch(err) { console.warn('OB WS parse error:', err); }
         };
-
         sock.onerror = () => {};
         sock.onclose = () => {
             if (currentPair === pairId)
@@ -238,9 +264,7 @@ function connectTradesWS(wsBase, pairId) {
     try {
         const sock = new WebSocket(`${wsBase}/ws/trades/${pairId}`);
         ws.trades = sock;
-
         sock.onopen = () => clearFallbackPoll('trades');
-
         sock.onmessage = e => {
             try {
                 const msg = JSON.parse(e.data);
@@ -251,7 +275,6 @@ function connectTradesWS(wsBase, pairId) {
                 }
             } catch(err) { console.warn('Trades WS parse error:', err); }
         };
-
         sock.onerror = () => {};
         sock.onclose = () => {
             if (currentPair === pairId)
@@ -378,13 +401,23 @@ async function submitOrder() {
         });
 
         if (res.ok) {
+            const data = await res.json();
+            const trades = data.trades || [];
             showFeedback(
-                `${currentSide === 'buy' ? 'Buy' : 'Sell'} order placed!`,
+                trades.length > 0
+                    ? `${sideCapital} filled: ${trades.length} trade(s)!`
+                    : `${sideCapital} order placed`,
                 'success'
             );
             document.getElementById('order-quantity').value = '';
             document.getElementById('order-total').textContent = '0.00';
-            await Promise.all([loadPortfolio(), loadOpenOrders()]);
+            // Refresh everything
+            await Promise.all([
+                loadPortfolio(),
+                loadOpenOrders(),
+                loadOrderbook(currentPair),
+                loadTrades(currentPair),
+            ]);
         } else {
             const err = await res.json().catch(() => ({}));
             showFeedback(`Order failed: ${err.message || err.error || res.statusText}`, 'error');
@@ -421,7 +454,7 @@ function renderPortfolio(balances) {
         return `<tr>` +
             `<td class="asset-name">${esc(b.asset)}</td>` +
             `<td>${fmtQty(avail)}</td>` +
-            `<td>${fmtQty(locked)}</td>` +
+            `<td>${locked > 0 ? fmtQty(locked) : '<span class="text-muted">—</span>'}</td>` +
             `<td>${fmtQty(avail + locked)}</td>` +
             `</tr>`;
     }).join('');
@@ -443,34 +476,31 @@ async function loadOpenOrders() {
 
 function renderOpenOrders(orders) {
     const tbody = document.getElementById('orders-body');
-    const totalPages = Math.ceil(ordersTotal / ORDERS_PER_PAGE);
 
     if (orders.length === 0 && ordersTotal === 0) {
-        tbody.innerHTML = '<tr><td colspan="9" class="empty">No open orders</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" class="empty">No open orders</td></tr>';
         renderOrdersPagination(0);
         return;
     }
 
     tbody.innerHTML = orders.map(o => {
         const qty    = parseFloat(o.quantity) || 0;
-        const rem    = parseFloat(o.remaining != null ? o.remaining : o.filled != null ? qty - o.filled : qty);
-        const filled = o.filled != null ? parseFloat(o.filled) : qty - rem;
+        const rem    = parseFloat(o.remaining != null ? o.remaining : qty);
+        const filled = qty - rem;
         const side   = (o.side || 'buy').toLowerCase();
-        const status = (o.status || 'open').toLowerCase();
+        const status = (o.status || 'new').toLowerCase();
         return `<tr>` +
             `<td>${esc(o.pair_id)}</td>` +
             `<td class="side-${side}">${side.toUpperCase()}</td>` +
-            `<td>${esc(o.order_type || 'limit')}</td>` +
-            `<td>${o.price != null ? fmtPrice(parseFloat(o.price)) : '<span style="color:var(--text-muted)">MKT</span>'}</td>` +
+            `<td>${o.price != null ? fmtPrice(parseFloat(o.price)) : '<span class="text-muted">MKT</span>'}</td>` +
             `<td>${fmtQty(qty)}</td>` +
-            `<td>${fmtQty(filled)}</td>` +
-            `<td><span class="status status-${status}">${status}</span></td>` +
+            `<td>${filled > 0 ? fmtQty(filled) : '<span class="text-muted">—</span>'}</td>` +
             `<td>${fmtTime(o.created_at)}</td>` +
             `<td><button class="cancel-btn" onclick="cancelOrder('${esc(o.id)}')">✕</button></td>` +
             `</tr>`;
     }).join('');
 
-    renderOrdersPagination(totalPages);
+    renderOrdersPagination(Math.ceil(ordersTotal / ORDERS_PER_PAGE));
 }
 
 function renderOrdersPagination(totalPages) {
@@ -479,7 +509,7 @@ function renderOrdersPagination(totalPages) {
 
     if (ordersTotal <= ORDERS_PER_PAGE) {
         container.innerHTML = ordersTotal > 0
-            ? `<span class="page-info">${ordersTotal} orders</span>`
+            ? `<span class="page-info">${ordersTotal} order${ordersTotal === 1 ? '' : 's'}</span>`
             : '';
         return;
     }
@@ -488,9 +518,9 @@ function renderOrdersPagination(totalPages) {
     const end = Math.min((ordersPage + 1) * ORDERS_PER_PAGE, ordersTotal);
 
     container.innerHTML =
-        `<button class="page-btn" onclick="ordersPageNav(-1)" ${ordersPage === 0 ? 'disabled' : ''}>‹ Prev</button>` +
+        `<button class="page-btn" onclick="ordersPageNav(-1)" ${ordersPage === 0 ? 'disabled' : ''}>‹</button>` +
         `<span class="page-info">${start}–${end} of ${ordersTotal.toLocaleString()}</span>` +
-        `<button class="page-btn" onclick="ordersPageNav(1)" ${ordersPage >= totalPages - 1 ? 'disabled' : ''}>Next ›</button>`;
+        `<button class="page-btn" onclick="ordersPageNav(1)" ${ordersPage >= totalPages - 1 ? 'disabled' : ''}>›</button>`;
 }
 
 window.ordersPageNav = function(delta) {
@@ -504,7 +534,7 @@ window.cancelOrder = async function(orderId) {
         const res = await fetch(`${API}/api/orders/${orderId}`, { method: 'DELETE' });
         if (res.ok) {
             showFeedback('Order cancelled', 'success');
-            await Promise.all([loadOpenOrders(), loadPortfolio()]);
+            await Promise.all([loadOpenOrders(), loadPortfolio(), loadOrderbook(currentPair)]);
         } else {
             showFeedback('Failed to cancel order', 'error');
         }
@@ -521,7 +551,7 @@ window.cancelAllOrders = async function() {
             const data = await res.json();
             showFeedback(`Cancelled ${data.cancelled.toLocaleString()} orders`, 'success');
             ordersPage = 0;
-            await Promise.all([loadOpenOrders(), loadPortfolio()]);
+            await Promise.all([loadOpenOrders(), loadPortfolio(), loadOrderbook(currentPair)]);
         } else {
             showFeedback('Failed to cancel orders', 'error');
         }
@@ -560,16 +590,16 @@ function showFeedback(message, type = 'info') {
 
 function fmtPrice(n) {
     if (n == null || isNaN(n)) return '—';
-    if (n >= 10000) return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    if (n >= 1)     return n.toFixed(4);
-    return n.toFixed(8);
+    if (n >= 1000) return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    if (n >= 1)    return n.toFixed(4);
+    return n.toFixed(6);
 }
 
 function fmtQty(n) {
     if (n == null || isNaN(n)) return '—';
-    if (n >= 10000) return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    if (n >= 1)     return n.toFixed(4);
-    return n.toFixed(6);
+    if (n >= 1000) return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    if (n >= 1)    return n.toFixed(4);
+    return n.toFixed(5);
 }
 
 function fmtTime(ts) {

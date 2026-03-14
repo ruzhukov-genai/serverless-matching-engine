@@ -165,28 +165,42 @@ section {
     top: 0; right: 0;
     height: 100%;
     width: var(--depth, 0%);
-    background: var(--depth-bg, transparent);
     z-index: 0;
+    pointer-events: none;
 }
+.ask::before { background: rgba(248, 81, 73, 0.15); }
+.bid::before { background: rgba(63, 185, 80, 0.15); }
 .level > span { position: relative; z-index: 1; }
 .level:hover { background: var(--bg-hover); }
 
 .level.ask .level-price { color: var(--red); }
 .level.bid .level-price { color: var(--green); }
 .level-qty { color: var(--text); text-align: right; }
-.level-total { color: var(--text-muted); text-align: right; }
+.level-cum { color: var(--text-muted); text-align: right; }
+
+
 
 #spread {
-    text-align: center;
-    padding: 3px 4px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 8px;
     font-family: var(--mono);
     font-weight: 600;
-    color: var(--text-muted);
     font-size: 11px;
     border-top: 1px solid var(--border);
     border-bottom: 1px solid var(--border);
     background: var(--bg);
     flex-shrink: 0;
+}
+#last-price {
+    color: var(--green);
+    font-size: 13px;
+    font-weight: 700;
+}
+#spread-value {
+    color: var(--text-muted);
+    font-size: 10px;
 }
 
 /* ── Mid Column: Order Entry + Trades ───────────────────────────────────── */
@@ -462,6 +476,8 @@ td.empty {
     padding: 12px;
     font-family: var(--font);
 }
+
+.text-muted { color: var(--text-muted); }
 
 .empty-state {
     text-align: center;
