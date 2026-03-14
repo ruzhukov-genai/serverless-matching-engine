@@ -7,50 +7,57 @@
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
+    <!-- Top bar: logo + pairs + nav -->
     <header>
-        <h1>⚙ Serverless Matching Engine</h1>
+        <div class="header-left">
+            <span class="logo">⚙ SME</span>
+            <div id="pairs-list" class="pairs-bar"></div>
+        </div>
         <nav>
             <a href="/trading/" class="active">Trading</a>
             <a href="/dashboard/">Dashboard</a>
         </nav>
     </header>
 
+    <!-- Single-screen grid -->
     <main>
-        <!-- Pair selector -->
-        <section id="pair-selector">
-            <h2>Markets</h2>
-            <div id="pairs-list"></div>
+        <!-- Col 1: Order Book -->
+        <section id="orderbook">
+            <div class="section-title">Order Book — <span id="current-pair">—</span></div>
+            <div class="book-header">
+                <span>Price</span>
+                <span>Qty</span>
+                <span>Total</span>
+            </div>
+            <div id="asks" class="book-side asks"></div>
+            <div id="spread"><span id="spread-value">—</span></div>
+            <div id="bids" class="book-side bids"></div>
         </section>
 
-        <div class="trading-layout">
-
-            <!-- Order Book -->
-            <section id="orderbook">
-                <h2>Order Book — <span id="current-pair">—</span></h2>
-                <div class="book-header">
-                    <span>Price</span>
-                    <span style="text-align:right">Qty</span>
-                    <span style="text-align:right">Total</span>
-                </div>
-                <div id="asks" class="book-side asks"></div>
-                <div id="spread"><span id="spread-value">—</span></div>
-                <div id="bids" class="book-side bids"></div>
-            </section>
-
-            <!-- Order Entry -->
+        <!-- Col 2: Order Entry + Recent Trades stacked -->
+        <div class="mid-col">
             <section id="order-entry">
-                <h2>Place Order</h2>
                 <div class="order-tabs">
                     <button class="tab active" data-side="buy">Buy</button>
                     <button class="tab" data-side="sell">Sell</button>
                 </div>
                 <form id="order-form" autocomplete="off">
-                    <div class="form-group">
-                        <label>Type</label>
-                        <select id="order-type">
-                            <option value="limit">Limit</option>
-                            <option value="market">Market</option>
-                        </select>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Type</label>
+                            <select id="order-type">
+                                <option value="limit">Limit</option>
+                                <option value="market">Market</option>
+                            </select>
+                        </div>
+                        <div class="form-group" id="tif-group">
+                            <label>TIF</label>
+                            <select id="order-tif">
+                                <option value="gtc">GTC</option>
+                                <option value="ioc">IOC</option>
+                                <option value="fok">FOK</option>
+                            </select>
+                        </div>
                     </div>
                     <div class="form-group" id="price-group">
                         <label>Price</label>
@@ -60,48 +67,35 @@
                         <label>Quantity</label>
                         <input type="number" id="order-quantity" step="any" min="0" placeholder="0.00">
                     </div>
-                    <div class="form-group">
-                        <label>Time in Force</label>
-                        <select id="order-tif">
-                            <option value="gtc">GTC — Good Till Cancel</option>
-                            <option value="ioc">IOC — Immediate or Cancel</option>
-                            <option value="fok">FOK — Fill or Kill</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label>Total</label>
-                        <div class="order-total-row">
-                            <span id="order-total">0.00</span>
-                        </div>
+                    <div class="form-total">
+                        <span class="total-label">Total</span>
+                        <span id="order-total">0.00</span>
                     </div>
                     <button type="submit" id="submit-order" class="btn-buy">Buy</button>
                 </form>
             </section>
 
-            <!-- Recent Trades -->
             <section id="trades">
-                <h2>Recent Trades</h2>
+                <div class="section-title">Recent Trades</div>
                 <div class="trades-header">
                     <span>Price</span>
-                    <span style="text-align:right">Qty</span>
-                    <span style="text-align:right">Time</span>
+                    <span>Qty</span>
+                    <span>Time</span>
                 </div>
                 <div id="trades-list"></div>
             </section>
-
         </div>
 
-        <!-- Portfolio & Open Orders -->
-        <div class="bottom-panels">
-
+        <!-- Col 3: Portfolio + Open Orders stacked -->
+        <div class="right-col">
             <section id="portfolio">
-                <h2>Portfolio</h2>
+                <div class="section-title">Portfolio</div>
                 <table>
                     <thead>
                         <tr>
                             <th>Asset</th>
                             <th>Available</th>
-                            <th>In Orders</th>
+                            <th>Locked</th>
                             <th>Total</th>
                         </tr>
                     </thead>
@@ -113,30 +107,29 @@
 
             <section id="open-orders">
                 <div class="section-header">
-                    <h2>Open Orders</h2>
+                    <div class="section-title">Open Orders</div>
                     <button class="cancel-all-btn" onclick="cancelAllOrders()">Cancel All</button>
                 </div>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Pair</th>
-                            <th>Side</th>
-                            <th>Type</th>
-                            <th>Price</th>
-                            <th>Qty</th>
-                            <th>Filled</th>
-                            <th>Status</th>
-                            <th>Time</th>
-                            <th></th>
-                        </tr>
-                    </thead>
-                    <tbody id="orders-body">
-                        <tr><td colspan="9" class="empty">Loading…</td></tr>
-                    </tbody>
-                </table>
+                <div class="orders-table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Pair</th>
+                                <th>Side</th>
+                                <th>Price</th>
+                                <th>Qty</th>
+                                <th>Filled</th>
+                                <th>Time</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody id="orders-body">
+                            <tr><td colspan="7" class="empty">Loading…</td></tr>
+                        </tbody>
+                    </table>
+                </div>
                 <div id="orders-pagination" class="pagination"></div>
             </section>
-
         </div>
     </main>
 
