@@ -225,17 +225,23 @@ async fn run_seed(pg: &PgPool) -> Result<()> {
         .execute(pg).await?;
     }
 
-    // Balances
-    for (user, asset, avail) in [
-        ("user-1", "BTC", "10"), ("user-1", "ETH", "100"), ("user-1", "SOL", "1000"), ("user-1", "USDT", "1000000"),
-        ("user-2", "BTC", "10"), ("user-2", "ETH", "100"), ("user-2", "SOL", "1000"), ("user-2", "USDT", "1000000"),
-    ] {
-        let avail_d = Decimal::from_str(avail).unwrap();
-        sqlx::query(
-            "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1,$2,$3,0) ON CONFLICT DO NOTHING",
-        )
-        .bind(user).bind(asset).bind(avail_d)
-        .execute(pg).await?;
+    // Balances — 10 users with deep pockets for load testing
+    for user_num in 1..=10 {
+        let user = format!("user-{user_num}");
+        for (asset, avail) in [
+            ("BTC", "10000"),
+            ("ETH", "100000"),
+            ("SOL", "1000000"),
+            ("USDT", "1000000000"),  // 1B USDT
+        ] {
+            let avail_d = Decimal::from_str(avail).unwrap();
+            sqlx::query(
+                "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1,$2,$3,0)
+                 ON CONFLICT (user_id, asset) DO UPDATE SET available = GREATEST(balances.available, $3)",
+            )
+            .bind(&user).bind(asset).bind(avail_d)
+            .execute(pg).await?;
+        }
     }
 
     Ok(())
