@@ -1,20 +1,55 @@
 //! Order Book cache operations — sorted sets for bids/asks.
 //!
 //! Keys:
-//!   book:{pair_id}:bids  → ZSet (score = -price, so ZRANGEBYSCORE -inf +inf = highest bid first)
-//!   book:{pair_id}:asks  → ZSet (score = +price, so ZRANGEBYSCORE -inf +inf = lowest ask first)
-//!   order:{order_id}     → Hash (field "data" = MessagePack-serialized Order)
+//!   book:{pair_id}:bids  → ZSet (score = -price → ZRANGEBYSCORE -inf +inf = highest bid first)
+//!   book:{pair_id}:asks  → ZSet (score = +price → ZRANGEBYSCORE -inf +inf = lowest ask first)
+//!   order:{order_id}     → Hash with individual string fields (Lua-readable)
+//!   version:{pair_id}    → monotonic counter, incremented on every book mutation
 //!
-//! MessagePack is ~30-40% smaller and ~2x faster to (de)serialize vs JSON.
+//! Hash fields for order:{id}:
+//!   id          → UUID string
+//!   pair_id     → e.g. "BTC-USDT"
+//!   side        → "B" (Buy) or "S" (Sell)
+//!   order_type  → "L" (Limit) or "M" (Market)
+//!   tif         → "G" (GTC), "I" (IOC), or "F" (FOK)
+//!   price_i     → price * SCALE as i64 string ("0" for market orders)
+//!   qty_i       → quantity * SCALE as i64 string
+//!   remaining_i → remaining * SCALE as i64 string
+//!   status      → "N" (New), "PF" (PartiallyFilled), "F" (Filled), "C" (Cancelled)
+//!   stp         → "N", "CM", "CT", or "CB"
+//!   user_id     → string
+//!   ts_ms       → created_at.timestamp_millis() as i64 string
+//!   version     → i64 string
+//!
+//! Scale factor: 100_000_000 (10^8) for 8-decimal precision.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use chrono::{TimeZone, Utc};
 use deadpool_redis::{Config as DPConfig, Pool, Runtime};
-use redis::AsyncCommands;
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use uuid::Uuid;
 
-use crate::types::{Order, Side};
+use crate::types::{Order, OrderStatus, OrderType, SelfTradePreventionMode, Side, TimeInForce};
+
+// ── Scale factor ──────────────────────────────────────────────────────────────
+
+/// Fixed-point scale: 10^8 gives 8 decimal places of precision.
+/// BTC quantities up to ~21M and prices up to ~$90M fit safely within i64.
+/// Lua doubles (f64) can represent integers up to 2^53 ≈ 9e15 exactly;
+/// real-world crypto values (qty ≤ 21M * 10^8 = 2.1e15, price ≤ 90M * 10^8 = 9e15)
+/// are within this safe range.
+const SCALE: i64 = 100_000_000;
+
+pub fn decimal_to_i64(d: Decimal) -> i64 {
+    (d * Decimal::from(SCALE)).to_i64().unwrap_or(0)
+}
+
+pub fn i64_to_decimal(i: i64) -> Decimal {
+    Decimal::from(i) / Decimal::from(SCALE)
+}
 
 // ── Pool ─────────────────────────────────────────────────────────────────────
 
@@ -57,55 +92,179 @@ fn order_key(order_id: &Uuid) -> String {
     format!("order:{order_id}")
 }
 
-/// Fetch multiple orders by IDs using pipelined HGET commands to avoid N+1 calls.
+// ── Field names for HMGET ─────────────────────────────────────────────────────
+
+const ORDER_FIELDS: &[&str] = &[
+    "id", "pair_id", "side", "order_type", "tif",
+    "price_i", "qty_i", "remaining_i", "status", "stp",
+    "user_id", "ts_ms", "version",
+];
+
+// ── Order serialization helpers ───────────────────────────────────────────────
+
+fn side_char(side: Side) -> &'static str {
+    match side { Side::Buy => "B", Side::Sell => "S" }
+}
+
+fn order_type_char(ot: OrderType) -> &'static str {
+    match ot { OrderType::Limit => "L", OrderType::Market => "M" }
+}
+
+fn tif_char(tif: TimeInForce) -> &'static str {
+    match tif { TimeInForce::GTC => "G", TimeInForce::IOC => "I", TimeInForce::FOK => "F" }
+}
+
+fn status_char(s: OrderStatus) -> &'static str {
+    match s {
+        OrderStatus::New => "N",
+        OrderStatus::PartiallyFilled => "PF",
+        OrderStatus::Filled => "F",
+        OrderStatus::Cancelled | OrderStatus::Rejected => "C",
+    }
+}
+
+fn stp_char(stp: SelfTradePreventionMode) -> &'static str {
+    match stp {
+        SelfTradePreventionMode::None => "N",
+        SelfTradePreventionMode::CancelMaker => "CM",
+        SelfTradePreventionMode::CancelTaker => "CT",
+        SelfTradePreventionMode::CancelBoth => "CB",
+    }
+}
+
+/// Parse an order from HMGET results (13 fields, fixed positions as per ORDER_FIELDS).
+/// Returns None if the hash is empty or any required field is missing/invalid.
+fn parse_order_from_hmget(values: &[Option<String>]) -> Option<Order> {
+    if values.len() < 13 {
+        return None;
+    }
+    // If id is nil, the hash doesn't exist
+    let id_str = values[0].as_deref()?;
+    if id_str.is_empty() {
+        return None;
+    }
+
+    let id: Uuid = id_str.parse().ok()?;
+    let pair_id = values[1].clone()?;
+
+    let side = match values[2].as_deref()? {
+        "B" => Side::Buy,
+        "S" => Side::Sell,
+        _ => return None,
+    };
+
+    let order_type = match values[3].as_deref()? {
+        "L" => OrderType::Limit,
+        "M" => OrderType::Market,
+        _ => return None,
+    };
+
+    let tif = match values[4].as_deref()? {
+        "G" => TimeInForce::GTC,
+        "I" => TimeInForce::IOC,
+        "F" => TimeInForce::FOK,
+        _ => return None,
+    };
+
+    let price_i: i64 = values[5].as_deref().unwrap_or("0").parse().ok()?;
+    let qty_i: i64 = values[6].as_deref()?.parse().ok()?;
+    let remaining_i: i64 = values[7].as_deref()?.parse().ok()?;
+
+    let status = match values[8].as_deref()? {
+        "N" => OrderStatus::New,
+        "PF" => OrderStatus::PartiallyFilled,
+        "F" => OrderStatus::Filled,
+        "C" => OrderStatus::Cancelled,
+        _ => OrderStatus::New,
+    };
+
+    let stp_mode = match values[9].as_deref()? {
+        "N" => SelfTradePreventionMode::None,
+        "CM" => SelfTradePreventionMode::CancelMaker,
+        "CT" => SelfTradePreventionMode::CancelTaker,
+        "CB" => SelfTradePreventionMode::CancelBoth,
+        _ => SelfTradePreventionMode::None,
+    };
+
+    let user_id = values[10].clone()?;
+    let ts_ms: i64 = values[11].as_deref()?.parse().ok()?;
+    let version: i64 = values[12].as_deref().unwrap_or("1").parse().unwrap_or(1);
+
+    // Price: None for market orders or when price_i == 0 and type is Market
+    let price = if order_type == OrderType::Market || price_i == 0 {
+        None
+    } else {
+        Some(i64_to_decimal(price_i))
+    };
+
+    let ts_secs = ts_ms / 1000;
+    let ts_nanos = ((ts_ms % 1000) * 1_000_000) as u32;
+    let created_at = Utc
+        .timestamp_opt(ts_secs, ts_nanos)
+        .single()
+        .unwrap_or_else(Utc::now);
+
+    Some(Order {
+        id,
+        user_id,
+        pair_id,
+        side,
+        order_type,
+        tif,
+        price,
+        quantity: i64_to_decimal(qty_i),
+        remaining: i64_to_decimal(remaining_i),
+        status,
+        stp_mode,
+        version,
+        sequence: 0,       // sequence is DB-only
+        created_at,
+        updated_at: created_at, // updated_at not stored in cache; use created_at
+        client_order_id: None,  // not stored in cache
+    })
+}
+
+// ── Internal: fetch orders by IDs (pipelined HMGET) ──────────────────────────
+
 async fn fetch_orders_by_ids(pool: &Pool, ids: &[String]) -> Result<Vec<Order>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut conn = pool.get().await.context("pool.get")?;
-    let mut pipeline = redis::pipe();
-    
-    // Build pipeline with all HGET commands
+
+    // Pipeline N × HMGET — one per order ID
+    let mut pipe = redis::pipe();
     for id in ids {
         let okey = format!("order:{id}");
-        pipeline.hget(&okey, "data");
+        pipe.cmd("HMGET").arg(&okey).arg(ORDER_FIELDS);
     }
-    
-    // Execute pipeline and get all results at once (binary MessagePack data)
-    let data_list: Vec<Option<Vec<u8>>> = pipeline
+
+    let results: Vec<Vec<Option<String>>> = pipe
         .query_async(&mut *conn)
         .await
-        .context("pipeline HGET")?;
-    
+        .context("pipeline HMGET")?;
+
     let mut orders = Vec::with_capacity(ids.len());
-    for (id, data) in ids.iter().zip(data_list.iter()) {
-        if let Some(bytes) = data {
-            match rmp_serde::from_slice::<Order>(bytes) {
-                Ok(order) => orders.push(order),
-                Err(e) => tracing::warn!("bad order msgpack for {id}: {e}"),
-            }
+    for (id, values) in ids.iter().zip(results.iter()) {
+        match parse_order_from_hmget(values) {
+            Some(order) => orders.push(order),
+            None => tracing::warn!("missing/corrupt order hash for {id}"),
         }
     }
-    
+
     Ok(orders)
 }
-
-/// Score for the sorted set.  
-/// Bids: negate price so ZRANGEBYSCORE -inf +inf returns highest bid first.  
-/// Asks: raw price so ZRANGEBYSCORE -inf +inf returns lowest ask first.
-
 
 // ── Order Book ────────────────────────────────────────────────────────────────
 
 /// Load all orders for one side, sorted by price-time priority.
-/// For Buy (bids): highest price first (ZRANGEBYSCORE -inf +inf on negated scores).
-/// For Sell (asks): lowest price first.
+/// For Buy (bids): highest price first (negated scores, ascending = most-negative first).
+/// For Sell (asks): lowest price first (positive scores, ascending = cheapest first).
 pub async fn load_order_book(pool: &Pool, pair_id: &str, side: Side) -> Result<Vec<Order>> {
     let mut conn = pool.get().await.context("pool.get")?;
     let key = book_key(pair_id, side);
 
-    // Returns members (order_id strings) in score order
     let ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
         .arg(&key)
         .arg("-inf")
@@ -117,31 +276,40 @@ pub async fn load_order_book(pool: &Pool, pair_id: &str, side: Side) -> Result<V
     fetch_orders_by_ids(pool, &ids).await
 }
 
-/// Save an order to the sorted set + hash.
+/// Save an order to the sorted set + hash (individual string fields).
 pub async fn save_order_to_book(pool: &Pool, order: &Order) -> Result<()> {
-    let mut conn = pool.get().await.context("pool.get")?;
+    let bids_key = format!("book:{}:bids", order.pair_id);
+    let asks_key = format!("book:{}:asks", order.pair_id);
+    let order_key = format!("order:{}", order.id);
     let score = order.book_score();
-    let zkey = book_key(&order.pair_id, order.side);
-    let okey = order_key(&order.id);
-    let bytes = rmp_serde::to_vec_named(order).context("serialize order to msgpack")?;
+    let book_key = match order.side { Side::Buy => &bids_key, Side::Sell => &asks_key };
 
-    // ZADD + HSET in pipeline
+    let price_i = order.price.map(decimal_to_i64).unwrap_or(0);
+
+    let mut conn = pool.get().await.context("pool.get")?;
     let () = redis::pipe()
-        .cmd("ZADD")
-        .arg(&zkey)
-        .arg(score)
-        .arg(order.id.to_string())
-        .cmd("HSET")
-        .arg(&okey)
-        .arg("data")
-        .arg(&bytes)
+        .cmd("ZADD").arg(book_key.as_str()).arg(score).arg(order.id.to_string())
+        .cmd("HSET").arg(&order_key)
+            .arg("id").arg(order.id.to_string())
+            .arg("pair_id").arg(&order.pair_id)
+            .arg("side").arg(side_char(order.side))
+            .arg("order_type").arg(order_type_char(order.order_type))
+            .arg("tif").arg(tif_char(order.tif))
+            .arg("price_i").arg(price_i.to_string())
+            .arg("qty_i").arg(decimal_to_i64(order.quantity).to_string())
+            .arg("remaining_i").arg(decimal_to_i64(order.remaining).to_string())
+            .arg("status").arg(status_char(order.status))
+            .arg("stp").arg(stp_char(order.stp_mode))
+            .arg("user_id").arg(&order.user_id)
+            .arg("ts_ms").arg(order.created_at.timestamp_millis().to_string())
+            .arg("version").arg(order.version.to_string())
         .query_async(&mut *conn)
         .await
         .context("ZADD + HSET")?;
     Ok(())
 }
 
-/// Remove an order from the sorted set + delete its hash.
+/// Remove an order from the sorted set and delete its hash.
 pub async fn remove_order_from_book(pool: &Pool, order: &Order) -> Result<()> {
     let mut conn = pool.get().await.context("pool.get")?;
     let zkey = book_key(&order.pair_id, order.side);
@@ -149,26 +317,32 @@ pub async fn remove_order_from_book(pool: &Pool, order: &Order) -> Result<()> {
     let id_str = order.id.to_string();
 
     let () = redis::pipe()
-        .cmd("ZREM")
-        .arg(&zkey)
-        .arg(&id_str)
-        .cmd("DEL")
-        .arg(&okey)
+        .cmd("ZREM").arg(&zkey).arg(&id_str)
+        .cmd("DEL").arg(&okey)
         .query_async(&mut *conn)
         .await
         .context("ZREM + DEL")?;
     Ok(())
 }
 
-/// Get a single order by id.
+/// Get a single order by ID using HMGET.
 pub async fn get_order(pool: &Pool, order_id: &Uuid) -> Result<Option<Order>> {
     let mut conn = pool.get().await.context("pool.get")?;
     let okey = order_key(order_id);
-    let data: Option<Vec<u8>> = conn.hget(&okey, "data").await.context("HGET")?;
-    Ok(match data {
-        Some(bytes) => Some(rmp_serde::from_slice(&bytes).context("deserialize order msgpack")?),
-        None => None,
-    })
+
+    let values: Vec<Option<String>> = redis::cmd("HMGET")
+        .arg(&okey)
+        .arg(ORDER_FIELDS)
+        .query_async(&mut *conn)
+        .await
+        .context("HMGET")?;
+
+    // All nil → key doesn't exist
+    if values.iter().all(|v| v.is_none()) {
+        return Ok(None);
+    }
+
+    Ok(parse_order_from_hmget(&values))
 }
 
 /// Atomically increment a per-pair version counter. Returns the new value.
@@ -183,18 +357,24 @@ pub async fn increment_version(pool: &Pool, pair_id: &str) -> Result<i64> {
     Ok(v)
 }
 
+/// Read the current version counter without modifying it.
+pub async fn get_version(pool: &Pool, pair_id: &str) -> Result<i64> {
+    let mut conn = pool.get().await.context("pool.get")?;
+    let key = format!("version:{pair_id}");
+    let v: Option<i64> = redis::cmd("GET")
+        .arg(&key)
+        .query_async(&mut *conn)
+        .await
+        .context("GET version")?;
+    Ok(v.unwrap_or(0))
+}
+
 /// Load orders from one side with optional price filter.
-///
-/// For a Buy incoming order (price = limit):
-///   - Load asks with score <= buy_price (cheapest asks that qualify).
-/// For a Sell incoming order (price = limit):
-///   - Load bids with score >= -sell_price (i.e. bids where -score <= sell_price → bid price >= sell_price).
-/// If `limit_price` is None (market order), load all orders.
 pub async fn load_order_book_filtered(
     pool: &Pool,
     pair_id: &str,
     side: Side,
-    limit_price: Option<rust_decimal::Decimal>,
+    limit_price: Option<Decimal>,
 ) -> Result<Vec<Order>> {
     let mut conn = pool.get().await.context("pool.get")?;
     let key = book_key(pair_id, side);
@@ -204,9 +384,7 @@ pub async fn load_order_book_filtered(
         Some(price) => {
             let f: f64 = price.to_string().parse().unwrap_or(0.0);
             match side {
-                // asks: score = +price, we want asks where score <= buy_price
                 Side::Sell => ("-inf".to_string(), f.to_string()),
-                // bids: score = -price, we want bids where -score >= sell_price → score <= -sell_price
                 Side::Buy => ("-inf".to_string(), (-f).to_string()),
             }
         }
@@ -223,8 +401,7 @@ pub async fn load_order_book_filtered(
     fetch_orders_by_ids(pool, &ids).await
 }
 
-/// Load a batch of orders from one side using ZRANGEBYSCORE with LIMIT (for lazy loading).
-/// `offset` and `count` implement pagination through the book.
+/// Load a batch of orders from one side using ZRANGEBYSCORE with LIMIT.
 pub async fn load_order_book_batched(
     pool: &Pool,
     pair_id: &str,
@@ -249,18 +426,6 @@ pub async fn load_order_book_batched(
     fetch_orders_by_ids(pool, &ids).await
 }
 
-/// Read the current version counter without modifying it.
-pub async fn get_version(pool: &Pool, pair_id: &str) -> Result<i64> {
-    let mut conn = pool.get().await.context("pool.get")?;
-    let key = format!("version:{pair_id}");
-    let v: Option<i64> = redis::cmd("GET")
-        .arg(&key)
-        .query_async(&mut *conn)
-        .await
-        .context("GET version")?;
-    Ok(v.unwrap_or(0))
-}
-
 // ── OCC / CAS primitives ──────────────────────────────────────────────────────
 
 /// Result of a compare-and-swap attempt.
@@ -272,16 +437,15 @@ pub enum CasResult {
 }
 
 /// Load the order book snapshot AND the current version in a single pipeline.
+/// Used by the OCC retry loop (FOK orders and cancel/modify operations).
 ///
 /// Returns `(orders, version)` where `version` is the monotonic counter at
-/// `version:{pair_id}`. The version must be passed unchanged to
-/// `apply_book_mutations_cas` so the Lua script can verify no concurrent
-/// mutation occurred between snapshot and CAS.
+/// `version:{pair_id}`.
 pub async fn load_order_book_snapshot(
     pool: &Pool,
     pair_id: &str,
     side: Side,
-    limit_price: Option<rust_decimal::Decimal>,
+    limit_price: Option<Decimal>,
 ) -> Result<(Vec<Order>, i64)> {
     let mut conn = pool.get().await.context("pool.get")?;
     let zkey = book_key(pair_id, side);
@@ -292,9 +456,7 @@ pub async fn load_order_book_snapshot(
         Some(price) => {
             let f: f64 = price.to_string().parse().unwrap_or(0.0);
             match side {
-                // asks: score = +price, we want asks where score <= buy_price
                 Side::Sell => ("-inf".to_string(), f.to_string()),
-                // bids: score = -price, we want bids where score <= -sell_price
                 Side::Buy => ("-inf".to_string(), (-f).to_string()),
             }
         }
@@ -317,24 +479,23 @@ pub async fn load_order_book_snapshot(
         return Ok((Vec::new(), version));
     }
 
-    // Pipeline all HGET calls for the returned order IDs
+    // Pipeline HMGET for all order IDs
     let mut hget_pipe = redis::pipe();
     for id in &ids {
         let okey = format!("order:{id}");
-        hget_pipe.hget(&okey, "data");
+        hget_pipe.cmd("HMGET").arg(&okey).arg(ORDER_FIELDS);
     }
-    let data_list: Vec<Option<Vec<u8>>> = hget_pipe
+
+    let data_list: Vec<Vec<Option<String>>> = hget_pipe
         .query_async(&mut *conn)
         .await
-        .context("pipeline HGET orders")?;
+        .context("pipeline HMGET orders")?;
 
     let mut orders = Vec::with_capacity(ids.len());
-    for (id, data) in ids.iter().zip(data_list.iter()) {
-        if let Some(bytes) = data {
-            match rmp_serde::from_slice::<Order>(bytes) {
-                Ok(order) => orders.push(order),
-                Err(e) => tracing::warn!("bad order msgpack for {id}: {e}"),
-            }
+    for (id, values) in ids.iter().zip(data_list.iter()) {
+        match parse_order_from_hmget(values) {
+            Some(order) => orders.push(order),
+            None => tracing::warn!("missing/corrupt order hash for {id}"),
         }
     }
 
@@ -344,7 +505,7 @@ pub async fn load_order_book_snapshot(
 /// The Lua CAS script — atomically checks version, applies ZSet mutations, increments version.
 ///
 /// All accessed keys are declared in KEYS[] (Dragonfly/Redis cluster compatibility).
-/// Binary msgpack data is NOT passed through Lua — callers pre-write HSET data via pipeline.
+/// Order hash data is pre-written by the caller (Phase 1) before this script runs (Phase 2).
 ///
 /// KEYS: [1]=version, [2]=bids_zset, [3]=asks_zset, [4..4+N-1]=order hash keys (one per mutation)
 /// ARGV: [1]=expected_version, [2]=N, then 3 fields per mutation: op, order_id, score
@@ -363,10 +524,10 @@ for i = 0, n-1 do
 
     if op == 'REMOVE_BID' then
         redis.call('ZREM', KEYS[2], oid)
-        redis.call('HDEL', okey, 'data')
+        redis.call('DEL', okey)
     elseif op == 'REMOVE_ASK' then
         redis.call('ZREM', KEYS[3], oid)
-        redis.call('HDEL', okey, 'data')
+        redis.call('DEL', okey)
     elseif op == 'UPSERT_BID' then
         redis.call('ZADD', KEYS[2], score, oid)
         -- HSET data already written by caller before this script
@@ -383,12 +544,11 @@ return 'OK'
 /// Apply book mutations atomically via Lua CAS.
 ///
 /// Two-phase approach:
-/// 1. Pre-write all HSET (order hash) data for UPSERT ops in a pipeline (outside Lua).
-/// 2. Lua CAS script: check version, ZADD/ZREM, INCR version.
-///    All accessed Redis keys are declared in KEYS[] for Dragonfly compatibility.
+/// 1. Pre-write all HSET (order hash) data for UPSERT ops (pipeline, outside Lua).
+/// 2. Lua CAS: check version, ZADD/ZREM, INCR version.
 ///
-/// If CAS conflicts, the pre-written HSET data may be orphaned temporarily.
-/// It will be cleaned up by a subsequent REMOVE_* or overwritten on next retry.
+/// Used for FOK orders (which take the OCC path) and cancel/modify operations.
+/// All other orders go through `match_order_lua` which handles mutations atomically in Lua.
 pub async fn apply_book_mutations_cas(
     pool: &Pool,
     pair_id: &str,
@@ -413,18 +573,14 @@ pub async fn apply_book_mutations_cas(
     for upd in book_updates {
         let (op, needs_hset): (&'static str, bool) = match upd.side {
             Side::Buy => {
-                if upd.status == crate::types::OrderStatus::Filled
-                    || upd.status == crate::types::OrderStatus::Cancelled
-                {
+                if upd.status == OrderStatus::Filled || upd.status == OrderStatus::Cancelled {
                     ("REMOVE_BID", false)
                 } else {
                     ("UPSERT_BID", true)
                 }
             }
             Side::Sell => {
-                if upd.status == crate::types::OrderStatus::Filled
-                    || upd.status == crate::types::OrderStatus::Cancelled
-                {
+                if upd.status == OrderStatus::Filled || upd.status == OrderStatus::Cancelled {
                     ("REMOVE_ASK", false)
                 } else {
                     ("UPSERT_ASK", true)
@@ -458,19 +614,32 @@ pub async fn apply_book_mutations_cas(
 
     let mut conn = pool.get().await.context("pool.get")?;
 
-    // Phase 1: Pre-write HSET data for all UPSERT ops (pipeline, no Lua involved)
+    // Phase 1: Pre-write HSET data for all UPSERT ops (individual fields, not msgpack)
     if !upsert_orders.is_empty() {
         let mut hset_pipe = redis::pipe();
         for order in &upsert_orders {
             let okey = format!("order:{}", order.id);
-            let bytes = rmp_serde::to_vec_named(order).context("serialize order to msgpack")?;
-            hset_pipe.cmd("HSET").arg(&okey).arg("data").arg(bytes.as_slice()).ignore();
+            let price_i = order.price.map(decimal_to_i64).unwrap_or(0);
+            hset_pipe.cmd("HSET").arg(&okey)
+                .arg("id").arg(order.id.to_string())
+                .arg("pair_id").arg(&order.pair_id)
+                .arg("side").arg(side_char(order.side))
+                .arg("order_type").arg(order_type_char(order.order_type))
+                .arg("tif").arg(tif_char(order.tif))
+                .arg("price_i").arg(price_i.to_string())
+                .arg("qty_i").arg(decimal_to_i64(order.quantity).to_string())
+                .arg("remaining_i").arg(decimal_to_i64(order.remaining).to_string())
+                .arg("status").arg(status_char(order.status))
+                .arg("stp").arg(stp_char(order.stp_mode))
+                .arg("user_id").arg(&order.user_id)
+                .arg("ts_ms").arg(order.created_at.timestamp_millis().to_string())
+                .arg("version").arg(order.version.to_string())
+                .ignore();
         }
         hset_pipe.query_async::<()>(&mut *conn).await.context("pre-write HSET pipeline")?;
     }
 
     // Phase 2: Lua CAS — version check + ZADD/ZREM + INCR
-    // All keys (including order hash keys) declared in KEYS[] for Dragonfly compatibility
     let n = mutations.len();
     let script = redis::Script::new(CAS_SCRIPT);
     let mut invocation = script.prepare_invoke();
@@ -479,7 +648,6 @@ pub async fn apply_book_mutations_cas(
         .key(&bids_key)
         .key(&asks_key);
 
-    // Add one order hash key per mutation (KEYS[4..4+N-1])
     for m in &mutations {
         invocation.key(&m.order_key);
     }
@@ -507,3 +675,206 @@ pub async fn apply_book_mutations_cas(
     }
 }
 
+// ── Lua Matching ──────────────────────────────────────────────────────────────
+
+/// Result of `match_order_lua` — the atomic Lua match.
+pub struct LuaMatchResult {
+    pub remaining: Decimal,
+    pub status: OrderStatus,
+    pub trades: Vec<LuaTrade>,
+}
+
+/// A single trade produced by the Lua matching script.
+pub struct LuaTrade {
+    pub resting_order_id: Uuid,
+    pub price: Decimal,
+    pub quantity: Decimal,
+    pub buyer_id: String,
+    pub seller_id: String,
+}
+
+/// Extract a String from a redis::Value.
+fn redis_value_to_string(v: &redis::Value) -> Option<String> {
+    match v {
+        redis::Value::BulkString(bytes) => String::from_utf8(bytes.clone()).ok(),
+        redis::Value::SimpleString(s) => Some(s.clone()),
+        redis::Value::Int(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Match an incoming order atomically inside Dragonfly via a two-phase approach:
+///
+/// **Phase 1 (RT1):** `ZRANGEBYSCORE` — fetch up to 100 resting order IDs from
+///   the opposite book side. This gives us the candidate list.
+///
+/// **Phase 2 (RT2):** `EVAL` — the Lua script receives all resting order keys
+///   pre-declared in `KEYS[]` (Dragonfly enforces that scripts only access declared
+///   keys). It reads each resting order, runs price-time priority matching, commits
+///   all mutations (fills, partial fills, adding resting incoming order), and returns
+///   trade results — all atomically in a single script execution.
+///
+/// Total: 2 round-trips, no lock, no retry, no CAS version check.
+///
+/// # FOK note
+/// FOK orders are NOT handled here. See the OCC/CAS path in routes.rs.
+pub async fn match_order_lua(
+    pool: &Pool,
+    order: &Order,
+) -> Result<LuaMatchResult> {
+    let lua_script = include_str!("lua/match_order.lua");
+
+    let bids_key = format!("book:{}:bids", order.pair_id);
+    let asks_key = format!("book:{}:asks", order.pair_id);
+    let version_key = format!("version:{}", order.pair_id);
+    let incoming_order_key = format!("order:{}", order.id);
+
+    // Determine opposite book key (we read from opponent's side)
+    let opp_key = match order.side {
+        Side::Buy => &asks_key,
+        Side::Sell => &bids_key,
+    };
+
+    let price_i = order.price.map(decimal_to_i64).unwrap_or(0);
+    let score = order.book_score();
+
+    let mut conn = pool.get().await.context("pool.get")?;
+
+    // ── Phase 1: fetch resting order IDs from opposite book ──────────────────
+    let resting_ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
+        .arg(opp_key)
+        .arg("-inf")
+        .arg("+inf")
+        .arg("LIMIT")
+        .arg(0i64)
+        .arg(100i64)
+        .query_async(&mut *conn)
+        .await
+        .context("ZRANGEBYSCORE resting ids")?;
+
+    // ── Phase 2: Lua EVAL with all keys declared ──────────────────────────────
+    // KEYS: [1]=bids, [2]=asks, [3]=version, [4]=order:{incoming_id},
+    //       [5..4+N]=order:{resting_id_i}
+    // ARGV: [1..11]=order fields, [12]=N, [13..12+N]=resting_id strings
+    let n = resting_ids.len();
+
+    let script = redis::Script::new(lua_script);
+    let mut invocation = script.prepare_invoke();
+
+    // KEYS
+    invocation
+        .key(&bids_key)
+        .key(&asks_key)
+        .key(&version_key)
+        .key(&incoming_order_key);
+
+    for rid in &resting_ids {
+        invocation.key(format!("order:{rid}"));
+    }
+
+    // ARGV: order fields
+    invocation
+        .arg(order.id.to_string())
+        .arg(side_char(order.side))
+        .arg(order_type_char(order.order_type))
+        .arg(tif_char(order.tif))
+        .arg(price_i.to_string())
+        .arg(decimal_to_i64(order.quantity).to_string())
+        .arg(&order.user_id)
+        .arg(stp_char(order.stp_mode))
+        .arg(order.created_at.timestamp_millis().to_string())
+        .arg(&order.pair_id)
+        .arg(score.to_string())
+        // N + resting IDs
+        .arg(n.to_string());
+
+    for rid in &resting_ids {
+        invocation.arg(rid);
+    }
+
+    let raw: redis::Value = invocation
+        .invoke_async(&mut *conn)
+        .await
+        .context("Lua match_order EVAL")?;
+
+    // Parse the returned bulk array:
+    //   [0] = "OK"
+    //   [1] = remaining_i
+    //   [2] = status
+    //   [3] = trade_count
+    //   then 5 fields per trade: resting_id, price_i, qty_i, buyer_id, seller_id
+    let items = match raw {
+        redis::Value::Array(v) => v,
+        other => anyhow::bail!("unexpected Lua return type: {:?}", other),
+    };
+
+    if items.len() < 4 {
+        anyhow::bail!("Lua script returned too few fields: {}", items.len());
+    }
+
+    let ok_str = redis_value_to_string(&items[0]).unwrap_or_default();
+    if ok_str != "OK" {
+        anyhow::bail!("Lua script returned error: {ok_str}");
+    }
+
+    let remaining_i: i64 = redis_value_to_string(&items[1])
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let status_str = redis_value_to_string(&items[2]).unwrap_or_default();
+    let status = match status_str.as_str() {
+        "N" => OrderStatus::New,
+        "PF" => OrderStatus::PartiallyFilled,
+        "F" => OrderStatus::Filled,
+        "C" => OrderStatus::Cancelled,
+        other => anyhow::bail!("unknown status from Lua: {other}"),
+    };
+
+    let trade_count: usize = redis_value_to_string(&items[3])
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let expected_len = 4 + trade_count * 5;
+    if items.len() < expected_len {
+        anyhow::bail!(
+            "Lua returned {} items but expected {} for {} trades",
+            items.len(), expected_len, trade_count
+        );
+    }
+
+    let mut trades = Vec::with_capacity(trade_count);
+    for i in 0..trade_count {
+        let base = 4 + i * 5;
+        let resting_id_str = redis_value_to_string(&items[base])
+            .context("missing resting_id")?;
+        let resting_order_id: Uuid = resting_id_str.parse()
+            .context("invalid resting_id UUID")?;
+
+        let price_i_str = redis_value_to_string(&items[base + 1])
+            .context("missing price_i")?;
+        let trade_price_i: i64 = price_i_str.parse().context("invalid price_i")?;
+
+        let qty_i_str = redis_value_to_string(&items[base + 2])
+            .context("missing qty_i")?;
+        let trade_qty_i: i64 = qty_i_str.parse().context("invalid qty_i")?;
+
+        let buyer_id = redis_value_to_string(&items[base + 3])
+            .context("missing buyer_id")?;
+        let seller_id = redis_value_to_string(&items[base + 4])
+            .context("missing seller_id")?;
+
+        trades.push(LuaTrade {
+            resting_order_id,
+            price: i64_to_decimal(trade_price_i),
+            quantity: i64_to_decimal(trade_qty_i),
+            buyer_id,
+            seller_id,
+        });
+    }
+
+    Ok(LuaMatchResult {
+        remaining: i64_to_decimal(remaining_i),
+        status,
+        trades,
+    })
+}

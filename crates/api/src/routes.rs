@@ -332,109 +332,194 @@ pub async fn create_order(
     // 3. Lock balance in DB (outside lock)
     lock_balance(&s.pg, &order).await
         .map_err(AppError::bad_request)?;
-    let pre_lock_ms = pre_lock_start.elapsed().as_millis() as u64;
+    let _pre_lock_ms = pre_lock_start.elapsed().as_millis() as u64;
 
-    // ── OCC RETRY LOOP (replaces distributed lock) ────────────────────────
-    const MAX_CAS_RETRIES: u32 = 10;
-    let mut cas_retries = 0u32;
-    let cas_start = std::time::Instant::now();
-    let original_order = order.clone();
-    let opposite_side = order.side.opposite();
+    // ── ROUTE: FOK → OCC CAS path; all other orders → Lua atomic EVAL ───────
+    //
+    // FOK (Fill-or-Kill) requires knowing total available liquidity BEFORE
+    // committing fills. A single-pass Lua script cannot do this atomically.
+    // FOK orders use the OCC/CAS retry loop below (they are rare in practice).
+    //
+    // All other orders (GTC, IOC, Market) use `match_order_lua` — a single
+    // Dragonfly EVAL call that loads the book, runs price-time matching, commits
+    // all mutations, and returns trade results atomically with no lock or retry.
 
-    let result;
-    let mut match_ms: u64 = 0;
+    let match_start = std::time::Instant::now();
 
-    loop {
-        // 4. Load book snapshot (version + orders in one pipeline)
-        let (mut book, snapshot_version) = cache::load_order_book_snapshot(
-            &s.dragonfly,
-            &req.pair_id,
-            opposite_side,
-            order.price,
-        )
-        .await?;
+    if tif == TimeInForce::FOK {
+        // ── FOK: OCC/CAS retry loop (correctness over performance) ───────────
+        const MAX_CAS_RETRIES: u32 = 10;
+        let mut cas_retries = 0u32;
+        let original_order = order.clone();
+        let opposite_side = order.side.opposite();
 
-        // Sort book for price-time priority
-        book.sort_by(|a, b| {
-            let sa = sort_score(a);
-            let sb = sort_score(b);
-            sa.partial_cmp(&sb)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.created_at.cmp(&b.created_at))
-        });
+        let result = loop {
+            let (mut book, snapshot_version) = cache::load_order_book_snapshot(
+                &s.dragonfly,
+                &req.pair_id,
+                opposite_side,
+                order.price,
+            )
+            .await?;
 
-        // 5. Match inline
-        let match_start = std::time::Instant::now();
-        let r = match_order(&order, &mut book);
-        match_ms = match_start.elapsed().as_millis() as u64;
-        order = r.incoming.clone();
+            book.sort_by(|a, b| {
+                let sa = sort_score(a);
+                let sb = sort_score(b);
+                sa.partial_cmp(&sb)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.created_at.cmp(&b.created_at))
+            });
 
-        // 6. Handle FOK rollback — exit loop early, no CAS write needed
-        if req.order_type == OrderType::Limit
-            && tif == TimeInForce::FOK
-            && r.trades.is_empty()
-            && order.status == OrderStatus::Cancelled
-        {
-            cancel_order_in_db(&s.pg, order.id).await?;
-            release_locked_balance(&s.pg, &order).await?;
-            return Ok((
-                StatusCode::OK,
-                Json(json!({
-                    "order": order_to_json(&order),
-                    "trades": [],
-                    "message": "FOK order cancelled — insufficient liquidity"
-                })),
-            ));
-        }
+            let r = match_order(&order, &mut book);
+            order = r.incoming.clone();
 
-        // 7. Try atomic CAS write
-        let incoming_if_resting = if order.status == OrderStatus::New
-            || order.status == OrderStatus::PartiallyFilled
-        {
-            Some(&order)
-        } else {
-            None
+            // FOK cancelled: exit without CAS write
+            if r.trades.is_empty() && order.status == OrderStatus::Cancelled {
+                cancel_order_in_db(&s.pg, order.id).await?;
+                release_locked_balance(&s.pg, &order).await?;
+                return Ok((
+                    StatusCode::OK,
+                    Json(json!({
+                        "order": order_to_json(&order),
+                        "trades": [],
+                        "message": "FOK order cancelled — insufficient liquidity"
+                    })),
+                ));
+            }
+
+            let incoming_if_resting = if order.status == OrderStatus::New
+                || order.status == OrderStatus::PartiallyFilled
+            {
+                Some(&order)
+            } else {
+                None
+            };
+
+            match cache::apply_book_mutations_cas(
+                &s.dragonfly,
+                &req.pair_id,
+                snapshot_version,
+                &r.book_updates,
+                incoming_if_resting,
+            )
+            .await?
+            {
+                cache::CasResult::Ok => break r,
+                cache::CasResult::Conflict => {
+                    cas_retries += 1;
+                    if cas_retries >= MAX_CAS_RETRIES {
+                        return Err(AppError::conflict(anyhow::anyhow!(
+                            "order book contention: too many retries"
+                        )));
+                    }
+                    order = original_order.clone();
+                    continue;
+                }
+            }
         };
 
-        match cache::apply_book_mutations_cas(
-            &s.dragonfly,
-            &req.pair_id,
-            snapshot_version,
-            &r.book_updates,
-            incoming_if_resting,
-        )
-        .await?
+        let lua_ms = match_start.elapsed().as_millis() as u64;
+        let total_ms = total_start.elapsed().as_millis() as u64;
+        let trade_count = result.trades.len();
+
         {
-            cache::CasResult::Ok => {
-                result = r;
-                break;
-            }
-            cache::CasResult::Conflict => {
-                cas_retries += 1;
-                if cas_retries >= MAX_CAS_RETRIES {
-                    return Err(AppError::conflict(anyhow::anyhow!(
-                        "order book contention: too many retries"
-                    )));
+            let pool = s.dragonfly.clone();
+            let pair_id = req.pair_id.clone();
+            tokio::spawn(async move {
+                let _ = metrics::record_match_latency(&pool, &pair_id, lua_ms).await;
+                let _ = metrics::record_lock_wait(&pool, &pair_id, 0).await;
+                let _ = metrics::increment_order_count(&pool, &pair_id).await;
+                if trade_count > 0 {
+                    let _ = metrics::increment_trade_count(&pool, &pair_id, trade_count as u64).await;
                 }
-                // Reset order to pre-match state and retry
-                order = original_order.clone();
-                continue;
-            }
+            });
         }
+
+        let post_lock_start = std::time::Instant::now();
+
+        insert_audit_event(
+            &s.pg,
+            Some(&req.pair_id),
+            "ORDER_CREATED",
+            &json!({
+                "order_id": order.id.to_string(),
+                "user_id": order.user_id,
+                "side": format!("{:?}", order.side),
+                "order_type": format!("{:?}", order.order_type),
+                "price": order.price.map(|v| v.to_string()),
+                "quantity": order.quantity.to_string(),
+            }),
+        )
+        .await
+        .ok();
+
+        let trade_jsons = persist_trades(&s.pg, &result.trades).await?;
+
+        let mut all_updates: Vec<&Order> = result.book_updates.iter().collect();
+        all_updates.push(&order);
+        batch_update_orders_db(&s.pg, &all_updates).await?;
+
+        for upd in &result.book_updates {
+            let event_type = match upd.status {
+                OrderStatus::Filled => "ORDER_FILLED",
+                OrderStatus::PartiallyFilled => "ORDER_PARTIALLY_FILLED",
+                OrderStatus::Cancelled => "ORDER_CANCELLED",
+                _ => continue,
+            };
+            insert_audit_event(
+                &s.pg,
+                Some(&req.pair_id),
+                event_type,
+                &json!({ "order_id": upd.id.to_string(), "remaining": upd.remaining.to_string() }),
+            )
+            .await
+            .ok();
+        }
+
+        if order.status == OrderStatus::Cancelled || order.status == OrderStatus::Filled {
+            release_remaining_locked(&s.pg, &order).await?;
+        }
+
+        let post_lock_ms = post_lock_start.elapsed().as_millis() as u64;
+
+        tracing::info!(
+            lua_ms = lua_ms,
+            match_ms = 0_u64,
+            post_lock_ms = post_lock_ms,
+            total_ms = total_ms,
+            trade_count = trade_count,
+            pair_id = %req.pair_id,
+            fok_occ_path = true,
+            "order complete"
+        );
+
+        return Ok((
+            StatusCode::CREATED,
+            Json(json!({
+                "order": order_to_json(&order),
+                "trades": trade_jsons,
+            })),
+        ));
     }
 
-    let cas_ms = cas_start.elapsed().as_millis() as u64;
-    let total_ms = total_start.elapsed().as_millis() as u64;
-    let trade_count = result.trades.len();
-    let lock_wait_ms: u64 = 0; // no longer used — kept for metrics compat
+    // ── Non-FOK: single atomic Lua EVAL — no lock, no retry ──────────────────
+    let lua_result = cache::match_order_lua(&s.dragonfly, &order).await?;
+    let lua_ms = match_start.elapsed().as_millis() as u64;
 
-    // Write metrics to Dragonfly (best-effort, don't fail the request)
+    // Apply Lua result to the incoming order struct
+    order.remaining = lua_result.remaining;
+    order.status = lua_result.status;
+
+    let trade_count = lua_result.trades.len();
+    let total_ms = total_start.elapsed().as_millis() as u64;
+
+    // Metrics (best-effort)
     {
         let pool = s.dragonfly.clone();
         let pair_id = req.pair_id.clone();
         tokio::spawn(async move {
-            let _ = metrics::record_match_latency(&pool, &pair_id, match_ms).await;
-            let _ = metrics::record_lock_wait(&pool, &pair_id, lock_wait_ms).await;
+            let _ = metrics::record_match_latency(&pool, &pair_id, lua_ms).await;
+            let _ = metrics::record_lock_wait(&pool, &pair_id, 0).await;
             let _ = metrics::increment_order_count(&pool, &pair_id).await;
             if trade_count > 0 {
                 let _ = metrics::increment_trade_count(&pool, &pair_id, trade_count as u64).await;
@@ -442,7 +527,6 @@ pub async fn create_order(
         });
     }
 
-    // 10. Persist to DB (outside lock) — timed as post_lock segment
     let post_lock_start = std::time::Instant::now();
 
     insert_audit_event(
@@ -461,31 +545,36 @@ pub async fn create_order(
     .await
     .ok();
 
-    // Batch persist all trades in a single transaction
-    let trade_jsons = persist_trades(&s.pg, &result.trades).await?;
-
-    // Batch update all affected resting orders in one transaction
-    let mut all_updates: Vec<&Order> = result.book_updates.iter().collect();
-    all_updates.push(&order);
-    batch_update_orders_db(&s.pg, &all_updates).await?;
-
-    // Audit events for book updates (best-effort, non-blocking)
-    for upd in &result.book_updates {
-        let event_type = match upd.status {
-            OrderStatus::Filled => "ORDER_FILLED",
-            OrderStatus::PartiallyFilled => "ORDER_PARTIALLY_FILLED",
-            OrderStatus::Cancelled => "ORDER_CANCELLED",
-            _ => continue,
+    // Convert LuaTrades → Trade objects (UUIDs generated in Rust, not Lua)
+    let trade_now = Utc::now();
+    let trades: Vec<Trade> = lua_result.trades.iter().map(|lt| {
+        let (buy_order_id, sell_order_id) = match order.side {
+            Side::Buy  => (order.id, lt.resting_order_id),
+            Side::Sell => (lt.resting_order_id, order.id),
         };
-        insert_audit_event(
-            &s.pg,
-            Some(&req.pair_id),
-            event_type,
-            &json!({ "order_id": upd.id.to_string(), "remaining": upd.remaining.to_string() }),
-        )
-        .await
-        .ok();
-    }
+        Trade {
+            id: Uuid::new_v4(),
+            pair_id: order.pair_id.clone(),
+            buy_order_id,
+            sell_order_id,
+            buyer_id: lt.buyer_id.clone(),
+            seller_id: lt.seller_id.clone(),
+            price: lt.price,
+            quantity: lt.quantity,
+            sequence: 0,
+            created_at: trade_now,
+        }
+    }).collect();
+
+    // Persist trades + settle balances (single DB transaction)
+    let trade_jsons = persist_trades(&s.pg, &trades).await?;
+
+    // Update resting orders' statuses in DB using arithmetic SQL.
+    // Dragonfly is already correct (Lua committed atomically); this syncs Postgres.
+    update_resting_orders_after_lua(&s.pg, &lua_result.trades).await?;
+
+    // Update incoming order's remaining + status in DB
+    update_order_db(&s.pg, &order).await?;
 
     if order.status == OrderStatus::Cancelled || order.status == OrderStatus::Filled {
         release_remaining_locked(&s.pg, &order).await?;
@@ -494,10 +583,8 @@ pub async fn create_order(
     let post_lock_ms = post_lock_start.elapsed().as_millis() as u64;
 
     tracing::info!(
-        pre_lock_ms = pre_lock_ms,
-        cas_ms = cas_ms,
-        cas_retries = cas_retries,
-        match_ms = match_ms,
+        lua_ms = lua_ms,
+        match_ms = 0_u64,
         post_lock_ms = post_lock_ms,
         total_ms = total_ms,
         trade_count = trade_count,
@@ -1303,6 +1390,41 @@ async fn persist_trades(pg: &sqlx::PgPool, trades: &[Trade]) -> anyhow::Result<V
     }
 
     Ok(trade_jsons)
+}
+
+/// Update resting orders in Postgres after a Lua atomic fill.
+///
+/// Uses arithmetic SQL so we don't need the current remaining value.
+/// Dragonfly is already correct; this syncs the authoritative Postgres state.
+/// Runs each update individually (resting orders per match are typically ≤ a few).
+async fn update_resting_orders_after_lua(
+    pg: &sqlx::PgPool,
+    lua_trades: &[cache::LuaTrade],
+) -> anyhow::Result<()> {
+    if lua_trades.is_empty() {
+        return Ok(());
+    }
+    let now = Utc::now();
+    let mut tx = pg.begin().await?;
+    for lt in lua_trades {
+        sqlx::query(
+            "UPDATE orders
+             SET remaining   = GREATEST(remaining - $1, 0),
+                 status      = CASE WHEN GREATEST(remaining - $1, 0) = 0
+                                    THEN 'Filled' ELSE 'PartiallyFilled' END,
+                 version     = version + 1,
+                 updated_at  = $2
+             WHERE id = $3
+               AND status IN ('New', 'PartiallyFilled')",
+        )
+        .bind(lt.quantity)
+        .bind(now)
+        .bind(lt.resting_order_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn insert_trade_db(pg: &sqlx::PgPool, trade: &Trade) -> anyhow::Result<()> {
