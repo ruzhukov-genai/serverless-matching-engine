@@ -1,5 +1,7 @@
 //! API route handlers — real implementations backed by Dragonfly + PostgreSQL.
 
+use std::collections::HashMap;
+
 use axum::{
     extract::{Path, Query, State, WebSocketUpgrade, ws::Message, ws::WebSocket},
     http::StatusCode,
@@ -450,27 +452,8 @@ pub async fn create_order(
     .await
     .ok();
 
-    let mut trade_jsons: Vec<Value> = Vec::new();
-    for trade in &result.trades {
-        insert_trade_db(&s.pg, trade).await?;
-        settle_trade_balances(&s.pg, trade).await?;
-        trade_jsons.push(trade_to_json(trade));
-
-        insert_audit_event(
-            &s.pg,
-            Some(&req.pair_id),
-            "TRADE_EXECUTED",
-            &json!({
-                "trade_id": trade.id.to_string(),
-                "buy_order_id": trade.buy_order_id.to_string(),
-                "sell_order_id": trade.sell_order_id.to_string(),
-                "price": trade.price.to_string(),
-                "quantity": trade.quantity.to_string(),
-            }),
-        )
-        .await
-        .ok();
-    }
+    // Batch persist all trades in a single transaction
+    let trade_jsons = persist_trades(&s.pg, &result.trades).await?;
 
     for upd in &result.book_updates {
         update_order_db(&s.pg, upd).await?;
@@ -1170,6 +1153,113 @@ async fn cancel_order_with_lock(
     release_locked_balance(pg, &order).await?;
 
     Ok(order)
+}
+
+/// Persist all trades from a single match in one DB transaction.
+///
+/// Opens one transaction, bulk-inserts all trades, aggregates balance deltas
+/// into one UPDATE per (user_id, asset), batch-inserts audit events, then commits.
+/// Returns a Vec<Value> of trade JSON objects.
+async fn persist_trades(pg: &sqlx::PgPool, trades: &[Trade]) -> anyhow::Result<Vec<Value>> {
+    if trades.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut tx = pg.begin().await?;
+    let mut trade_jsons = Vec::with_capacity(trades.len());
+
+    // Step 1: INSERT all trades
+    for trade in trades {
+        sqlx::query(
+            "INSERT INTO trades (id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING",
+        )
+        .bind(trade.id)
+        .bind(&trade.pair_id)
+        .bind(trade.buy_order_id)
+        .bind(trade.sell_order_id)
+        .bind(&trade.buyer_id)
+        .bind(&trade.seller_id)
+        .bind(trade.price)
+        .bind(trade.quantity)
+        .bind(trade.created_at)
+        .execute(&mut *tx)
+        .await?;
+
+        trade_jsons.push(trade_to_json(trade));
+    }
+
+    // Step 2: Aggregate balance deltas across all trades
+    // Key: (user_id, asset) → (locked_decrease, available_increase)
+    let mut deltas: HashMap<(String, String), (Decimal, Decimal)> = HashMap::new();
+
+    for trade in trades {
+        let (base, quote) = sme_shared::parse_pair_id(&trade.pair_id)?;
+        let cost = trade.price * trade.quantity;
+
+        // buyer (quote asset): locked -= cost
+        deltas
+            .entry((trade.buyer_id.clone(), quote.clone()))
+            .or_insert((Decimal::ZERO, Decimal::ZERO))
+            .0 += cost;
+
+        // buyer (base asset): available += qty
+        deltas
+            .entry((trade.buyer_id.clone(), base.clone()))
+            .or_insert((Decimal::ZERO, Decimal::ZERO))
+            .1 += trade.quantity;
+
+        // seller (base asset): locked -= qty
+        deltas
+            .entry((trade.seller_id.clone(), base.clone()))
+            .or_insert((Decimal::ZERO, Decimal::ZERO))
+            .0 += trade.quantity;
+
+        // seller (quote asset): available += cost
+        deltas
+            .entry((trade.seller_id.clone(), quote.clone()))
+            .or_insert((Decimal::ZERO, Decimal::ZERO))
+            .1 += cost;
+    }
+
+    // Step 3: Apply one UPDATE per (user_id, asset).
+    // Uses INSERT ON CONFLICT to handle new balance rows (e.g. buyer receiving
+    // base asset for the first time).
+    for ((user_id, asset), (locked_decrease, available_increase)) in &deltas {
+        sqlx::query(
+            "INSERT INTO balances (user_id, asset, available, locked) VALUES ($3, $4, $2, 0)
+             ON CONFLICT (user_id, asset) DO UPDATE
+               SET locked    = GREATEST(balances.locked    - $1, 0),
+                   available = balances.available + $2",
+        )
+        .bind(locked_decrease)
+        .bind(available_increase)
+        .bind(user_id)
+        .bind(asset)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // Step 4: Batch INSERT audit events
+    for trade in trades {
+        sqlx::query(
+            "INSERT INTO audit_log (pair_id, event_type, payload) VALUES ($1, $2, $3)",
+        )
+        .bind(&trade.pair_id)
+        .bind("TRADE_EXECUTED")
+        .bind(json!({
+            "trade_id": trade.id.to_string(),
+            "buy_order_id": trade.buy_order_id.to_string(),
+            "sell_order_id": trade.sell_order_id.to_string(),
+            "price": trade.price.to_string(),
+            "quantity": trade.quantity.to_string(),
+        }))
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(trade_jsons)
 }
 
 async fn insert_trade_db(pg: &sqlx::PgPool, trade: &Trade) -> anyhow::Result<()> {
