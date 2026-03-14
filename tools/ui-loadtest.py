@@ -172,18 +172,29 @@ async def ws_client(session: aiohttp.ClientSession, stats: ClientStats, path: st
 async def place_orders(session: aiohttp.ClientSession, stats: ClientStats, client_id: int, deadline: float):
     seq = 0
     while time.monotonic() < deadline:
-        side = "Buy" if seq % 2 == 0 else "Sell"
-        user = f"user-{(client_id % 5) + 1}"
-        # Non-crossing IOC orders (no match, pure throughput)
-        price = "70500.00" if side == "Buy" else "71000.00"
+        # Mix of order types for realistic book:
+        #   seq % 4 == 0: GTC sell that rests at 70800 (ask side)
+        #   seq % 4 == 1: GTC buy that crosses at 70800 → trade!
+        #   seq % 4 == 2: GTC buy that rests at 70600 (bid side)
+        #   seq % 4 == 3: GTC sell that crosses at 70600 → trade!
+        pattern = seq % 4
+        user = f"user-{(client_id % 10) + 1}"
+        if pattern == 0:
+            side, price, tif = "Sell", "70800.00", "GTC"
+        elif pattern == 1:
+            side, price, tif = "Buy", "70800.00", "GTC"
+        elif pattern == 2:
+            side, price, tif = "Buy", "70600.00", "GTC"
+        else:
+            side, price, tif = "Sell", "70600.00", "GTC"
         body = {
             "user_id": user,
             "pair_id": PAIR,
             "side": side,
             "order_type": "Limit",
-            "tif": "IOC",
+            "tif": tif,
             "price": price,
-            "quantity": "0.00001",
+            "quantity": "0.00100",
         }
         t0 = time.monotonic()
         try:
