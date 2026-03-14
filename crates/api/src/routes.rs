@@ -248,35 +248,11 @@ pub async fn get_ticker(
     Path(pair_id): Path<String>,
     State(s): State<AppState>,
 ) -> HandlerResult<impl IntoResponse> {
-    let row = sqlx::query(
-        "SELECT
-            MAX(price) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') as high_24h,
-            MIN(price) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') as low_24h,
-            SUM(quantity) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') as volume_24h,
-            (SELECT price FROM trades WHERE pair_id = $1 ORDER BY created_at DESC LIMIT 1) as last_price
-         FROM trades WHERE pair_id = $1",
-    )
-    .bind(&pair_id)
-    .fetch_optional(&s.pg)
-    .await?;
-
-    let ticker = match row {
-        Some(r) => json!({
-            "pair": pair_id,
-            "last": r.get::<Option<Decimal>, _>("last_price").map(|v| v.to_string()),
-            "high_24h": r.get::<Option<Decimal>, _>("high_24h").map(|v| v.to_string()),
-            "low_24h": r.get::<Option<Decimal>, _>("low_24h").map(|v| v.to_string()),
-            "volume_24h": r.get::<Option<Decimal>, _>("volume_24h").map(|v| v.to_string()),
-        }),
-        None => json!({
-            "pair": pair_id,
-            "last": null,
-            "high_24h": null,
-            "low_24h": null,
-            "volume_24h": null,
-        }),
-    };
-
+    let cache = s.ticker_cache.read().await;
+    let ticker = cache.get(&pair_id).cloned().unwrap_or_else(|| json!({
+        "pair": pair_id,
+        "last": null, "high_24h": null, "low_24h": null, "volume_24h": null,
+    }));
     Ok(Json(ticker))
 }
 
@@ -722,25 +698,22 @@ pub async fn list_orders(
     let limit = q.limit.unwrap_or(50).min(500);
     let offset = q.offset.unwrap_or(0).max(0);
 
-    let (count_row, rows) = if let Some(ref pair_id) = q.pair_id {
-        let c = sqlx::query("SELECT COUNT(*) as cnt FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled') AND pair_id = $2")
-            .bind(&user_id).bind(pair_id).fetch_one(&s.pg).await?;
-        let r = sqlx::query(
-            "SELECT id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, sequence, created_at, updated_at, client_order_id
+    // Single query with COUNT(*) OVER() window function — eliminates the separate count query
+    let rows = if let Some(ref pair_id) = q.pair_id {
+        sqlx::query(
+            "SELECT id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, sequence, created_at, updated_at, client_order_id,
+                    COUNT(*) OVER() as total_count
              FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled') AND pair_id = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4",
-        ).bind(&user_id).bind(pair_id).bind(limit).bind(offset).fetch_all(&s.pg).await?;
-        (c, r)
+        ).bind(&user_id).bind(pair_id).bind(limit).bind(offset).fetch_all(&s.pg).await?
     } else {
-        let c = sqlx::query("SELECT COUNT(*) as cnt FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled')")
-            .bind(&user_id).fetch_one(&s.pg).await?;
-        let r = sqlx::query(
-            "SELECT id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, sequence, created_at, updated_at, client_order_id
+        sqlx::query(
+            "SELECT id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, sequence, created_at, updated_at, client_order_id,
+                    COUNT(*) OVER() as total_count
              FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled') ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-        ).bind(&user_id).bind(limit).bind(offset).fetch_all(&s.pg).await?;
-        (c, r)
+        ).bind(&user_id).bind(limit).bind(offset).fetch_all(&s.pg).await?
     };
 
-    let total: i64 = count_row.get("cnt");
+    let total: i64 = rows.first().map(|r| r.get("total_count")).unwrap_or(0);
     let orders: Vec<Value> = rows.iter().map(row_to_order_json).collect();
     Ok(Json(json!({ "orders": orders, "total": total, "limit": limit, "offset": offset })))
 }
@@ -1564,6 +1537,76 @@ async fn settle_trade_balances(pg: &sqlx::PgPool, trade: &Trade) -> anyhow::Resu
 
 fn sort_score(order: &Order) -> f64 {
     order.book_score()
+}
+
+// ── Background ticker refresh ────────────────────────────────────────────────
+
+/// Runs forever, refreshing ticker data for all pairs every 2 seconds.
+pub async fn ticker_refresh_loop(
+    pg: sqlx::PgPool,
+    cache: std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, Value>>>,
+) {
+    use tokio::time::{Duration, interval};
+    let mut ticker = interval(Duration::from_secs(2));
+
+    loop {
+        ticker.tick().await;
+
+        // Single query for all pairs — one round trip instead of N
+        let rows = sqlx::query(
+            "SELECT pair_id,
+                    MAX(price) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') as high_24h,
+                    MIN(price) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') as low_24h,
+                    SUM(quantity) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') as volume_24h
+             FROM trades GROUP BY pair_id",
+        )
+        .fetch_all(&pg)
+        .await;
+
+        let agg_rows = match rows {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "ticker refresh failed (agg)");
+                continue;
+            }
+        };
+
+        // Get last prices in one query
+        let last_rows = sqlx::query(
+            "SELECT DISTINCT ON (pair_id) pair_id, price as last_price
+             FROM trades ORDER BY pair_id, created_at DESC",
+        )
+        .fetch_all(&pg)
+        .await;
+
+        let last_prices: std::collections::HashMap<String, Decimal> = match last_rows {
+            Ok(r) => r.iter().map(|row| {
+                let pid: String = row.get("pair_id");
+                let price: Decimal = row.get("last_price");
+                (pid, price)
+            }).collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "ticker refresh failed (last)");
+                continue;
+            }
+        };
+
+        let mut new_cache = std::collections::HashMap::new();
+        for row in &agg_rows {
+            let pair_id: String = row.get("pair_id");
+            let last = last_prices.get(&pair_id).map(|v| v.to_string());
+            new_cache.insert(pair_id.clone(), json!({
+                "pair": pair_id,
+                "last": last,
+                "high_24h": row.get::<Option<Decimal>, _>("high_24h").map(|v| v.to_string()),
+                "low_24h": row.get::<Option<Decimal>, _>("low_24h").map(|v| v.to_string()),
+                "volume_24h": row.get::<Option<Decimal>, _>("volume_24h").map(|v| v.to_string()),
+            }));
+        }
+
+        let mut w = cache.write().await;
+        *w = new_cache;
+    }
 }
 
 // ── Background metrics refresh ───────────────────────────────────────────────

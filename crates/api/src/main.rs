@@ -41,6 +41,8 @@ pub struct AppState {
     pub book_broadcasts: Arc<HashMap<String, broadcast::Sender<String>>>,
     /// Cached metrics — refreshed every 5s by a background task
     pub metrics_cache: Arc<RwLock<serde_json::Value>>,
+    /// Cached ticker data per pair — refreshed every 2s
+    pub ticker_cache: Arc<RwLock<HashMap<String, serde_json::Value>>>,
 }
 
 #[tokio::main]
@@ -119,9 +121,19 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Cached ticker — refreshed every 2s by background task
+    let ticker_cache = Arc::new(RwLock::new(HashMap::<String, serde_json::Value>::new()));
+    {
+        let cache = ticker_cache.clone();
+        let pg = pg_hot.clone();
+        tokio::spawn(async move {
+            routes::ticker_refresh_loop(pg, cache).await;
+        });
+    }
+
     let state = AppState {
         dragonfly, pg: pg_hot, pg_bg, pairs_cache, persist_tx,
-        book_broadcasts, metrics_cache,
+        book_broadcasts, metrics_cache, ticker_cache,
     };
 
     let app = Router::new()
