@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -137,4 +137,26 @@ pub struct AuditRecord {
     pub pair_id: String,
     pub timestamp: DateTime<Utc>,
     pub event: AuditEvent,
+}
+
+impl Order {
+    /// Compute the book score for this order. Used for Redis sorted sets.
+    /// Buy orders get negative prices (for price-desc sorting), sell orders get positive prices (for price-asc sorting).
+    pub fn book_score(&self) -> f64 {
+        let price = self.price.unwrap_or_default().to_f64().unwrap_or(0.0);
+        match self.side {
+            Side::Buy => -price,
+            Side::Sell => price,
+        }
+    }
+}
+
+/// Parse pair_id string (e.g., "BTC-USDT") to extract base and quote assets.
+/// Returns (base, quote) or error if invalid format.
+pub fn parse_pair_id(pair_id: &str) -> anyhow::Result<(String, String)> {
+    let parts: Vec<&str> = pair_id.split('-').collect();
+    if parts.len() != 2 {
+        anyhow::bail!("invalid pair_id format: {}, expected BASE-QUOTE", pair_id);
+    }
+    Ok((parts[0].to_string(), parts[1].to_string()))
 }

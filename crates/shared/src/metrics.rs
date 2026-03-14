@@ -13,10 +13,10 @@ const SAMPLE_CAP: isize = 1000;
 
 // ── Write helpers ─────────────────────────────────────────────────────────────
 
-/// Push a match latency sample (ms) to the list; trim to last 1000.
-pub async fn record_match_latency(pool: &Pool, pair_id: &str, ms: u64) -> Result<()> {
+/// Push a sample to a metrics list; trim to last 1000.
+async fn push_sample(pool: &Pool, pair_id: &str, metric_type: &str, ms: u64) -> Result<()> {
     let mut conn = pool.get().await.context("pool.get")?;
-    let key = format!("metrics:{pair_id}:latency");
+    let key = format!("metrics:{pair_id}:{metric_type}");
     let () = redis::pipe()
         .cmd("LPUSH")
         .arg(&key)
@@ -27,26 +27,18 @@ pub async fn record_match_latency(pool: &Pool, pair_id: &str, ms: u64) -> Result
         .arg(SAMPLE_CAP - 1)
         .query_async(&mut *conn)
         .await
-        .context("record_match_latency")?;
+        .with_context(|| format!("push_sample {metric_type}"))?;
     Ok(())
+}
+
+/// Push a match latency sample (ms) to the list; trim to last 1000.
+pub async fn record_match_latency(pool: &Pool, pair_id: &str, ms: u64) -> Result<()> {
+    push_sample(pool, pair_id, "latency", ms).await
 }
 
 /// Push a lock-wait latency sample (ms) to the list; trim to last 1000.
 pub async fn record_lock_wait(pool: &Pool, pair_id: &str, ms: u64) -> Result<()> {
-    let mut conn = pool.get().await.context("pool.get")?;
-    let key = format!("metrics:{pair_id}:lock_wait");
-    let () = redis::pipe()
-        .cmd("LPUSH")
-        .arg(&key)
-        .arg(ms.to_string())
-        .cmd("LTRIM")
-        .arg(&key)
-        .arg(0)
-        .arg(SAMPLE_CAP - 1)
-        .query_async(&mut *conn)
-        .await
-        .context("record_lock_wait")?;
-    Ok(())
+    push_sample(pool, pair_id, "lock_wait", ms).await
 }
 
 /// Increment per-pair order counter.

@@ -49,21 +49,44 @@ fn order_key(order_id: &Uuid) -> String {
     format!("order:{order_id}")
 }
 
+/// Fetch multiple orders by IDs using pipelined HGET commands to avoid N+1 calls.
+async fn fetch_orders_by_ids(pool: &Pool, ids: &[String]) -> Result<Vec<Order>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut conn = pool.get().await.context("pool.get")?;
+    let mut pipeline = redis::pipe();
+    
+    // Build pipeline with all HGET commands
+    for id in ids {
+        let okey = format!("order:{id}");
+        pipeline.hget(&okey, "data");
+    }
+    
+    // Execute pipeline and get all results at once
+    let data_list: Vec<Option<String>> = pipeline
+        .query_async(&mut *conn)
+        .await
+        .context("pipeline HGET")?;
+    
+    let mut orders = Vec::with_capacity(ids.len());
+    for (id, data) in ids.iter().zip(data_list.iter()) {
+        if let Some(json) = data {
+            match serde_json::from_str::<Order>(json) {
+                Ok(order) => orders.push(order),
+                Err(e) => tracing::warn!("bad order json for {id}: {e}"),
+            }
+        }
+    }
+    
+    Ok(orders)
+}
+
 /// Score for the sorted set.  
 /// Bids: negate price so ZRANGEBYSCORE -inf +inf returns highest bid first.  
 /// Asks: raw price so ZRANGEBYSCORE -inf +inf returns lowest ask first.
-fn book_score(order: &Order) -> f64 {
-    let price = order
-        .price
-        .unwrap_or_default()
-        .to_string()
-        .parse::<f64>()
-        .unwrap_or(0.0);
-    match order.side {
-        Side::Buy => -price,
-        Side::Sell => price,
-    }
-}
+
 
 // ── Order Book ────────────────────────────────────────────────────────────────
 
@@ -83,24 +106,13 @@ pub async fn load_order_book(pool: &Pool, pair_id: &str, side: Side) -> Result<V
         .await
         .context("ZRANGEBYSCORE")?;
 
-    let mut orders = Vec::with_capacity(ids.len());
-    for id in &ids {
-        let okey = format!("order:{id}");
-        let data: Option<String> = conn.hget(&okey, "data").await.context("HGET")?;
-        if let Some(json) = data {
-            match serde_json::from_str::<Order>(&json) {
-                Ok(order) => orders.push(order),
-                Err(e) => tracing::warn!("bad order json for {id}: {e}"),
-            }
-        }
-    }
-    Ok(orders)
+    fetch_orders_by_ids(pool, &ids).await
 }
 
 /// Save an order to the sorted set + hash.
 pub async fn save_order_to_book(pool: &Pool, order: &Order) -> Result<()> {
     let mut conn = pool.get().await.context("pool.get")?;
-    let score = book_score(order);
+    let score = order.book_score();
     let zkey = book_key(&order.pair_id, order.side);
     let okey = order_key(&order.id);
     let json = serde_json::to_string(order).context("serialize order")?;
@@ -200,18 +212,7 @@ pub async fn load_order_book_filtered(
         .await
         .context("ZRANGEBYSCORE filtered")?;
 
-    let mut orders = Vec::with_capacity(ids.len());
-    for id in &ids {
-        let okey = format!("order:{id}");
-        let data: Option<String> = conn.hget(&okey, "data").await.context("HGET")?;
-        if let Some(json) = data {
-            match serde_json::from_str::<Order>(&json) {
-                Ok(order) => orders.push(order),
-                Err(e) => tracing::warn!("bad order json for {id}: {e}"),
-            }
-        }
-    }
-    Ok(orders)
+    fetch_orders_by_ids(pool, &ids).await
 }
 
 /// Load a batch of orders from one side using ZRANGEBYSCORE with LIMIT (for lazy loading).
@@ -237,18 +238,7 @@ pub async fn load_order_book_batched(
         .await
         .context("ZRANGEBYSCORE batched")?;
 
-    let mut orders = Vec::with_capacity(ids.len());
-    for id in &ids {
-        let okey = format!("order:{id}");
-        let data: Option<String> = conn.hget(&okey, "data").await.context("HGET")?;
-        if let Some(json) = data {
-            match serde_json::from_str::<Order>(&json) {
-                Ok(order) => orders.push(order),
-                Err(e) => tracing::warn!("bad order json for {id}: {e}"),
-            }
-        }
-    }
-    Ok(orders)
+    fetch_orders_by_ids(pool, &ids).await
 }
 
 /// Read the current version counter without modifying it.

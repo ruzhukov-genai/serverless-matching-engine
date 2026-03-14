@@ -64,9 +64,7 @@ pub fn match_order(incoming: &Order, book: &mut Vec<Order>) -> MatchResult {
         incoming.tif
     };
 
-    if incoming.order_type == OrderType::Market && incoming.price.is_none() {
-        // keep going — no price filter
-    }
+
 
     // ── Walk book in priority order ───────────────────────────────────────
     for resting in book.iter_mut() {

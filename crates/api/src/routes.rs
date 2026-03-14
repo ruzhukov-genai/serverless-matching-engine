@@ -146,18 +146,24 @@ pub async fn get_trades(
     Ok(Json(json!({ "pair": pair_id, "trades": trades })))
 }
 
+fn row_to_trade(r: &sqlx::postgres::PgRow) -> Trade {
+    Trade {
+        id: r.get("id"),
+        pair_id: r.get("pair_id"),
+        buy_order_id: r.get("buy_order_id"),
+        sell_order_id: r.get("sell_order_id"),
+        buyer_id: r.get("buyer_id"),
+        seller_id: r.get("seller_id"),
+        price: r.get("price"),
+        quantity: r.get("quantity"),
+        sequence: r.get::<Option<i64>, _>("sequence").unwrap_or(0),
+        created_at: r.get("created_at"),
+    }
+}
+
 fn row_to_trade_json(r: &sqlx::postgres::PgRow) -> Value {
-    json!({
-        "id": r.get::<Uuid, _>("id").to_string(),
-        "pair_id": r.get::<String, _>("pair_id"),
-        "buy_order_id": r.get::<Uuid, _>("buy_order_id").to_string(),
-        "sell_order_id": r.get::<Uuid, _>("sell_order_id").to_string(),
-        "buyer_id": r.get::<String, _>("buyer_id"),
-        "seller_id": r.get::<String, _>("seller_id"),
-        "price": r.get::<Decimal, _>("price").to_string(),
-        "quantity": r.get::<Decimal, _>("quantity").to_string(),
-        "created_at": r.get::<chrono::DateTime<Utc>, _>("created_at").to_rfc3339(),
-    })
+    let trade = row_to_trade(r);
+    trade_to_json(&trade)
 }
 
 // ── GET /api/ticker/{pair_id} ─────────────────────────────────────────────────
@@ -504,36 +510,7 @@ pub async fn cancel_order(
     Path(order_id): Path<Uuid>,
     State(s): State<AppState>,
 ) -> HandlerResult<impl IntoResponse> {
-    let order = load_order_db(&s.pg, order_id).await?
-        .ok_or_else(|| AppError::not_found(anyhow::anyhow!("order not found")))?;
-
-    if order.status != OrderStatus::New && order.status != OrderStatus::PartiallyFilled {
-        return Err(AppError::conflict(anyhow::anyhow!(
-            "order not cancellable: status={:?}",
-            order.status
-        )));
-    }
-
-    let worker_id = format!("cancel-{order_id}");
-    let guard = lock::acquire_lock(&s.dragonfly, &order.pair_id, &worker_id).await?;
-
-    // Re-check status inside lock
-    let order = load_order_db(&s.pg, order_id).await?
-        .ok_or_else(|| AppError::not_found(anyhow::anyhow!("order not found")))?;
-    if order.status != OrderStatus::New && order.status != OrderStatus::PartiallyFilled {
-        guard.release().await;
-        return Err(AppError::conflict(anyhow::anyhow!(
-            "order not cancellable: status={:?}",
-            order.status
-        )));
-    }
-
-    cache::remove_order_from_book(&s.dragonfly, &order).await?;
-    cache::increment_version(&s.dragonfly, &order.pair_id).await?;
-    guard.release().await;
-
-    cancel_order_in_db(&s.pg, order_id).await?;
-    release_locked_balance(&s.pg, &order).await?;
+    let order = cancel_order_with_lock(&s.pg, &s.dragonfly, order_id, "cancel").await?;
 
     insert_audit_event(
         &s.pg,
@@ -554,29 +531,7 @@ pub async fn modify_order(
     State(s): State<AppState>,
     Json(_req): Json<CreateOrderRequest>,
 ) -> HandlerResult<impl IntoResponse> {
-    let old_order = load_order_db(&s.pg, order_id).await?
-        .ok_or_else(|| AppError::not_found(anyhow::anyhow!("order not found")))?;
-
-    if old_order.status != OrderStatus::New && old_order.status != OrderStatus::PartiallyFilled {
-        return Err(AppError::conflict(anyhow::anyhow!("order not modifiable")));
-    }
-
-    let worker_id = format!("modify-{order_id}");
-    let guard = lock::acquire_lock(&s.dragonfly, &old_order.pair_id, &worker_id).await?;
-
-    let old_order = load_order_db(&s.pg, order_id).await?
-        .ok_or_else(|| AppError::not_found(anyhow::anyhow!("order not found")))?;
-    if old_order.status != OrderStatus::New && old_order.status != OrderStatus::PartiallyFilled {
-        guard.release().await;
-        return Err(AppError::conflict(anyhow::anyhow!("order not modifiable")));
-    }
-
-    cache::remove_order_from_book(&s.dragonfly, &old_order).await?;
-    cache::increment_version(&s.dragonfly, &old_order.pair_id).await?;
-    guard.release().await;
-
-    cancel_order_in_db(&s.pg, order_id).await?;
-    release_locked_balance(&s.pg, &old_order).await?;
+    let _old_order = cancel_order_with_lock(&s.pg, &s.dragonfly, order_id, "modify").await?;
 
     Ok(Json(json!({
         "cancelled_order_id": order_id.to_string(),
@@ -1007,6 +962,8 @@ async fn load_order_db(pg: &sqlx::PgPool, order_id: Uuid) -> anyhow::Result<Opti
     Ok(row.map(|r| row_to_order(&r)))
 }
 
+
+
 fn row_to_order(r: &sqlx::postgres::PgRow) -> Order {
     let side: Side = match r.get::<String, _>("side").as_str() {
         "Buy" => Side::Buy,
@@ -1048,30 +1005,16 @@ fn row_to_order(r: &sqlx::postgres::PgRow) -> Order {
         status,
         stp_mode,
         version: r.get("version"),
-        sequence: 0,
+        sequence: r.get::<Option<i64>, _>("sequence").unwrap_or(0),
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
-        client_order_id: None, // not loaded from DB for internal use
+        client_order_id: r.get("client_order_id"),
     }
 }
 
 fn row_to_order_json(r: &sqlx::postgres::PgRow) -> Value {
-    json!({
-        "id": r.get::<Uuid, _>("id").to_string(),
-        "user_id": r.get::<String, _>("user_id"),
-        "pair_id": r.get::<String, _>("pair_id"),
-        "side": r.get::<String, _>("side"),
-        "order_type": r.get::<String, _>("order_type"),
-        "tif": r.get::<String, _>("tif"),
-        "price": r.get::<Option<Decimal>, _>("price").map(|v| v.to_string()),
-        "quantity": r.get::<Decimal, _>("quantity").to_string(),
-        "remaining": r.get::<Decimal, _>("remaining").to_string(),
-        "status": r.get::<String, _>("status"),
-        "stp_mode": r.get::<String, _>("stp_mode"),
-        "version": r.get::<i64, _>("version"),
-        "created_at": r.get::<chrono::DateTime<Utc>, _>("created_at").to_rfc3339(),
-        "updated_at": r.get::<chrono::DateTime<Utc>, _>("updated_at").to_rfc3339(),
-    })
+    let order = row_to_order(r);
+    order_to_json(&order)
 }
 
 fn order_to_json(o: &Order) -> Value {
@@ -1148,12 +1091,7 @@ async fn release_remaining_locked(pg: &sqlx::PgPool, order: &Order) -> anyhow::R
     if order.remaining == Decimal::ZERO {
         return Ok(());
     }
-    let row = sqlx::query("SELECT base, quote FROM pairs WHERE id = $1")
-        .bind(&order.pair_id)
-        .fetch_one(pg)
-        .await?;
-    let base: String = row.get("base");
-    let quote: String = row.get("quote");
+    let (base, quote) = sme_shared::parse_pair_id(&order.pair_id)?;
 
     let (asset, amount) = match order.side {
         Side::Buy => {
@@ -1176,15 +1114,10 @@ async fn release_remaining_locked(pg: &sqlx::PgPool, order: &Order) -> anyhow::R
 }
 
 async fn get_lock_asset_amount(
-    pg: &sqlx::PgPool,
+    _pg: &sqlx::PgPool,
     order: &Order,
 ) -> anyhow::Result<(String, Decimal)> {
-    let row = sqlx::query("SELECT base, quote FROM pairs WHERE id = $1")
-        .bind(&order.pair_id)
-        .fetch_one(pg)
-        .await?;
-    let base: String = row.get("base");
-    let quote: String = row.get("quote");
+    let (base, quote) = sme_shared::parse_pair_id(&order.pair_id)?;
 
     Ok(match order.side {
         Side::Buy => {
@@ -1193,6 +1126,50 @@ async fn get_lock_asset_amount(
         }
         Side::Sell => (base, order.quantity),
     })
+}
+
+async fn cancel_order_with_lock(
+    pg: &sqlx::PgPool,
+    dragonfly: &deadpool_redis::Pool,
+    order_id: Uuid,
+    operation_name: &str,
+) -> HandlerResult<Order> {
+    // Initial load without lock
+    let order = load_order_db(pg, order_id).await?
+        .ok_or_else(|| AppError::not_found(anyhow::anyhow!("order not found")))?;
+
+    if order.status != OrderStatus::New && order.status != OrderStatus::PartiallyFilled {
+        return Err(AppError::conflict(anyhow::anyhow!(
+            "order not cancellable: status={:?}",
+            order.status
+        )));
+    }
+
+    // Acquire lock and double-check
+    let worker_id = format!("{}-{order_id}", operation_name);
+    let guard = lock::acquire_lock(dragonfly, &order.pair_id, &worker_id).await?;
+
+    // Re-check status inside lock
+    let order = load_order_db(pg, order_id).await?
+        .ok_or_else(|| AppError::not_found(anyhow::anyhow!("order not found")))?;
+    if order.status != OrderStatus::New && order.status != OrderStatus::PartiallyFilled {
+        guard.release().await;
+        return Err(AppError::conflict(anyhow::anyhow!(
+            "order not cancellable: status={:?}",
+            order.status
+        )));
+    }
+
+    // Remove from book and release lock
+    cache::remove_order_from_book(dragonfly, &order).await?;
+    cache::increment_version(dragonfly, &order.pair_id).await?;
+    guard.release().await;
+
+    // Cancel in DB and release balance
+    cancel_order_in_db(pg, order_id).await?;
+    release_locked_balance(pg, &order).await?;
+
+    Ok(order)
 }
 
 async fn insert_trade_db(pg: &sqlx::PgPool, trade: &Trade) -> anyhow::Result<()> {
@@ -1215,12 +1192,7 @@ async fn insert_trade_db(pg: &sqlx::PgPool, trade: &Trade) -> anyhow::Result<()>
 }
 
 async fn settle_trade_balances(pg: &sqlx::PgPool, trade: &Trade) -> anyhow::Result<()> {
-    let row = sqlx::query("SELECT base, quote FROM pairs WHERE id = $1")
-        .bind(&trade.pair_id)
-        .fetch_one(pg)
-        .await?;
-    let base: String = row.get("base");
-    let quote: String = row.get("quote");
+    let (base, quote) = sme_shared::parse_pair_id(&trade.pair_id)?;
     let cost = trade.price * trade.quantity;
 
     let mut tx = pg.begin().await?;
@@ -1250,18 +1222,5 @@ async fn settle_trade_balances(pg: &sqlx::PgPool, trade: &Trade) -> anyhow::Resu
 }
 
 fn sort_score(order: &Order) -> f64 {
-    match order.side {
-        Side::Sell => order
-            .price
-            .unwrap_or_default()
-            .to_string()
-            .parse()
-            .unwrap_or(f64::MAX),
-        Side::Buy => -order
-            .price
-            .unwrap_or_default()
-            .to_string()
-            .parse::<f64>()
-            .unwrap_or(f64::MAX),
-    }
+    order.book_score()
 }
