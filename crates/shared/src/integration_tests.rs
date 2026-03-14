@@ -2135,4 +2135,459 @@ mod tests {
             .await
             .unwrap();
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // LUA ATOMIC MATCHING TESTS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Basic cross: resting ask, then crossing bid → trade, ask removed from book.
+    #[tokio::test]
+    async fn test_lua_matching_basic_cross() {
+        let pool = dragonfly_pool().await;
+        let pair = "LUA-BASIC-CROSS";
+        cleanup_pair(&pool, pair).await;
+
+        // Place resting ask
+        let ask = test_order(Side::Sell, dec!(100), dec!(1), pair, "seller-1");
+        cache::save_order_to_book(&pool, &ask).await.unwrap();
+
+        // Incoming crossing bid
+        let bid = test_order(Side::Buy, dec!(100), dec!(1), pair, "buyer-1");
+        let result = cache::match_order_lua(&pool, &bid).await.unwrap();
+
+        // One trade should have been produced
+        assert_eq!(result.trades.len(), 1, "expected 1 trade");
+        assert_eq!(result.trades[0].price, dec!(100));
+        assert_eq!(result.trades[0].quantity, dec!(1));
+        assert_eq!(result.trades[0].buyer_id, "buyer-1");
+        assert_eq!(result.trades[0].seller_id, "seller-1");
+        assert_eq!(result.status, OrderStatus::Filled);
+        assert_eq!(result.remaining, dec!(0));
+
+        // Resting ask must have been removed from the book
+        let asks = cache::load_order_book(&pool, pair, Side::Sell).await.unwrap();
+        assert_eq!(asks.len(), 0, "asks book must be empty after full cross");
+
+        // Incoming bid fully filled — must NOT rest
+        let bids = cache::load_order_book(&pool, pair, Side::Buy).await.unwrap();
+        assert_eq!(bids.len(), 0, "filled bid must not rest");
+
+        cleanup_pair(&pool, pair).await;
+    }
+
+    /// Partial fill: large resting ask, smaller crossing bid → partial fill, ask updated.
+    #[tokio::test]
+    async fn test_lua_matching_partial_fill() {
+        let pool = dragonfly_pool().await;
+        let pair = "LUA-PARTIAL";
+        cleanup_pair(&pool, pair).await;
+
+        // Large resting ask: 5 units @ 100
+        let ask = test_order(Side::Sell, dec!(100), dec!(5), pair, "seller-2");
+        cache::save_order_to_book(&pool, &ask).await.unwrap();
+
+        // Smaller incoming bid: 2 units @ 100
+        let bid = test_order(Side::Buy, dec!(100), dec!(2), pair, "buyer-2");
+        let result = cache::match_order_lua(&pool, &bid).await.unwrap();
+
+        // Bid fully filled, 1 trade for 2 units
+        assert_eq!(result.trades.len(), 1);
+        assert_eq!(result.trades[0].quantity, dec!(2));
+        assert_eq!(result.status, OrderStatus::Filled);
+        assert_eq!(result.remaining, dec!(0));
+
+        // Resting ask should still be in book with reduced remaining (5 - 2 = 3)
+        let asks = cache::load_order_book(&pool, pair, Side::Sell).await.unwrap();
+        assert_eq!(asks.len(), 1, "partially filled ask must remain in book");
+        assert_eq!(asks[0].id, ask.id);
+        assert_eq!(asks[0].remaining, dec!(3), "ask remaining must be reduced to 3");
+        assert_eq!(asks[0].status, OrderStatus::PartiallyFilled);
+
+        cleanup_pair(&pool, pair).await;
+    }
+
+    /// No cross: bid below best ask → no trades, bid rests in book.
+    #[tokio::test]
+    async fn test_lua_matching_no_cross() {
+        let pool = dragonfly_pool().await;
+        let pair = "LUA-NO-CROSS";
+        cleanup_pair(&pool, pair).await;
+
+        // Resting ask at 110
+        let ask = test_order(Side::Sell, dec!(110), dec!(1), pair, "seller-3");
+        cache::save_order_to_book(&pool, &ask).await.unwrap();
+
+        // Incoming bid at 100 — below best ask, no cross
+        let bid = test_order(Side::Buy, dec!(100), dec!(1), pair, "buyer-3");
+        let result = cache::match_order_lua(&pool, &bid).await.unwrap();
+
+        // No trades
+        assert_eq!(result.trades.len(), 0, "no trades expected when bid < ask");
+        assert_eq!(result.status, OrderStatus::New, "bid should rest as New");
+        assert_eq!(result.remaining, dec!(1));
+
+        // Bid should be resting in bids book
+        let bids = cache::load_order_book(&pool, pair, Side::Buy).await.unwrap();
+        assert_eq!(bids.len(), 1, "bid must rest in book");
+        assert_eq!(bids[0].price, Some(dec!(100)));
+
+        // Ask untouched
+        let asks = cache::load_order_book(&pool, pair, Side::Sell).await.unwrap();
+        assert_eq!(asks.len(), 1, "ask must remain in book");
+
+        // Cleanup orders
+        cleanup_order(&pool, &ask.id).await;
+        cleanup_order(&pool, &bid.id).await;
+        cleanup_pair(&pool, pair).await;
+    }
+
+    /// Multi-level sweep: 3 asks at different prices, large bid walks through all 3.
+    #[tokio::test]
+    async fn test_lua_matching_multi_level() {
+        let pool = dragonfly_pool().await;
+        let pair = "LUA-MULTI-LEVEL";
+        cleanup_pair(&pool, pair).await;
+
+        // Three asks at different prices
+        let a1 = test_order(Side::Sell, dec!(99), dec!(1), pair, "s-ml-1");
+        let a2 = test_order(Side::Sell, dec!(100), dec!(1), pair, "s-ml-2");
+        let a3 = test_order(Side::Sell, dec!(101), dec!(1), pair, "s-ml-3");
+        for a in [&a1, &a2, &a3] {
+            cache::save_order_to_book(&pool, a).await.unwrap();
+        }
+
+        // Incoming bid: 3 units @ 105 — sweeps all 3 price levels
+        let bid = test_order(Side::Buy, dec!(105), dec!(3), pair, "b-ml-1");
+        let result = cache::match_order_lua(&pool, &bid).await.unwrap();
+
+        // 3 trades at the 3 ask prices
+        assert_eq!(result.trades.len(), 3, "expected 3 trades");
+        let prices: Vec<rust_decimal::Decimal> = result.trades.iter().map(|t| t.price).collect();
+        assert!(prices.contains(&dec!(99)), "trade at 99");
+        assert!(prices.contains(&dec!(100)), "trade at 100");
+        assert!(prices.contains(&dec!(101)), "trade at 101");
+        assert_eq!(result.status, OrderStatus::Filled);
+        assert_eq!(result.remaining, dec!(0));
+
+        // All asks removed
+        let asks = cache::load_order_book(&pool, pair, Side::Sell).await.unwrap();
+        assert_eq!(asks.len(), 0, "all asks must be consumed");
+
+        cleanup_pair(&pool, pair).await;
+    }
+
+    /// STP CancelMaker: same user places ask then bid with STP=CancelMaker.
+    /// Resting ask gets cancelled, no trade, bid rests.
+    #[tokio::test]
+    async fn test_lua_matching_stp_cancel_maker() {
+        let pool = dragonfly_pool().await;
+        let pair = "LUA-STP-CM";
+        cleanup_pair(&pool, pair).await;
+
+        let user = "stp-cm-user";
+
+        // Resting ask from the same user (STP=None on the ask itself)
+        let ask = test_order(Side::Sell, dec!(100), dec!(1), pair, user);
+        cache::save_order_to_book(&pool, &ask).await.unwrap();
+
+        // Incoming bid from same user, STP=CancelMaker
+        let bid = Order {
+            id: Uuid::new_v4(),
+            user_id: user.to_string(),
+            pair_id: pair.to_string(),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::GTC,
+            price: Some(dec!(100)),
+            quantity: dec!(1),
+            remaining: dec!(1),
+            status: OrderStatus::New,
+            stp_mode: SelfTradePreventionMode::CancelMaker,
+            version: 1,
+            sequence: 0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            client_order_id: None,
+        };
+        let result = cache::match_order_lua(&pool, &bid).await.unwrap();
+
+        // No trade — STP prevented it
+        assert_eq!(result.trades.len(), 0, "STP CancelMaker must produce no trade");
+
+        // Resting ask must have been cancelled (removed from book)
+        let asks = cache::load_order_book(&pool, pair, Side::Sell).await.unwrap();
+        assert_eq!(asks.len(), 0, "resting ask must be cancelled by STP CancelMaker");
+
+        // Incoming bid should rest (GTC, no cancellation of taker)
+        let bids = cache::load_order_book(&pool, pair, Side::Buy).await.unwrap();
+        assert_eq!(bids.len(), 1, "bid must rest after STP cancelled the maker");
+        assert_eq!(bids[0].price, Some(dec!(100)));
+
+        cleanup_order(&pool, &bid.id).await;
+        cleanup_pair(&pool, pair).await;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // CANCEL ALL ORDERS (DB logic, mirrors DELETE /api/orders route)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Place 5 orders for a user, cancel all, verify cancelled + balances released.
+    #[tokio::test]
+    async fn test_cancel_all_orders() {
+        let pg = pg_pool().await;
+        db::run_migrations(&pg).await.unwrap();
+
+        // Unique user to avoid cross-test interference
+        let user = format!("cancel-all-{}", Uuid::new_v4().to_string().split('-').next().unwrap());
+
+        // Insert user balance: 10000 USDT available
+        sqlx::query("DELETE FROM balances WHERE user_id = $1").bind(&user).execute(&pg).await.unwrap();
+        sqlx::query("INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'USDT', 10000, 0)")
+            .bind(&user).execute(&pg).await.unwrap();
+
+        // Place 5 orders (price=100, qty=1 each → locks 100 USDT per order)
+        let mut order_ids = Vec::new();
+        for _ in 0..5 {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status)
+                 VALUES ($1, $2, 'BTC-USDT', 'Buy', 'Limit', 'GTC', 100, 1, 1, 'New')"
+            ).bind(id).bind(&user).execute(&pg).await.unwrap();
+
+            // Lock balance for each order
+            sqlx::query("UPDATE balances SET available = available - 100, locked = locked + 100 WHERE user_id = $1 AND asset = 'USDT'")
+                .bind(&user).execute(&pg).await.unwrap();
+
+            order_ids.push(id);
+        }
+
+        // Verify: 5 active orders, 500 locked
+        let row = sqlx::query("SELECT COUNT(*) as cnt FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled')")
+            .bind(&user).fetch_one(&pg).await.unwrap();
+        let active: i64 = row.get("cnt");
+        assert_eq!(active, 5);
+
+        let row = sqlx::query("SELECT locked FROM balances WHERE user_id = $1 AND asset = 'USDT'")
+            .bind(&user).fetch_one(&pg).await.unwrap();
+        let locked: Decimal = row.get("locked");
+        assert_eq!(locked, dec!(500));
+
+        // Cancel all (replicate route logic)
+        let result = sqlx::query(
+            "UPDATE orders SET status = 'Cancelled', updated_at = NOW() WHERE user_id = $1 AND status IN ('New','PartiallyFilled')"
+        ).bind(&user).execute(&pg).await.unwrap();
+        assert_eq!(result.rows_affected(), 5, "all 5 orders must be cancelled");
+
+        // Release locked balances
+        sqlx::query("UPDATE balances SET available = available + locked, locked = 0 WHERE user_id = $1 AND locked > 0")
+            .bind(&user).execute(&pg).await.unwrap();
+
+        // Verify: 0 active orders
+        let row = sqlx::query("SELECT COUNT(*) as cnt FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled')")
+            .bind(&user).fetch_one(&pg).await.unwrap();
+        let active: i64 = row.get("cnt");
+        assert_eq!(active, 0, "no active orders after cancel all");
+
+        // Verify: balance fully released
+        let row = sqlx::query("SELECT available, locked FROM balances WHERE user_id = $1 AND asset = 'USDT'")
+            .bind(&user).fetch_one(&pg).await.unwrap();
+        let available: Decimal = row.get("available");
+        let locked: Decimal = row.get("locked");
+        assert_eq!(locked, dec!(0), "locked must be 0 after cancel all");
+        assert_eq!(available, dec!(10000), "available must be restored to 10000");
+
+        // Cleanup
+        sqlx::query("DELETE FROM orders WHERE user_id = $1").bind(&user).execute(&pg).await.unwrap();
+        sqlx::query("DELETE FROM balances WHERE user_id = $1").bind(&user).execute(&pg).await.unwrap();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // LIST ORDERS PAGINATION (DB logic, mirrors GET /api/orders route)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Place 10 orders, paginate: limit=3&offset=0 returns 3, total=10; offset=3 returns next 3.
+    #[tokio::test]
+    async fn test_list_orders_pagination() {
+        let pg = pg_pool().await;
+        db::run_migrations(&pg).await.unwrap();
+
+        let user = format!("pagination-{}", Uuid::new_v4().to_string().split('-').next().unwrap());
+
+        // Place 10 orders
+        let mut order_ids: Vec<Uuid> = Vec::new();
+        for _ in 0..10 {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status)
+                 VALUES ($1, $2, 'BTC-USDT', 'Buy', 'Limit', 'GTC', 50000, 1, 1, 'New')"
+            ).bind(id).bind(&user).execute(&pg).await.unwrap();
+            order_ids.push(id);
+        }
+
+        // Total count
+        let row = sqlx::query("SELECT COUNT(*) as cnt FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled')")
+            .bind(&user).fetch_one(&pg).await.unwrap();
+        let total: i64 = row.get("cnt");
+        assert_eq!(total, 10, "total must be 10");
+
+        // First page: limit=3, offset=0
+        let page1 = sqlx::query("SELECT id FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled') ORDER BY created_at DESC LIMIT $2 OFFSET $3")
+            .bind(&user).bind(3i64).bind(0i64).fetch_all(&pg).await.unwrap();
+        assert_eq!(page1.len(), 3, "first page must return 3 orders");
+
+        // Second page: limit=3, offset=3
+        let page2 = sqlx::query("SELECT id FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled') ORDER BY created_at DESC LIMIT $2 OFFSET $3")
+            .bind(&user).bind(3i64).bind(3i64).fetch_all(&pg).await.unwrap();
+        assert_eq!(page2.len(), 3, "second page must return 3 orders");
+
+        // No overlap between pages
+        let ids1: Vec<Uuid> = page1.iter().map(|r| r.get::<Uuid, _>("id")).collect();
+        let ids2: Vec<Uuid> = page2.iter().map(|r| r.get::<Uuid, _>("id")).collect();
+        assert!(
+            ids1.iter().all(|id| !ids2.contains(id)),
+            "pages must not overlap"
+        );
+
+        // Third page: limit=3, offset=6 → 4 items remaining
+        let page3 = sqlx::query("SELECT id FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled') ORDER BY created_at DESC LIMIT $2 OFFSET $3")
+            .bind(&user).bind(3i64).bind(6i64).fetch_all(&pg).await.unwrap();
+        assert_eq!(page3.len(), 3, "third page must return 3 orders");
+
+        // Fourth page: offset=9 → 1 item remaining
+        let page4 = sqlx::query("SELECT id FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled') ORDER BY created_at DESC LIMIT $2 OFFSET $3")
+            .bind(&user).bind(3i64).bind(9i64).fetch_all(&pg).await.unwrap();
+        assert_eq!(page4.len(), 1, "last page must return 1 order");
+
+        // Cleanup
+        sqlx::query("DELETE FROM orders WHERE user_id = $1").bind(&user).execute(&pg).await.unwrap();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // NEW HASH FORMAT: save and fetch round-trip
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Save an order via save_order_to_book, fetch via get_order, verify all fields.
+    #[tokio::test]
+    async fn test_save_and_fetch_order_new_hash_format() {
+        let pool = dragonfly_pool().await;
+        let pair = "LUA-HASH-FMT";
+        cleanup_pair(&pool, pair).await;
+
+        let order = Order {
+            id: Uuid::new_v4(),
+            user_id: "hash-fmt-user".to_string(),
+            pair_id: pair.to_string(),
+            side: Side::Sell,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::GTC,
+            price: Some(dec!(98765.43210000)),
+            quantity: dec!(2.50000000),
+            remaining: dec!(1.75000000),
+            status: OrderStatus::PartiallyFilled,
+            stp_mode: SelfTradePreventionMode::CancelMaker,
+            version: 3,
+            sequence: 0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            client_order_id: None,
+        };
+
+        cache::save_order_to_book(&pool, &order).await.unwrap();
+
+        let fetched = cache::get_order(&pool, &order.id).await.unwrap()
+            .expect("order must be in cache after save");
+
+        assert_eq!(fetched.id, order.id);
+        assert_eq!(fetched.user_id, order.user_id);
+        assert_eq!(fetched.pair_id, order.pair_id);
+        assert_eq!(fetched.side, order.side);
+        assert_eq!(fetched.order_type, order.order_type);
+        assert_eq!(fetched.tif, order.tif);
+        assert_eq!(fetched.price, order.price, "price must be preserved to 8 decimal places");
+        assert_eq!(fetched.quantity, order.quantity, "quantity must be preserved");
+        assert_eq!(fetched.remaining, order.remaining, "remaining must be preserved");
+        assert_eq!(fetched.status, order.status);
+        assert_eq!(fetched.stp_mode, order.stp_mode);
+        assert_eq!(fetched.version, order.version);
+
+        cleanup_order(&pool, &order.id).await;
+        cleanup_pair(&pool, pair).await;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // DEADLOCK FIX: sorted deltas in persist_trades
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Verify that applying balance deltas for 2 trades with overlapping user/asset
+    /// pairs in sorted order (the deadlock fix) completes without error or panic.
+    #[tokio::test]
+    async fn test_deadlock_fix_sorted_deltas() {
+        use std::collections::HashMap;
+
+        let pg = pg_pool().await;
+        db::run_migrations(&pg).await.unwrap();
+
+        let buyer  = format!("dl-buyer-{}", Uuid::new_v4().to_string().split('-').next().unwrap());
+        let seller = format!("dl-sell-{}", Uuid::new_v4().to_string().split('-').next().unwrap());
+
+        // Setup balances with locked amounts (simulating in-flight orders)
+        for u in [&buyer, &seller] {
+            sqlx::query("DELETE FROM balances WHERE user_id = $1").bind(u).execute(&pg).await.unwrap();
+            sqlx::query(
+                "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'BTC', 100, 5), ($1, 'USDT', 1000000, 50000)"
+            ).bind(u).execute(&pg).await.unwrap();
+        }
+
+        // Build deltas for 2 trades with the same buyer and seller (overlapping pairs):
+        // Trade 1: buyer buys 1 BTC @ 100 USDT
+        // Trade 2: buyer buys 2 BTC @ 100 USDT
+        let mut deltas: HashMap<(String, String), (Decimal, Decimal)> = HashMap::new();
+        for (qty, price) in [(dec!(1), dec!(100)), (dec!(2), dec!(100))] {
+            let cost = price * qty;
+            // buyer: locked USDT decreases, available BTC increases
+            let e = deltas.entry((buyer.clone(), "USDT".to_string())).or_insert((Decimal::ZERO, Decimal::ZERO));
+            e.0 += cost;
+            let e = deltas.entry((buyer.clone(), "BTC".to_string())).or_insert((Decimal::ZERO, Decimal::ZERO));
+            e.1 += qty;
+            // seller: locked BTC decreases, available USDT increases
+            let e = deltas.entry((seller.clone(), "BTC".to_string())).or_insert((Decimal::ZERO, Decimal::ZERO));
+            e.0 += qty;
+            let e = deltas.entry((seller.clone(), "USDT".to_string())).or_insert((Decimal::ZERO, Decimal::ZERO));
+            e.1 += cost;
+        }
+
+        // Sort by (user_id, asset) — the deadlock fix applied in persist_trades
+        let mut sorted_deltas: Vec<_> = deltas.iter().collect();
+        sorted_deltas.sort_by_key(|((uid, asset), _)| (uid.as_str(), asset.as_str()));
+
+        // Apply in a single transaction — must not deadlock or panic
+        let mut tx = pg.begin().await.expect("begin transaction");
+        for ((user_id, asset), (locked_decrease, available_increase)) in &sorted_deltas {
+            sqlx::query(
+                "INSERT INTO balances (user_id, asset, available, locked) VALUES ($3, $4, $2, 0)
+                 ON CONFLICT (user_id, asset) DO UPDATE
+                   SET locked    = GREATEST(balances.locked    - $1, 0),
+                       available = balances.available + $2",
+            )
+            .bind(locked_decrease)
+            .bind(available_increase)
+            .bind(user_id.as_str())
+            .bind(asset.as_str())
+            .execute(&mut *tx)
+            .await
+            .expect("sorted delta update must not deadlock");
+        }
+        tx.commit().await.expect("transaction must commit");
+
+        // Verify: buyer received 3 BTC (1+2) from the two trades
+        let row = sqlx::query("SELECT available FROM balances WHERE user_id = $1 AND asset = 'BTC'")
+            .bind(&buyer).fetch_one(&pg).await.unwrap();
+        let avail: Decimal = row.get("available");
+        assert_eq!(avail, dec!(103), "buyer must have 100 + 3 BTC after 2 trades");
+
+        // Cleanup
+        for u in [&buyer, &seller] {
+            sqlx::query("DELETE FROM balances WHERE user_id = $1").bind(u).execute(&pg).await.unwrap();
+        }
+    }
 }

@@ -878,3 +878,102 @@ pub async fn match_order_lua(
         trades,
     })
 }
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{decimal_to_i64, i64_to_decimal};
+    use crate::types::{Order, OrderStatus, OrderType, SelfTradePreventionMode, Side, TimeInForce};
+    use chrono::Utc;
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+    use uuid::Uuid;
+
+    fn make_order(side: Side, price: Decimal) -> Order {
+        Order {
+            id: Uuid::new_v4(),
+            user_id: "test-user".to_string(),
+            pair_id: "BTC-USDT".to_string(),
+            side,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::GTC,
+            price: Some(price),
+            quantity: dec!(1),
+            remaining: dec!(1),
+            status: OrderStatus::New,
+            stp_mode: SelfTradePreventionMode::None,
+            version: 1,
+            sequence: 0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            client_order_id: None,
+        }
+    }
+
+    #[test]
+    fn test_decimal_to_i64_roundtrip() {
+        // Verify decimal_to_i64 and i64_to_decimal are inverses for various values.
+        let cases: &[Decimal] = &[
+            dec!(0),
+            dec!(1.5),
+            dec!(0.00000001),
+            dec!(99999.99999999),
+            dec!(-1.5),
+        ];
+        for &v in cases {
+            let roundtripped = i64_to_decimal(decimal_to_i64(v));
+            assert_eq!(roundtripped, v, "roundtrip failed for {v}");
+        }
+    }
+
+    #[test]
+    fn test_decimal_to_i64_precision() {
+        // Verify 8 decimal places are preserved.
+        let v = dec!(0.12345678);
+        let i = decimal_to_i64(v);
+        assert_eq!(i, 12_345_678_i64, "0.12345678 * 10^8 should be 12345678");
+        let back = i64_to_decimal(i);
+        assert_eq!(back, v, "inverse should recover 0.12345678");
+
+        // Minimum representable value (1 satoshi)
+        let tiny = dec!(0.00000001);
+        assert_eq!(decimal_to_i64(tiny), 1_i64);
+        assert_eq!(i64_to_decimal(1_i64), tiny);
+    }
+
+    #[test]
+    fn test_book_score_consistency() {
+        // Bids: higher price → more negative score → ZRANGEBYSCORE returns highest bid first
+        let bid_high = make_order(Side::Buy, dec!(200));
+        let bid_low  = make_order(Side::Buy, dec!(100));
+        assert!(
+            bid_high.book_score() < bid_low.book_score(),
+            "higher bid price must yield a lower (more negative) score; high={} low={}",
+            bid_high.book_score(), bid_low.book_score()
+        );
+
+        // Asks: lower price → smaller positive score → ZRANGEBYSCORE returns lowest ask first
+        let ask_low  = make_order(Side::Sell, dec!(100));
+        let ask_high = make_order(Side::Sell, dec!(200));
+        assert!(
+            ask_low.book_score() < ask_high.book_score(),
+            "lower ask price must yield a smaller score; low={} high={}",
+            ask_low.book_score(), ask_high.book_score()
+        );
+
+        // Same-price bids have equal scores (Redis stable sort preserves insertion/time order)
+        let bid_a = make_order(Side::Buy, dec!(150));
+        let bid_b = make_order(Side::Buy, dec!(150));
+        assert_eq!(
+            bid_a.book_score(), bid_b.book_score(),
+            "same-price bids must have equal scores; time priority is handled by insertion order"
+        );
+
+        // Buy scores are negative, sell scores are positive
+        let bid = make_order(Side::Buy, dec!(100));
+        let ask = make_order(Side::Sell, dec!(100));
+        assert!(bid.book_score() < 0.0, "bid score must be negative");
+        assert!(ask.book_score() > 0.0, "ask score must be positive");
+    }
+}
