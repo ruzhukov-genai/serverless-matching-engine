@@ -39,10 +39,14 @@ pub struct AppState {
     pub persist_tx: mpsc::Sender<routes::PersistJob>,
     /// Shared orderbook broadcast: one poller per pair, all WS clients subscribe
     pub book_broadcasts: Arc<HashMap<String, broadcast::Sender<String>>>,
+    /// Cached orderbook snapshots — updated by broadcast pollers
+    pub book_snapshots: Arc<RwLock<HashMap<String, serde_json::Value>>>,
     /// Cached metrics — refreshed every 5s by a background task
     pub metrics_cache: Arc<RwLock<serde_json::Value>>,
     /// Cached ticker data per pair — refreshed every 2s
     pub ticker_cache: Arc<RwLock<HashMap<String, serde_json::Value>>>,
+    /// Cached recent trades per pair — refreshed every 2s
+    pub trades_cache: Arc<RwLock<HashMap<String, serde_json::Value>>>,
     /// Order events broadcast — all order state changes pushed here
     pub order_events_tx: broadcast::Sender<String>,
 }
@@ -99,6 +103,7 @@ async fn main() -> Result<()> {
 
     // Shared orderbook broadcast — one poller per pair, fan-out to all WS clients
     let mut book_broadcasts = HashMap::new();
+    let book_snapshots = Arc::new(RwLock::new(HashMap::<String, serde_json::Value>::new()));
     for pair_id in ["BTC-USDT", "ETH-USDT", "SOL-USDT"] {
         let (tx, _) = broadcast::channel::<String>(64);
         book_broadcasts.insert(pair_id.to_string(), tx.clone());
@@ -106,8 +111,9 @@ async fn main() -> Result<()> {
         // Spawn a single polling task per pair
         let df = dragonfly.clone();
         let pair = pair_id.to_string();
+        let snap_cache = book_snapshots.clone();
         tokio::spawn(async move {
-            routes::orderbook_broadcast_poller(df, pair, tx).await;
+            routes::orderbook_broadcast_poller(df, pair, tx, snap_cache).await;
         });
     }
     let book_broadcasts = Arc::new(book_broadcasts);
@@ -123,13 +129,15 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Cached ticker — refreshed every 2s by background task
+    // Cached ticker + trades — refreshed every 2s by background task
     let ticker_cache = Arc::new(RwLock::new(HashMap::<String, serde_json::Value>::new()));
+    let trades_cache = Arc::new(RwLock::new(HashMap::<String, serde_json::Value>::new()));
     {
-        let cache = ticker_cache.clone();
+        let tc = ticker_cache.clone();
+        let trc = trades_cache.clone();
         let pg = pg_hot.clone();
         tokio::spawn(async move {
-            routes::ticker_refresh_loop(pg, cache).await;
+            routes::ticker_trades_refresh_loop(pg, tc, trc).await;
         });
     }
 
@@ -138,7 +146,7 @@ async fn main() -> Result<()> {
 
     let state = AppState {
         dragonfly, pg: pg_hot, pg_bg, pairs_cache, persist_tx,
-        book_broadcasts, metrics_cache, ticker_cache, order_events_tx,
+        book_broadcasts, book_snapshots, metrics_cache, ticker_cache, trades_cache, order_events_tx,
     };
 
     let app = Router::new()

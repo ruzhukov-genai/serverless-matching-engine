@@ -145,7 +145,7 @@ async fn process_persist_job(pg: &sqlx::PgPool, job: PersistJob) -> anyhow::Resu
 
 pub async fn list_pairs(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
     let rows = sqlx::query("SELECT id, base, quote, tick_size, lot_size, min_order_size, max_order_size, price_precision, qty_precision, price_band_pct, active FROM pairs WHERE active = true")
-        .fetch_all(&s.pg)
+        .fetch_all(&s.pg_bg)
         .await?;
 
     let pairs: Vec<Value> = rows
@@ -179,16 +179,21 @@ pub async fn get_orderbook(
     Path(pair_id): Path<String>,
     State(s): State<AppState>,
 ) -> HandlerResult<impl IntoResponse> {
+    // Serve from cached snapshot (updated by broadcast poller every 500ms)
+    let cache = s.book_snapshots.read().await;
+    if let Some(snap) = cache.get(&pair_id) {
+        return Ok(Json(snap.clone()));
+    }
+    drop(cache);
+
+    // Fallback before cache is populated
     let bids_raw = cache::load_order_book_batched(&s.dragonfly, &pair_id, Side::Buy, 0, BOOK_DEPTH).await?;
     let asks_raw = cache::load_order_book_batched(&s.dragonfly, &pair_id, Side::Sell, 0, BOOK_DEPTH).await?;
 
-    let bids = aggregate_levels(bids_raw);
-    let asks = aggregate_levels(asks_raw);
-
     Ok(Json(json!({
         "pair": pair_id,
-        "bids": bids,
-        "asks": asks,
+        "bids": aggregate_levels(bids_raw),
+        "asks": aggregate_levels(asks_raw),
     })))
 }
 
@@ -210,12 +215,20 @@ pub async fn get_trades(
     Path(pair_id): Path<String>,
     State(s): State<AppState>,
 ) -> HandlerResult<impl IntoResponse> {
+    // Serve from cache (refreshed every 2s)
+    let cache = s.trades_cache.read().await;
+    if let Some(cached) = cache.get(&pair_id) {
+        return Ok(Json(cached.clone()));
+    }
+    drop(cache);
+
+    // Fallback before cache is populated
     let rows = sqlx::query(
         "SELECT id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, sequence, created_at
          FROM trades WHERE pair_id = $1 ORDER BY created_at DESC LIMIT 50",
     )
     .bind(&pair_id)
-    .fetch_all(&s.pg)
+    .fetch_all(&s.pg_bg)
     .await?;
 
     let trades: Vec<Value> = rows.iter().map(row_to_trade_json).collect();
@@ -709,13 +722,13 @@ pub async fn list_orders(
             "SELECT id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, sequence, created_at, updated_at, client_order_id,
                     COUNT(*) OVER() as total_count
              FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled') AND pair_id = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4",
-        ).bind(&user_id).bind(pair_id).bind(limit).bind(offset).fetch_all(&s.pg).await?
+        ).bind(&user_id).bind(pair_id).bind(limit).bind(offset).fetch_all(&s.pg_bg).await?
     } else {
         sqlx::query(
             "SELECT id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, sequence, created_at, updated_at, client_order_id,
                     COUNT(*) OVER() as total_count
              FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled') ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-        ).bind(&user_id).bind(limit).bind(offset).fetch_all(&s.pg).await?
+        ).bind(&user_id).bind(limit).bind(offset).fetch_all(&s.pg_bg).await?
     };
 
     let total: i64 = rows.first().map(|r| r.get("total_count")).unwrap_or(0);
@@ -763,11 +776,12 @@ pub async fn get_portfolio(
     State(s): State<AppState>,
 ) -> HandlerResult<impl IntoResponse> {
     let user_id = q.user_id.unwrap_or_else(|| "user-1".to_string());
+    // Use background pool for read-only queries — keep hot pool free for order writes
     let rows = sqlx::query(
         "SELECT user_id, asset, available, locked FROM balances WHERE user_id = $1",
     )
     .bind(&user_id)
-    .fetch_all(&s.pg)
+    .fetch_all(&s.pg_bg)
     .await?;
 
     let balances: Vec<Value> = rows
@@ -828,6 +842,7 @@ pub async fn orderbook_broadcast_poller(
     dragonfly: deadpool_redis::Pool,
     pair_id: String,
     tx: broadcast::Sender<String>,
+    snap_cache: std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, Value>>>,
 ) {
     use tokio::time::{Duration, interval};
     let mut ticker = interval(Duration::from_millis(500));
@@ -836,10 +851,7 @@ pub async fn orderbook_broadcast_poller(
     loop {
         ticker.tick().await;
 
-        // Skip if nobody is listening
-        if tx.receiver_count() == 0 {
-            continue;
-        }
+        let has_ws_subscribers = tx.receiver_count() > 0;
 
         let version = cache::get_version(&dragonfly, &pair_id)
             .await
@@ -857,17 +869,32 @@ pub async fn orderbook_broadcast_poller(
             .await
             .unwrap_or_default();
 
+        let bids_agg = aggregate_levels(bids);
+        let asks_agg = aggregate_levels(asks);
+
+        // Update REST cache
+        {
+            let mut w = snap_cache.write().await;
+            w.insert(pair_id.clone(), json!({
+                "pair": pair_id,
+                "bids": &bids_agg,
+                "asks": &asks_agg,
+            }));
+        }
+
         let msg = serde_json::to_string(&json!({
             "type": "snapshot",
             "pair": pair_id,
             "version": version,
-            "bids": aggregate_levels(bids),
-            "asks": aggregate_levels(asks),
+            "bids": bids_agg,
+            "asks": asks_agg,
         }))
         .unwrap_or_default();
 
-        // Best-effort send — if nobody is listening, drop it
-        let _ = tx.send(msg);
+        // Only send to WS if there are subscribers
+        if has_ws_subscribers {
+            let _ = tx.send(msg);
+        }
     }
 }
 
@@ -1025,27 +1052,11 @@ pub async fn get_lock_metrics(State(s): State<AppState>) -> HandlerResult<impl I
     Ok(Json(locks))
 }
 
-/// GET /api/metrics/throughput — trade counts per minute from DB (still live, cheap query).
+/// GET /api/metrics/throughput — served from in-memory cache.
 pub async fn get_throughput(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let rows = sqlx::query(
-        "SELECT date_trunc('minute', created_at) as bucket, COUNT(*) as count
-         FROM trades WHERE created_at >= NOW() - INTERVAL '1 hour'
-         GROUP BY bucket ORDER BY bucket",
-    )
-    .fetch_all(&s.pg)
-    .await?;
-
-    let series: Vec<Value> = rows
-        .iter()
-        .map(|r| {
-            json!({
-                "time": r.get::<chrono::DateTime<Utc>, _>("bucket").to_rfc3339(),
-                "count": r.get::<i64, _>("count"),
-            })
-        })
-        .collect();
-
-    Ok(Json(json!({ "series": series })))
+    let cached = s.metrics_cache.read().await;
+    let throughput = cached.get("throughput").cloned().unwrap_or(json!({"series": []}));
+    Ok(Json(throughput))
 }
 
 /// GET /api/metrics/latency — served from in-memory cache.
@@ -1631,10 +1642,11 @@ fn sort_score(order: &Order) -> f64 {
 
 // ── Background ticker refresh ────────────────────────────────────────────────
 
-/// Runs forever, refreshing ticker data for all pairs every 2 seconds.
-pub async fn ticker_refresh_loop(
+/// Runs forever, refreshing ticker + recent trades for all pairs every 2 seconds.
+pub async fn ticker_trades_refresh_loop(
     pg: sqlx::PgPool,
     cache: std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, Value>>>,
+    trades_cache: std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, Value>>>,
 ) {
     use tokio::time::{Duration, interval};
     let mut ticker = interval(Duration::from_secs(2));
@@ -1696,6 +1708,28 @@ pub async fn ticker_refresh_loop(
 
         let mut w = cache.write().await;
         *w = new_cache;
+
+        // Refresh recent trades for all pairs (single query, last hour, top 150)
+        if let Ok(rows) = sqlx::query(
+            "SELECT id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, sequence, created_at
+             FROM trades WHERE created_at >= NOW() - INTERVAL '1 hour' ORDER BY created_at DESC LIMIT 150",
+        )
+        .fetch_all(&pg)
+        .await {
+            let mut by_pair: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
+            for r in &rows {
+                let pair: String = r.get("pair_id");
+                let entry = by_pair.entry(pair).or_default();
+                if entry.len() < 50 {
+                    entry.push(row_to_trade_json(r));
+                }
+            }
+            let mut tw = trades_cache.write().await;
+            for pair_id in PAIRS {
+                let trades = by_pair.remove(*pair_id).unwrap_or_default();
+                tw.insert(pair_id.to_string(), json!({ "pair": pair_id, "trades": trades }));
+            }
+        }
     }
 }
 
@@ -1704,7 +1738,7 @@ pub async fn ticker_refresh_loop(
 /// Runs forever, refreshing metrics cache every 5 seconds.
 pub async fn metrics_refresh_loop(
     dragonfly: deadpool_redis::Pool,
-    _pg: sqlx::PgPool,
+    pg: sqlx::PgPool,
     cache: std::sync::Arc<tokio::sync::RwLock<Value>>,
 ) {
     use tokio::time::{Duration, interval};
@@ -1778,12 +1812,33 @@ pub async fn metrics_refresh_loop(
             "per_pair": per_pair,
         });
 
+        // ── /api/metrics/throughput ──
+        let throughput_val = match sqlx::query(
+            "SELECT date_trunc('minute', created_at) as bucket, COUNT(*) as count
+             FROM trades WHERE created_at >= NOW() - INTERVAL '1 hour'
+             GROUP BY bucket ORDER BY bucket",
+        )
+        .fetch_all(&pg)
+        .await {
+            Ok(rows) => {
+                let series: Vec<Value> = rows.iter().map(|r| {
+                    json!({
+                        "time": r.get::<chrono::DateTime<chrono::Utc>, _>("bucket").to_rfc3339(),
+                        "count": r.get::<i64, _>("count"),
+                    })
+                }).collect();
+                json!({ "series": series })
+            }
+            Err(_) => json!({ "series": [] }),
+        };
+
         // Write all at once
         let mut w = cache.write().await;
         *w = json!({
             "metrics": metrics_val,
             "locks": locks_val,
             "latency": latency_val,
+            "throughput": throughput_val,
         });
     }
 }
