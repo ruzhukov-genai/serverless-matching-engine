@@ -126,12 +126,12 @@ impl Stats {
 
 // ── Order Generators ──────────────────────────────────────────────────────────
 
-/// Non-crossing limit orders: alternate buy@49000 and sell@51000 (no match)
+/// Non-crossing limit orders: alternate buy@70500 and sell@71000 (no match)
 fn resting_order(pair: &str, seq: u64) -> Value {
     let (side, price) = if seq.is_multiple_of(2) {
-        ("Buy", "49000")
+        ("Buy", "70500")
     } else {
-        ("Sell", "51000")
+        ("Sell", "71000")
     };
     let user = if seq.is_multiple_of(2) { "user-1" } else { "user-2" };
     json!({
@@ -148,9 +148,9 @@ fn resting_order(pair: &str, seq: u64) -> Value {
 /// Crossing orders: even = GTC sell that rests, odd = GTC buy that matches
 fn crossing_order(pair: &str, seq: u64) -> Value {
     let (side, price, user) = if seq.is_multiple_of(2) {
-        ("Sell", "50000", "user-2")
+        ("Sell", "70735", "user-2")
     } else {
-        ("Buy", "50000", "user-1")
+        ("Buy", "70735", "user-1")
     };
     json!({
         "user_id": user,

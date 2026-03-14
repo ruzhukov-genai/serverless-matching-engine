@@ -175,7 +175,7 @@ async def place_orders(session: aiohttp.ClientSession, stats: ClientStats, clien
         side = "Buy" if seq % 2 == 0 else "Sell"
         user = f"user-{(client_id % 5) + 1}"
         # Non-crossing IOC orders (no match, pure throughput)
-        price = "49000.00" if side == "Buy" else "51000.00"
+        price = "70500.00" if side == "Buy" else "71000.00"
         body = {
             "user_id": user,
             "pair_id": PAIR,
