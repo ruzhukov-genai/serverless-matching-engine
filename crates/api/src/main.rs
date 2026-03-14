@@ -5,6 +5,7 @@ use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
@@ -26,7 +27,12 @@ pub struct PairConfig {
 #[derive(Clone)]
 pub struct AppState {
     pub dragonfly: RedisPool,
+    /// Hot path pool — used by create_order, list_orders, cancel_order, get_portfolio, etc.
+    /// Fast, low contention, max 30 connections.
     pub pg: PgPool,
+    /// Background persist pool — used exclusively by the async persist worker.
+    /// Tolerates higher latency, max 20 connections.
+    pub pg_bg: PgPool,
     /// In-memory pairs cache: pair_id → PairConfig
     pub pairs_cache: Arc<HashMap<String, PairConfig>>,
     /// Channel to the background persistence worker
@@ -44,25 +50,46 @@ async fn main() -> Result<()> {
 
     let config = sme_shared::Config::from_env();
     let dragonfly = sme_shared::cache::create_pool(&config.dragonfly_url).await?;
-    let pg = sme_shared::db::create_pool(&config.database_url).await?;
+
+    // Hot path pool: low latency, fast order inserts + balance locks.
+    let pg_hot = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(30)
+        .min_connections(3)
+        .acquire_timeout(Duration::from_secs(5))
+        .idle_timeout(Duration::from_secs(120))
+        .max_lifetime(Duration::from_secs(1800))
+        .connect(&config.database_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect pg_hot: {}", e))?;
+
+    // Background persist pool: dedicated to async trade/balance settlement writes.
+    let pg_bg = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(20)
+        .min_connections(2)
+        .acquire_timeout(Duration::from_secs(10))
+        .idle_timeout(Duration::from_secs(120))
+        .max_lifetime(Duration::from_secs(1800))
+        .connect(&config.database_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect pg_bg: {}", e))?;
 
     tracing::info!("running migrations");
-    sme_shared::db::run_migrations(&pg).await?;
+    sme_shared::db::run_migrations(&pg_hot).await?;
 
     // Run seed SQL directly
     tracing::info!("seeding initial data");
-    run_seed(&pg).await?;
+    run_seed(&pg_hot).await?;
 
     // Load pairs into memory cache — eliminates SELECT on every order validation
     tracing::info!("loading pairs cache");
-    let pairs_cache = Arc::new(load_pairs_cache(&pg).await?);
+    let pairs_cache = Arc::new(load_pairs_cache(&pg_hot).await?);
     tracing::info!(count = pairs_cache.len(), "pairs cache loaded");
 
-    // Spawn background persistence worker
+    // Spawn background persistence worker — uses dedicated pg_bg pool
     let (persist_tx, persist_rx) = mpsc::channel::<routes::PersistJob>(1000);
-    routes::spawn_persist_worker(pg.clone(), persist_rx);
+    routes::spawn_persist_worker(pg_bg.clone(), persist_rx);
 
-    let state = AppState { dragonfly, pg, pairs_cache, persist_tx };
+    let state = AppState { dragonfly, pg: pg_hot, pg_bg, pairs_cache, persist_tx };
 
     let app = Router::new()
         // Trading API

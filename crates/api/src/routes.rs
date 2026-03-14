@@ -636,7 +636,7 @@ pub async fn create_order(
             // Channel full or closed — bypass channel and spawn directly
             tracing::warn!("persist channel full, spawning direct persist task");
             let job = e.into_inner();
-            let pg = s.pg.clone();
+            let pg = s.pg_bg.clone();
             tokio::spawn(async move {
                 if let Err(err) = process_persist_job(&pg, job).await {
                     tracing::error!(error = %err, "direct persist task failed");
