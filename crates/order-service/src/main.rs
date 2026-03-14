@@ -119,10 +119,11 @@ async fn validate_order(pg: &sqlx::PgPool, order: &Order) -> Result<()> {
     }
 
     // Tick alignment for limit orders
-    if let Some(price) = order.price {
-        if tick_size > Decimal::ZERO && price % tick_size != Decimal::ZERO {
-            anyhow::bail!("price not aligned to tick_size {tick_size}");
-        }
+    if let Some(price) = order.price
+        && tick_size > Decimal::ZERO
+        && price % tick_size != Decimal::ZERO
+    {
+        anyhow::bail!("price not aligned to tick_size {tick_size}");
     }
 
     Ok(())

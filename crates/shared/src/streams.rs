@@ -107,7 +107,7 @@ fn parse_stream_reply(reply: redis::Value) -> Result<Vec<StreamMessage>> {
     // XREADGROUP returns: [[stream_name, [[id, [field, value, ...]], ...]]]
     // or Nil if no messages
     match reply {
-        Value::Nil => return Ok(vec![]),
+        Value::Nil => Ok(vec![]),
         Value::Array(streams) => {
             let mut out = Vec::new();
             for stream_entry in streams {

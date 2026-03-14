@@ -20,7 +20,6 @@
 //!   all        — run all scenarios sequentially
 
 use anyhow::Result;
-use rand::Rng;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,7 +44,7 @@ impl Config {
             args.iter()
                 .position(|a| a == flag)
                 .and_then(|i| args.get(i + 1))
-                .map(|s| s.clone())
+                .cloned()
                 .unwrap_or_else(|| default.to_string())
         };
 
@@ -129,12 +128,12 @@ impl Stats {
 
 /// Non-crossing limit orders: alternate buy@49000 and sell@51000 (no match)
 fn resting_order(pair: &str, seq: u64) -> Value {
-    let (side, price) = if seq % 2 == 0 {
+    let (side, price) = if seq.is_multiple_of(2) {
         ("Buy", "49000")
     } else {
         ("Sell", "51000")
     };
-    let user = if seq % 2 == 0 { "user-1" } else { "user-2" };
+    let user = if seq.is_multiple_of(2) { "user-1" } else { "user-2" };
     json!({
         "user_id": user,
         "pair_id": pair,
@@ -148,7 +147,7 @@ fn resting_order(pair: &str, seq: u64) -> Value {
 
 /// Crossing orders: even = GTC sell that rests, odd = GTC buy that matches
 fn crossing_order(pair: &str, seq: u64) -> Value {
-    let (side, price, user) = if seq % 2 == 0 {
+    let (side, price, user) = if seq.is_multiple_of(2) {
         ("Sell", "50000", "user-2")
     } else {
         ("Buy", "50000", "user-1")

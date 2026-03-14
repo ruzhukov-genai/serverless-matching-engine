@@ -33,7 +33,7 @@ pub struct MatchResult {
 ///
 /// Returns a `MatchResult` describing the outcome.  The `book` slice is NOT
 /// mutated — all changes are reported through `book_updates` and `trades`.
-pub fn match_order(incoming: &Order, book: &mut Vec<Order>) -> MatchResult {
+pub fn match_order(incoming: &Order, book: &mut [Order]) -> MatchResult {
     let mut incoming = incoming.clone();
     let mut trades: Vec<Trade> = Vec::new();
     let mut book_updates: Vec<Order> = Vec::new();

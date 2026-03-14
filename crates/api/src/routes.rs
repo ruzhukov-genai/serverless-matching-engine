@@ -1084,10 +1084,11 @@ fn validate_order_request(
     if order.quantity < cfg.min_order_size || order.quantity > cfg.max_order_size {
         anyhow::bail!("quantity out of range [{}, {}]", cfg.min_order_size, cfg.max_order_size);
     }
-    if let Some(price) = order.price {
-        if cfg.tick_size > Decimal::ZERO && price % cfg.tick_size != Decimal::ZERO {
-            anyhow::bail!("price not aligned to tick_size");
-        }
+    if let Some(price) = order.price
+        && cfg.tick_size > Decimal::ZERO
+        && price % cfg.tick_size != Decimal::ZERO
+    {
+        anyhow::bail!("price not aligned to tick_size");
     }
     Ok(())
 }
@@ -1537,6 +1538,7 @@ async fn update_resting_orders_after_lua(
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn insert_trade_db(pg: &sqlx::PgPool, trade: &Trade) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO trades (id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, created_at)
@@ -1556,6 +1558,7 @@ async fn insert_trade_db(pg: &sqlx::PgPool, trade: &Trade) -> anyhow::Result<()>
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn settle_trade_balances(pg: &sqlx::PgPool, trade: &Trade) -> anyhow::Result<()> {
     let (base, quote) = sme_shared::parse_pair_id(&trade.pair_id)?;
     let cost = trade.price * trade.quantity;
