@@ -3,7 +3,11 @@
 //! Keys:
 //!   book:{pair_id}:bids  → ZSet (score = -price, so ZRANGEBYSCORE -inf +inf = highest bid first)
 //!   book:{pair_id}:asks  → ZSet (score = +price, so ZRANGEBYSCORE -inf +inf = lowest ask first)
-//!   order:{order_id}     → Hash (field "data" = JSON-serialized Order)
+//!   order:{order_id}     → Hash (field "data" = MessagePack-serialized Order)
+//!
+//! MessagePack is ~30-40% smaller and ~2x faster to (de)serialize vs JSON.
+
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use deadpool_redis::{Config as DPConfig, Pool, Runtime};
@@ -15,9 +19,13 @@ use crate::types::{Order, Side};
 // ── Pool ─────────────────────────────────────────────────────────────────────
 
 pub async fn create_pool(url: &str) -> Result<Pool> {
-    let cfg = DPConfig::from_url(url);
-    let pool = cfg
-        .create_pool(Some(Runtime::Tokio1))
+    let pool = DPConfig::from_url(url)
+        .builder()
+        .context("failed to create redis pool builder")?
+        .max_size(50)
+        .wait_timeout(Some(Duration::from_secs(3)))
+        .runtime(Runtime::Tokio1)
+        .build()
         .context("failed to create deadpool-redis pool")?;
     Ok(pool)
 }
@@ -64,18 +72,18 @@ async fn fetch_orders_by_ids(pool: &Pool, ids: &[String]) -> Result<Vec<Order>> 
         pipeline.hget(&okey, "data");
     }
     
-    // Execute pipeline and get all results at once
-    let data_list: Vec<Option<String>> = pipeline
+    // Execute pipeline and get all results at once (binary MessagePack data)
+    let data_list: Vec<Option<Vec<u8>>> = pipeline
         .query_async(&mut *conn)
         .await
         .context("pipeline HGET")?;
     
     let mut orders = Vec::with_capacity(ids.len());
     for (id, data) in ids.iter().zip(data_list.iter()) {
-        if let Some(json) = data {
-            match serde_json::from_str::<Order>(json) {
+        if let Some(bytes) = data {
+            match rmp_serde::from_slice::<Order>(bytes) {
                 Ok(order) => orders.push(order),
-                Err(e) => tracing::warn!("bad order json for {id}: {e}"),
+                Err(e) => tracing::warn!("bad order msgpack for {id}: {e}"),
             }
         }
     }
@@ -115,7 +123,7 @@ pub async fn save_order_to_book(pool: &Pool, order: &Order) -> Result<()> {
     let score = order.book_score();
     let zkey = book_key(&order.pair_id, order.side);
     let okey = order_key(&order.id);
-    let json = serde_json::to_string(order).context("serialize order")?;
+    let bytes = rmp_serde::to_vec_named(order).context("serialize order to msgpack")?;
 
     // ZADD + HSET in pipeline
     let () = redis::pipe()
@@ -126,7 +134,7 @@ pub async fn save_order_to_book(pool: &Pool, order: &Order) -> Result<()> {
         .cmd("HSET")
         .arg(&okey)
         .arg("data")
-        .arg(&json)
+        .arg(&bytes)
         .query_async(&mut *conn)
         .await
         .context("ZADD + HSET")?;
@@ -156,9 +164,9 @@ pub async fn remove_order_from_book(pool: &Pool, order: &Order) -> Result<()> {
 pub async fn get_order(pool: &Pool, order_id: &Uuid) -> Result<Option<Order>> {
     let mut conn = pool.get().await.context("pool.get")?;
     let okey = order_key(order_id);
-    let data: Option<String> = conn.hget(&okey, "data").await.context("HGET")?;
+    let data: Option<Vec<u8>> = conn.hget(&okey, "data").await.context("HGET")?;
     Ok(match data {
-        Some(json) => Some(serde_json::from_str(&json).context("deserialize order")?),
+        Some(bytes) => Some(rmp_serde::from_slice(&bytes).context("deserialize order msgpack")?),
         None => None,
     })
 }
