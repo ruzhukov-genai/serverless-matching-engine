@@ -6,6 +6,7 @@ members = [
     "crates/order-service",
     "crates/transaction-service",
     "crates/api",
+    "tools/loadtest",
 ]
 
 [workspace.package]
