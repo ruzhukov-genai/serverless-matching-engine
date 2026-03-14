@@ -6,7 +6,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
@@ -37,6 +37,10 @@ pub struct AppState {
     pub pairs_cache: Arc<HashMap<String, PairConfig>>,
     /// Channel to the background persistence worker
     pub persist_tx: mpsc::Sender<routes::PersistJob>,
+    /// Shared orderbook broadcast: one poller per pair, all WS clients subscribe
+    pub book_broadcasts: Arc<HashMap<String, broadcast::Sender<String>>>,
+    /// Cached metrics — refreshed every 5s by a background task
+    pub metrics_cache: Arc<RwLock<serde_json::Value>>,
 }
 
 #[tokio::main]
@@ -89,7 +93,36 @@ async fn main() -> Result<()> {
     let (persist_tx, persist_rx) = mpsc::channel::<routes::PersistJob>(1000);
     routes::spawn_persist_worker(pg_bg.clone(), persist_rx);
 
-    let state = AppState { dragonfly, pg: pg_hot, pg_bg, pairs_cache, persist_tx };
+    // Shared orderbook broadcast — one poller per pair, fan-out to all WS clients
+    let mut book_broadcasts = HashMap::new();
+    for pair_id in ["BTC-USDT", "ETH-USDT", "SOL-USDT"] {
+        let (tx, _) = broadcast::channel::<String>(64);
+        book_broadcasts.insert(pair_id.to_string(), tx.clone());
+
+        // Spawn a single polling task per pair
+        let df = dragonfly.clone();
+        let pair = pair_id.to_string();
+        tokio::spawn(async move {
+            routes::orderbook_broadcast_poller(df, pair, tx).await;
+        });
+    }
+    let book_broadcasts = Arc::new(book_broadcasts);
+
+    // Cached metrics — refreshed every 5s by background task
+    let metrics_cache = Arc::new(RwLock::new(serde_json::json!({})));
+    {
+        let cache = metrics_cache.clone();
+        let df = dragonfly.clone();
+        let pg = pg_hot.clone();
+        tokio::spawn(async move {
+            routes::metrics_refresh_loop(df, pg, cache).await;
+        });
+    }
+
+    let state = AppState {
+        dragonfly, pg: pg_hot, pg_bg, pairs_cache, persist_tx,
+        book_broadcasts, metrics_cache,
+    };
 
     let app = Router::new()
         // Trading API

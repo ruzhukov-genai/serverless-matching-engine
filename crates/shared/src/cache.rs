@@ -57,7 +57,7 @@ pub async fn create_pool(url: &str) -> Result<Pool> {
     let pool = DPConfig::from_url(url)
         .builder()
         .context("failed to create redis pool builder")?
-        .max_size(50)
+        .max_size(200)
         .wait_timeout(Some(Duration::from_secs(3)))
         .runtime(Runtime::Tokio1)
         .build()

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use axum::{
     extract::{Path, Query, State, WebSocketUpgrade, ws::Message, ws::WebSocket},
@@ -172,12 +172,15 @@ pub async fn list_pairs(State(s): State<AppState>) -> HandlerResult<impl IntoRes
 
 // ── GET /api/orderbook/{pair_id} ──────────────────────────────────────────────
 
+/// Max price levels returned by the REST orderbook endpoint and WS broadcast.
+const BOOK_DEPTH: isize = 200;
+
 pub async fn get_orderbook(
     Path(pair_id): Path<String>,
     State(s): State<AppState>,
 ) -> HandlerResult<impl IntoResponse> {
-    let bids_raw = cache::load_order_book(&s.dragonfly, &pair_id, Side::Buy).await?;
-    let asks_raw = cache::load_order_book(&s.dragonfly, &pair_id, Side::Sell).await?;
+    let bids_raw = cache::load_order_book_batched(&s.dragonfly, &pair_id, Side::Buy, 0, BOOK_DEPTH).await?;
+    let asks_raw = cache::load_order_book_batched(&s.dragonfly, &pair_id, Side::Sell, 0, BOOK_DEPTH).await?;
 
     let bids = aggregate_levels(bids_raw);
     let asks = aggregate_levels(asks_raw);
@@ -810,6 +813,39 @@ pub async fn ws_orderbook(
 }
 
 async fn handle_orderbook_ws(pair_id: String, state: AppState, mut socket: WebSocket) {
+    // Subscribe to the shared broadcast for this pair
+    let mut rx = match state.book_broadcasts.get(&pair_id) {
+        Some(tx) => tx.subscribe(),
+        None => {
+            let _ = socket
+                .send(Message::Text(json!({"error": "unknown pair"}).to_string().into()))
+                .await;
+            return;
+        }
+    };
+
+    loop {
+        match rx.recv().await {
+            Ok(msg) => {
+                if socket.send(Message::Text(msg.into())).await.is_err() {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::debug!(pair = %pair_id, lagged = n, "ws client lagged, skipping");
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+/// Single polling task per pair — loads the book once, broadcasts to all subscribers.
+pub async fn orderbook_broadcast_poller(
+    dragonfly: deadpool_redis::Pool,
+    pair_id: String,
+    tx: broadcast::Sender<String>,
+) {
     use tokio::time::{Duration, interval};
     let mut ticker = interval(Duration::from_millis(500));
     let mut last_version: i64 = -1;
@@ -817,7 +853,12 @@ async fn handle_orderbook_ws(pair_id: String, state: AppState, mut socket: WebSo
     loop {
         ticker.tick().await;
 
-        let version = cache::get_version(&state.dragonfly, &pair_id)
+        // Skip if nobody is listening
+        if tx.receiver_count() == 0 {
+            continue;
+        }
+
+        let version = cache::get_version(&dragonfly, &pair_id)
             .await
             .unwrap_or(0);
 
@@ -826,10 +867,10 @@ async fn handle_orderbook_ws(pair_id: String, state: AppState, mut socket: WebSo
         }
         last_version = version;
 
-        let bids = cache::load_order_book(&state.dragonfly, &pair_id, Side::Buy)
+        let bids = cache::load_order_book_batched(&dragonfly, &pair_id, Side::Buy, 0, BOOK_DEPTH)
             .await
             .unwrap_or_default();
-        let asks = cache::load_order_book(&state.dragonfly, &pair_id, Side::Sell)
+        let asks = cache::load_order_book_batched(&dragonfly, &pair_id, Side::Sell, 0, BOOK_DEPTH)
             .await
             .unwrap_or_default();
 
@@ -842,9 +883,8 @@ async fn handle_orderbook_ws(pair_id: String, state: AppState, mut socket: WebSo
         }))
         .unwrap_or_default();
 
-        if socket.send(Message::Text(msg.into())).await.is_err() {
-            break;
-        }
+        // Best-effort send — if nobody is listening, drop it
+        let _ = tx.send(msg);
     }
 }
 
@@ -906,68 +946,23 @@ async fn handle_trades_ws(pair_id: String, state: AppState, mut socket: WebSocke
     }
 }
 
-// ── Dashboard API ─────────────────────────────────────────────────────────────
+// ── Dashboard API (cached — refreshed every 5s) ──────────────────────────────
 
-/// GET /api/metrics — aggregate order/trade counts from Dragonfly metrics keys.
+/// GET /api/metrics — served from in-memory cache.
 pub async fn get_metrics(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let mut total_orders: i64 = 0;
-    let mut total_trades: i64 = 0;
-
-    for pair_id in PAIRS {
-        total_orders += metrics::get_order_count(&s.dragonfly, pair_id).await.unwrap_or(0);
-        total_trades += metrics::get_trade_count(&s.dragonfly, pair_id).await.unwrap_or(0);
-    }
-
-    // Also collect latency P50 across all pairs for the KPI "latency" field
-    let mut all_latency: Vec<u64> = Vec::new();
-    for pair_id in PAIRS {
-        let samples = metrics::get_latency_samples(&s.dragonfly, pair_id, 100).await.unwrap_or_default();
-        all_latency.extend(samples);
-    }
-    let (p50, p95, p99) = metrics::compute_percentiles(all_latency);
-
-    Ok(Json(json!({
-        "orders_per_sec": total_orders,
-        "matches_per_sec": total_trades,
-        "trades_per_sec": total_trades,
-        "active_pairs": 3,
-        "active_workers": 1,
-        "latency": {
-            "p50": p50,
-            "p95": p95,
-            "p99": p99,
-        },
-        "streams": {},
-    })))
+    let cached = s.metrics_cache.read().await;
+    let metrics = cached.get("metrics").cloned().unwrap_or(json!({}));
+    Ok(Json(metrics))
 }
 
-/// GET /api/metrics/locks — read from Dragonfly lock_wait lists.
+/// GET /api/metrics/locks — served from in-memory cache.
 pub async fn get_lock_metrics(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let mut all_waits: Vec<u64> = Vec::new();
-    for pair_id in PAIRS {
-        let samples = metrics::get_lock_wait_samples(&s.dragonfly, pair_id, 1000).await.unwrap_or_default();
-        all_waits.extend(samples);
-    }
-
-    let (avg_wait_ms, contention_rate) = if all_waits.is_empty() {
-        (0.0f64, 0.0f64)
-    } else {
-        let avg = all_waits.iter().sum::<u64>() as f64 / all_waits.len() as f64;
-        // contention = fraction of waits > 1ms
-        let contended = all_waits.iter().filter(|&&v| v > 1).count();
-        let rate = contended as f64 / all_waits.len() as f64;
-        (avg, rate)
-    };
-
-    Ok(Json(json!({
-        "contention_rate": contention_rate,
-        "avg_wait_ms": avg_wait_ms,
-        "retry_count": all_waits.len(),
-        "failures": 0,
-    })))
+    let cached = s.metrics_cache.read().await;
+    let locks = cached.get("locks").cloned().unwrap_or(json!({}));
+    Ok(Json(locks))
 }
 
-/// GET /api/metrics/throughput — trade counts per minute from DB.
+/// GET /api/metrics/throughput — trade counts per minute from DB (still live, cheap query).
 pub async fn get_throughput(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
     let rows = sqlx::query(
         "SELECT date_trunc('minute', created_at) as bucket, COUNT(*) as count
@@ -990,33 +985,11 @@ pub async fn get_throughput(State(s): State<AppState>) -> HandlerResult<impl Int
     Ok(Json(json!({ "series": series })))
 }
 
-/// GET /api/metrics/latency — P50/P95/P99 from Dragonfly latency samples.
+/// GET /api/metrics/latency — served from in-memory cache.
 pub async fn get_latency_percentiles(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let mut all_samples: Vec<u64> = Vec::new();
-    let mut per_pair: Vec<Value> = Vec::new();
-
-    for pair_id in PAIRS {
-        let samples = metrics::get_latency_samples(&s.dragonfly, pair_id, 1000).await.unwrap_or_default();
-        let (p50, p95, p99) = metrics::compute_percentiles(samples.clone());
-        per_pair.push(json!({
-            "pair_id": pair_id,
-            "sample_count": samples.len(),
-            "p50": p50,
-            "p95": p95,
-            "p99": p99,
-        }));
-        all_samples.extend(samples);
-    }
-
-    let (p50, p95, p99) = metrics::compute_percentiles(all_samples.clone());
-
-    Ok(Json(json!({
-        "sample_count": all_samples.len(),
-        "p50": p50,
-        "p95": p95,
-        "p99": p99,
-        "per_pair": per_pair,
-    })))
+    let cached = s.metrics_cache.read().await;
+    let latency = cached.get("latency").cloned().unwrap_or(json!({}));
+    Ok(Json(latency))
 }
 
 /// GET /api/audit — last 50 audit events from DB.
@@ -1591,4 +1564,93 @@ async fn settle_trade_balances(pg: &sqlx::PgPool, trade: &Trade) -> anyhow::Resu
 
 fn sort_score(order: &Order) -> f64 {
     order.book_score()
+}
+
+// ── Background metrics refresh ───────────────────────────────────────────────
+
+/// Runs forever, refreshing metrics cache every 5 seconds.
+pub async fn metrics_refresh_loop(
+    dragonfly: deadpool_redis::Pool,
+    _pg: sqlx::PgPool,
+    cache: std::sync::Arc<tokio::sync::RwLock<Value>>,
+) {
+    use tokio::time::{Duration, interval};
+    let mut ticker = interval(Duration::from_secs(5));
+
+    loop {
+        ticker.tick().await;
+
+        // ── /api/metrics ──
+        let mut total_orders: i64 = 0;
+        let mut total_trades: i64 = 0;
+        for pair_id in PAIRS {
+            total_orders += metrics::get_order_count(&dragonfly, pair_id).await.unwrap_or(0);
+            total_trades += metrics::get_trade_count(&dragonfly, pair_id).await.unwrap_or(0);
+        }
+        let mut all_latency: Vec<u64> = Vec::new();
+        for pair_id in PAIRS {
+            let samples = metrics::get_latency_samples(&dragonfly, pair_id, 100).await.unwrap_or_default();
+            all_latency.extend(samples);
+        }
+        let (p50, p95, p99) = metrics::compute_percentiles(all_latency);
+
+        let metrics_val = json!({
+            "orders_per_sec": total_orders,
+            "matches_per_sec": total_trades,
+            "trades_per_sec": total_trades,
+            "active_pairs": 3,
+            "active_workers": 1,
+            "latency": { "p50": p50, "p95": p95, "p99": p99 },
+            "streams": {},
+        });
+
+        // ── /api/metrics/locks ──
+        let mut all_waits: Vec<u64> = Vec::new();
+        for pair_id in PAIRS {
+            let samples = metrics::get_lock_wait_samples(&dragonfly, pair_id, 1000).await.unwrap_or_default();
+            all_waits.extend(samples);
+        }
+        let (avg_wait_ms, contention_rate) = if all_waits.is_empty() {
+            (0.0f64, 0.0f64)
+        } else {
+            let avg = all_waits.iter().sum::<u64>() as f64 / all_waits.len() as f64;
+            let contended = all_waits.iter().filter(|&&v| v > 1).count();
+            let rate = contended as f64 / all_waits.len() as f64;
+            (avg, rate)
+        };
+        let locks_val = json!({
+            "contention_rate": contention_rate,
+            "avg_wait_ms": avg_wait_ms,
+            "retry_count": all_waits.len(),
+            "failures": 0,
+        });
+
+        // ── /api/metrics/latency (detailed) ──
+        let mut all_samples: Vec<u64> = Vec::new();
+        let mut per_pair: Vec<Value> = Vec::new();
+        for pair_id in PAIRS {
+            let samples = metrics::get_latency_samples(&dragonfly, pair_id, 1000).await.unwrap_or_default();
+            let (pp50, pp95, pp99) = metrics::compute_percentiles(samples.clone());
+            per_pair.push(json!({
+                "pair_id": pair_id,
+                "sample_count": samples.len(),
+                "p50": pp50, "p95": pp95, "p99": pp99,
+            }));
+            all_samples.extend(samples);
+        }
+        let (lp50, lp95, lp99) = metrics::compute_percentiles(all_samples.clone());
+        let latency_val = json!({
+            "sample_count": all_samples.len(),
+            "p50": lp50, "p95": lp95, "p99": lp99,
+            "per_pair": per_pair,
+        });
+
+        // Write all at once
+        let mut w = cache.write().await;
+        *w = json!({
+            "metrics": metrics_val,
+            "locks": locks_val,
+            "latency": latency_val,
+        });
+    }
 }
