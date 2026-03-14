@@ -76,6 +76,9 @@ pub async fn run_migrations(pool: &PgPool) -> Result<()> {
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )",
         "CREATE INDEX IF NOT EXISTS idx_audit_pair ON audit_log(pair_id, created_at DESC)",
+        // Migration 003: Idempotency
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS client_order_id VARCHAR(64)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_idempotency ON orders(user_id, client_order_id) WHERE client_order_id IS NOT NULL",
     ];
 
     for stmt in statements {

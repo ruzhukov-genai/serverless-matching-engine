@@ -210,6 +210,10 @@ pub struct CreateOrderRequest {
     pub price: Option<Decimal>,
     pub quantity: Decimal,
     pub stp_mode: Option<SelfTradePreventionMode>,
+    /// Client-provided idempotency key. If set, duplicate submissions
+    /// with the same (user_id, client_order_id) return the existing order
+    /// instead of creating a new one (exactly-once semantics).
+    pub client_order_id: Option<String>,
 }
 
 pub async fn create_order(
@@ -221,6 +225,73 @@ pub async fn create_order(
     let user_id = req.user_id.unwrap_or_else(|| "user-1".to_string());
     let tif = req.tif.unwrap_or(TimeInForce::GTC);
     let stp_mode = req.stp_mode.unwrap_or(SelfTradePreventionMode::None);
+
+    // ── IDEMPOTENCY CHECK ─────────────────────────────────────────────────
+    // If client_order_id is provided, check for existing order with same
+    // (user_id, client_order_id). Return cached result on duplicate.
+    if let Some(ref coid) = req.client_order_id {
+        let existing = sqlx::query(
+            "SELECT id, status, remaining, price, quantity, side, order_type, pair_id
+             FROM orders WHERE user_id = $1 AND client_order_id = $2"
+        )
+        .bind(&user_id)
+        .bind(coid)
+        .fetch_optional(&s.pg)
+        .await?;
+
+        if let Some(row) = existing {
+            let order_id: Uuid = row.get("id");
+            // Load trades for this order
+            let trade_rows = sqlx::query(
+                "SELECT id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, created_at
+                 FROM trades WHERE buy_order_id = $1 OR sell_order_id = $1"
+            )
+            .bind(order_id)
+            .fetch_all(&s.pg)
+            .await?;
+
+            let trade_jsons: Vec<Value> = trade_rows.iter().map(|r| {
+                json!({
+                    "id": r.get::<Uuid, _>("id").to_string(),
+                    "pair_id": r.get::<String, _>("pair_id"),
+                    "buy_order_id": r.get::<Uuid, _>("buy_order_id").to_string(),
+                    "sell_order_id": r.get::<Uuid, _>("sell_order_id").to_string(),
+                    "buyer_id": r.get::<String, _>("buyer_id"),
+                    "seller_id": r.get::<String, _>("seller_id"),
+                    "price": r.get::<Decimal, _>("price").to_string(),
+                    "quantity": r.get::<Decimal, _>("quantity").to_string(),
+                })
+            }).collect();
+
+            let order_json = json!({
+                "id": order_id.to_string(),
+                "status": row.get::<String, _>("status"),
+                "remaining": row.get::<Decimal, _>("remaining").to_string(),
+                "price": row.get::<Option<Decimal>, _>("price").map(|v| v.to_string()),
+                "quantity": row.get::<Decimal, _>("quantity").to_string(),
+                "side": row.get::<String, _>("side"),
+                "order_type": row.get::<String, _>("order_type"),
+                "pair_id": row.get::<String, _>("pair_id"),
+                "client_order_id": coid,
+                "idempotent_replay": true,
+            });
+
+            tracing::info!(
+                client_order_id = %coid,
+                order_id = %order_id,
+                "idempotent replay — returning cached result"
+            );
+
+            return Ok((
+                StatusCode::OK, // 200, not 201 — this is a replay
+                Json(json!({
+                    "order": order_json,
+                    "trades": trade_jsons,
+                    "idempotent_replay": true,
+                })),
+            ));
+        }
+    }
 
     let now = Utc::now();
     let mut order = Order {
@@ -239,13 +310,14 @@ pub async fn create_order(
         sequence: 0,
         created_at: now,
         updated_at: now,
+        client_order_id: req.client_order_id.clone(),
     };
 
     // 1. Validate (outside lock)
     validate_order_request(&s.pg, &order).await
         .map_err(AppError::bad_request)?;
 
-    // 2. Insert to DB (outside lock)
+    // 2. Insert to DB (outside lock — unique constraint enforces idempotency)
     insert_order_db(&s.pg, &order).await?;
 
     // 3. Lock balance in DB (outside lock)
@@ -876,8 +948,8 @@ async fn validate_order_request(pg: &sqlx::PgPool, order: &Order) -> anyhow::Res
 
 async fn insert_order_db(pg: &sqlx::PgPool, order: &Order) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+        "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, created_at, updated_at, client_order_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
          ON CONFLICT DO NOTHING",
     )
     .bind(order.id)
@@ -894,6 +966,7 @@ async fn insert_order_db(pg: &sqlx::PgPool, order: &Order) -> anyhow::Result<()>
     .bind(order.version)
     .bind(order.created_at)
     .bind(order.updated_at)
+    .bind(&order.client_order_id)
     .execute(pg)
     .await?;
     Ok(())
@@ -978,6 +1051,7 @@ fn row_to_order(r: &sqlx::postgres::PgRow) -> Order {
         sequence: 0,
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
+        client_order_id: None, // not loaded from DB for internal use
     }
 }
 
@@ -1001,7 +1075,7 @@ fn row_to_order_json(r: &sqlx::postgres::PgRow) -> Value {
 }
 
 fn order_to_json(o: &Order) -> Value {
-    json!({
+    let mut j = json!({
         "id": o.id.to_string(),
         "user_id": o.user_id,
         "pair_id": o.pair_id,
@@ -1016,7 +1090,11 @@ fn order_to_json(o: &Order) -> Value {
         "version": o.version,
         "created_at": o.created_at.to_rfc3339(),
         "updated_at": o.updated_at.to_rfc3339(),
-    })
+    });
+    if let Some(ref coid) = o.client_order_id {
+        j["client_order_id"] = json!(coid);
+    }
+    j
 }
 
 fn trade_to_json(t: &Trade) -> Value {

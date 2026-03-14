@@ -76,6 +76,10 @@ pub struct Order {
     pub sequence: i64,             // per-pair sequence number
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Client-provided idempotency key. If set, duplicate submissions
+    /// with the same (user_id, client_order_id) return the existing order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_order_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -34,6 +34,7 @@ fn make_order(
         sequence: 0,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+            client_order_id: None,
     }
 }
 

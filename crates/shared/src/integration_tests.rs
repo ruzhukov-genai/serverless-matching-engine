@@ -12,6 +12,7 @@ mod tests {
     use chrono::Utc;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
+    use sqlx::Row;
     use uuid::Uuid;
 
     // ── Helpers ───────────────────────────────────────────────────────────
@@ -45,6 +46,7 @@ mod tests {
             sequence: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            client_order_id: None,
         }
     }
 
@@ -1972,6 +1974,107 @@ mod tests {
 
         cleanup_order(&df, &buy.id).await;
         cleanup_pair(&df, pair).await;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // IDEMPOTENCY
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn idempotency_duplicate_client_order_id_blocked_by_db() {
+        // Two orders with the same (user_id, client_order_id) — DB unique constraint
+        let pg = pg_pool().await;
+        db::run_migrations(&pg).await.unwrap();
+
+        let user = "idem-user-1";
+        let coid = format!("coid-{}", Uuid::new_v4().to_string().split('-').next().unwrap());
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+
+        // First insert succeeds
+        let rows = sqlx::query(
+            "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, client_order_id)
+             VALUES ($1, $2, 'BTC-USDT', 'Buy', 'Limit', 'GTC', 50000, 1, 1, 'New', $3)
+             ON CONFLICT DO NOTHING"
+        )
+        .bind(id1).bind(user).bind(&coid)
+        .execute(&pg).await.unwrap().rows_affected();
+        assert_eq!(rows, 1);
+
+        // Second insert with same client_order_id — ON CONFLICT DO NOTHING → 0 rows
+        let rows = sqlx::query(
+            "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, client_order_id)
+             VALUES ($1, $2, 'BTC-USDT', 'Buy', 'Limit', 'GTC', 50000, 1, 1, 'New', $3)
+             ON CONFLICT DO NOTHING"
+        )
+        .bind(id2).bind(user).bind(&coid)
+        .execute(&pg).await.unwrap().rows_affected();
+        assert_eq!(rows, 0, "duplicate client_order_id should be rejected");
+
+        // Can look up existing order by client_order_id
+        let existing = sqlx::query("SELECT id FROM orders WHERE user_id = $1 AND client_order_id = $2")
+            .bind(user).bind(&coid)
+            .fetch_one(&pg).await.unwrap();
+        let existing_id: Uuid = existing.get("id");
+        assert_eq!(existing_id, id1, "should find the first order");
+
+        // Cleanup
+        sqlx::query("DELETE FROM orders WHERE id = $1").bind(id1).execute(&pg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idempotency_different_users_same_client_order_id_ok() {
+        // Different users can use the same client_order_id
+        let pg = pg_pool().await;
+        db::run_migrations(&pg).await.unwrap();
+
+        let coid = format!("shared-{}", Uuid::new_v4().to_string().split('-').next().unwrap());
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+
+        let r1 = sqlx::query(
+            "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, client_order_id)
+             VALUES ($1, 'userA', 'BTC-USDT', 'Buy', 'Limit', 'GTC', 50000, 1, 1, 'New', $2)
+             ON CONFLICT DO NOTHING"
+        ).bind(id1).bind(&coid).execute(&pg).await.unwrap().rows_affected();
+
+        let r2 = sqlx::query(
+            "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, client_order_id)
+             VALUES ($1, 'userB', 'BTC-USDT', 'Buy', 'Limit', 'GTC', 50000, 1, 1, 'New', $2)
+             ON CONFLICT DO NOTHING"
+        ).bind(id2).bind(&coid).execute(&pg).await.unwrap().rows_affected();
+
+        assert_eq!(r1, 1);
+        assert_eq!(r2, 1, "different users with same client_order_id should both succeed");
+
+        // Cleanup
+        sqlx::query("DELETE FROM orders WHERE id IN ($1, $2)").bind(id1).bind(id2).execute(&pg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idempotency_null_client_order_id_allows_duplicates() {
+        // Without client_order_id, multiple orders from same user are allowed
+        let pg = pg_pool().await;
+        db::run_migrations(&pg).await.unwrap();
+
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+
+        let r1 = sqlx::query(
+            "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status)
+             VALUES ($1, 'idem-null', 'BTC-USDT', 'Buy', 'Limit', 'GTC', 50000, 1, 1, 'New')"
+        ).bind(id1).execute(&pg).await.unwrap().rows_affected();
+
+        let r2 = sqlx::query(
+            "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status)
+             VALUES ($1, 'idem-null', 'BTC-USDT', 'Buy', 'Limit', 'GTC', 50000, 1, 1, 'New')"
+        ).bind(id2).execute(&pg).await.unwrap().rows_affected();
+
+        assert_eq!(r1, 1);
+        assert_eq!(r2, 1, "null client_order_id should not trigger unique constraint");
+
+        // Cleanup
+        sqlx::query("DELETE FROM orders WHERE id IN ($1, $2)").bind(id1).bind(id2).execute(&pg).await.unwrap();
     }
 
     // ═══════════════════════════════════════════════════════════════════════
