@@ -35,6 +35,8 @@ pub struct AppState {
     pub pg_bg: PgPool,
     /// In-memory pairs cache: pair_id → PairConfig
     pub pairs_cache: Arc<HashMap<String, PairConfig>>,
+    /// Cached /api/pairs response — loaded on first request, never changes
+    pub pairs_list_cache: Arc<RwLock<Vec<serde_json::Value>>>,
     /// Channel to the background persistence worker
     pub persist_tx: mpsc::Sender<routes::PersistJob>,
     /// Shared orderbook broadcast: one poller per pair, all WS clients subscribe
@@ -66,7 +68,7 @@ async fn main() -> Result<()> {
     // Hot path pool: low latency, fast order inserts + balance locks.
     let pg_hot = sqlx::postgres::PgPoolOptions::new()
         .max_connections(60)
-        .min_connections(5)
+        .min_connections(2)
         .acquire_timeout(Duration::from_secs(5))
         .idle_timeout(Duration::from_secs(120))
         .max_lifetime(Duration::from_secs(1800))
@@ -74,10 +76,10 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("connect pg_hot: {}", e))?;
 
-    // Background persist pool: dedicated to async trade/balance settlement writes.
+    // Background pool: async persist + read-only queries (portfolio, orders, pairs).
     let pg_bg = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(20)
-        .min_connections(2)
+        .max_connections(40)
+        .min_connections(3)
         .acquire_timeout(Duration::from_secs(10))
         .idle_timeout(Duration::from_secs(120))
         .max_lifetime(Duration::from_secs(1800))
@@ -145,7 +147,9 @@ async fn main() -> Result<()> {
     let (order_events_tx, _) = broadcast::channel::<String>(1024);
 
     let state = AppState {
-        dragonfly, pg: pg_hot, pg_bg, pairs_cache, persist_tx,
+        dragonfly, pg: pg_hot, pg_bg, pairs_cache,
+        pairs_list_cache: Arc::new(RwLock::new(Vec::new())),
+        persist_tx,
         book_broadcasts, book_snapshots, metrics_cache, ticker_cache, trades_cache, order_events_tx,
     };
 

@@ -144,6 +144,13 @@ async fn process_persist_job(pg: &sqlx::PgPool, job: PersistJob) -> anyhow::Resu
 // ── GET /api/pairs ────────────────────────────────────────────────────────────
 
 pub async fn list_pairs(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
+    // Pairs are static — serve from in-memory cache
+    let cache = s.pairs_list_cache.read().await;
+    if !cache.is_empty() {
+        return Ok(Json(json!({ "pairs": &*cache })));
+    }
+    drop(cache);
+
     let rows = sqlx::query("SELECT id, base, quote, tick_size, lot_size, min_order_size, max_order_size, price_precision, qty_precision, price_band_pct, active FROM pairs WHERE active = true")
         .fetch_all(&s.pg_bg)
         .await?;
@@ -166,6 +173,10 @@ pub async fn list_pairs(State(s): State<AppState>) -> HandlerResult<impl IntoRes
             })
         })
         .collect();
+
+    // Cache for future requests (pairs are static)
+    let mut w = s.pairs_list_cache.write().await;
+    *w = pairs.clone();
 
     Ok(Json(json!({ "pairs": pairs })))
 }
