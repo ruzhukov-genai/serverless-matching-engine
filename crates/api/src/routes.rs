@@ -334,82 +334,99 @@ pub async fn create_order(
         .map_err(AppError::bad_request)?;
     let pre_lock_ms = pre_lock_start.elapsed().as_millis() as u64;
 
-    // ── ACQUIRE PER-PAIR LOCK ─────────────────────────────────────────────
-    let lock_start = std::time::Instant::now();
-    let worker_id = format!("api-{}", order.id);
-    let guard = lock::acquire_lock(&s.dragonfly, &req.pair_id, &worker_id).await?;
-    let lock_wait_ms = lock_start.elapsed().as_millis() as u64;
-
-    // 4. Load opposite side of the book
-    let book_load_start = std::time::Instant::now();
+    // ── OCC RETRY LOOP (replaces distributed lock) ────────────────────────
+    const MAX_CAS_RETRIES: u32 = 10;
+    let mut cas_retries = 0u32;
+    let cas_start = std::time::Instant::now();
+    let original_order = order.clone();
     let opposite_side = order.side.opposite();
-    let mut book = cache::load_order_book_filtered(
-        &s.dragonfly,
-        &req.pair_id,
-        opposite_side,
-        order.price,
-    )
-    .await?;
-    let book_load_ms = book_load_start.elapsed().as_millis() as u64;
 
-    // Sort book for price-time priority
-    book.sort_by(|a, b| {
-        let sa = sort_score(a);
-        let sb = sort_score(b);
-        sa.partial_cmp(&sb)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.created_at.cmp(&b.created_at))
-    });
+    let result;
+    let mut match_ms: u64 = 0;
 
-    // 5. Match inline
-    let match_start = std::time::Instant::now();
-    let result = match_order(&order, &mut book);
-    let match_ms = match_start.elapsed().as_millis() as u64;
-    order = result.incoming.clone();
+    loop {
+        // 4. Load book snapshot (version + orders in one pipeline)
+        let (mut book, snapshot_version) = cache::load_order_book_snapshot(
+            &s.dragonfly,
+            &req.pair_id,
+            opposite_side,
+            order.price,
+        )
+        .await?;
 
-    // 6. Handle FOK rollback
-    if req.order_type == OrderType::Limit
-        && tif == TimeInForce::FOK
-        && result.trades.is_empty()
-        && order.status == OrderStatus::Cancelled
-    {
-        guard.release().await;
-        cancel_order_in_db(&s.pg, order.id).await?;
-        release_locked_balance(&s.pg, &order).await?;
-        return Ok((
-            StatusCode::OK,
-            Json(json!({
-                "order": order_to_json(&order),
-                "trades": [],
-                "message": "FOK order cancelled — insufficient liquidity"
-            })),
-        ));
-    }
+        // Sort book for price-time priority
+        book.sort_by(|a, b| {
+            let sa = sort_score(a);
+            let sb = sort_score(b);
+            sa.partial_cmp(&sb)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
 
-    // 7. Update matched resting orders in cache (INSIDE lock)
-    let cache_write_start = std::time::Instant::now();
-    for upd in &result.book_updates {
-        if upd.status == OrderStatus::Filled || upd.status == OrderStatus::Cancelled {
-            cache::remove_order_from_book(&s.dragonfly, upd).await?;
+        // 5. Match inline
+        let match_start = std::time::Instant::now();
+        let r = match_order(&order, &mut book);
+        match_ms = match_start.elapsed().as_millis() as u64;
+        order = r.incoming.clone();
+
+        // 6. Handle FOK rollback — exit loop early, no CAS write needed
+        if req.order_type == OrderType::Limit
+            && tif == TimeInForce::FOK
+            && r.trades.is_empty()
+            && order.status == OrderStatus::Cancelled
+        {
+            cancel_order_in_db(&s.pg, order.id).await?;
+            release_locked_balance(&s.pg, &order).await?;
+            return Ok((
+                StatusCode::OK,
+                Json(json!({
+                    "order": order_to_json(&order),
+                    "trades": [],
+                    "message": "FOK order cancelled — insufficient liquidity"
+                })),
+            ));
+        }
+
+        // 7. Try atomic CAS write
+        let incoming_if_resting = if order.status == OrderStatus::New
+            || order.status == OrderStatus::PartiallyFilled
+        {
+            Some(&order)
         } else {
-            cache::save_order_to_book(&s.dragonfly, upd).await?;
+            None
+        };
+
+        match cache::apply_book_mutations_cas(
+            &s.dragonfly,
+            &req.pair_id,
+            snapshot_version,
+            &r.book_updates,
+            incoming_if_resting,
+        )
+        .await?
+        {
+            cache::CasResult::Ok => {
+                result = r;
+                break;
+            }
+            cache::CasResult::Conflict => {
+                cas_retries += 1;
+                if cas_retries >= MAX_CAS_RETRIES {
+                    return Err(AppError::conflict(anyhow::anyhow!(
+                        "order book contention: too many retries"
+                    )));
+                }
+                // Reset order to pre-match state and retry
+                order = original_order.clone();
+                continue;
+            }
         }
     }
 
-    // 8. Update incoming order in cache (INSIDE lock)
-    if order.status == OrderStatus::New || order.status == OrderStatus::PartiallyFilled {
-        cache::save_order_to_book(&s.dragonfly, &order).await?;
-    }
-
-    // 9. Bump version counter (INSIDE lock)
-    cache::increment_version(&s.dragonfly, &req.pair_id).await?;
-    let cache_write_ms = cache_write_start.elapsed().as_millis() as u64;
-
-    // ── RELEASE LOCK ──────────────────────────────────────────────────────
-    guard.release().await;
-
+    let cas_ms = cas_start.elapsed().as_millis() as u64;
     let total_ms = total_start.elapsed().as_millis() as u64;
     let trade_count = result.trades.len();
+    let lock_wait_ms: u64 = 0; // no longer used — kept for metrics compat
 
     // Write metrics to Dragonfly (best-effort, don't fail the request)
     {
@@ -478,10 +495,9 @@ pub async fn create_order(
 
     tracing::info!(
         pre_lock_ms = pre_lock_ms,
-        lock_wait_ms = lock_wait_ms,
-        book_load_ms = book_load_ms,
+        cas_ms = cas_ms,
+        cas_retries = cas_retries,
         match_ms = match_ms,
-        cache_write_ms = cache_write_ms,
         post_lock_ms = post_lock_ms,
         total_ms = total_ms,
         trade_count = trade_count,

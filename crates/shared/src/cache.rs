@@ -260,3 +260,250 @@ pub async fn get_version(pool: &Pool, pair_id: &str) -> Result<i64> {
         .context("GET version")?;
     Ok(v.unwrap_or(0))
 }
+
+// ── OCC / CAS primitives ──────────────────────────────────────────────────────
+
+/// Result of a compare-and-swap attempt.
+pub enum CasResult {
+    /// Mutations applied atomically, version incremented.
+    Ok,
+    /// Version changed between snapshot and CAS — caller should retry.
+    Conflict,
+}
+
+/// Load the order book snapshot AND the current version in a single pipeline.
+///
+/// Returns `(orders, version)` where `version` is the monotonic counter at
+/// `version:{pair_id}`. The version must be passed unchanged to
+/// `apply_book_mutations_cas` so the Lua script can verify no concurrent
+/// mutation occurred between snapshot and CAS.
+pub async fn load_order_book_snapshot(
+    pool: &Pool,
+    pair_id: &str,
+    side: Side,
+    limit_price: Option<rust_decimal::Decimal>,
+) -> Result<(Vec<Order>, i64)> {
+    let mut conn = pool.get().await.context("pool.get")?;
+    let zkey = book_key(pair_id, side);
+    let version_key = format!("version:{pair_id}");
+
+    let (min_score, max_score) = match limit_price {
+        None => ("-inf".to_string(), "+inf".to_string()),
+        Some(price) => {
+            let f: f64 = price.to_string().parse().unwrap_or(0.0);
+            match side {
+                // asks: score = +price, we want asks where score <= buy_price
+                Side::Sell => ("-inf".to_string(), f.to_string()),
+                // bids: score = -price, we want bids where score <= -sell_price
+                Side::Buy => ("-inf".to_string(), (-f).to_string()),
+            }
+        }
+    };
+
+    // Pipeline: GET version + ZRANGEBYSCORE
+    let (version_raw, ids): (Option<String>, Vec<String>) = redis::pipe()
+        .cmd("GET").arg(&version_key)
+        .cmd("ZRANGEBYSCORE").arg(&zkey).arg(&min_score).arg(&max_score)
+        .query_async(&mut *conn)
+        .await
+        .context("pipeline GET version + ZRANGEBYSCORE")?;
+
+    let version: i64 = version_raw
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    if ids.is_empty() {
+        return Ok((Vec::new(), version));
+    }
+
+    // Pipeline all HGET calls for the returned order IDs
+    let mut hget_pipe = redis::pipe();
+    for id in &ids {
+        let okey = format!("order:{id}");
+        hget_pipe.hget(&okey, "data");
+    }
+    let data_list: Vec<Option<Vec<u8>>> = hget_pipe
+        .query_async(&mut *conn)
+        .await
+        .context("pipeline HGET orders")?;
+
+    let mut orders = Vec::with_capacity(ids.len());
+    for (id, data) in ids.iter().zip(data_list.iter()) {
+        if let Some(bytes) = data {
+            match rmp_serde::from_slice::<Order>(bytes) {
+                Ok(order) => orders.push(order),
+                Err(e) => tracing::warn!("bad order msgpack for {id}: {e}"),
+            }
+        }
+    }
+
+    Ok((orders, version))
+}
+
+/// The Lua CAS script — atomically checks version, applies ZSet mutations, increments version.
+///
+/// All accessed keys are declared in KEYS[] (Dragonfly/Redis cluster compatibility).
+/// Binary msgpack data is NOT passed through Lua — callers pre-write HSET data via pipeline.
+///
+/// KEYS: [1]=version, [2]=bids_zset, [3]=asks_zset, [4..4+N-1]=order hash keys (one per mutation)
+/// ARGV: [1]=expected_version, [2]=N, then 3 fields per mutation: op, order_id, score
+const CAS_SCRIPT: &str = r#"
+local current = redis.call('GET', KEYS[1])
+if tostring(current) ~= ARGV[1] then
+    return redis.error_reply('VERSION_CONFLICT')
+end
+
+local n = tonumber(ARGV[2])
+for i = 0, n-1 do
+    local op    = ARGV[3 + i*3 + 0]
+    local oid   = ARGV[3 + i*3 + 1]
+    local score = ARGV[3 + i*3 + 2]
+    local okey  = KEYS[4 + i]
+
+    if op == 'REMOVE_BID' then
+        redis.call('ZREM', KEYS[2], oid)
+        redis.call('HDEL', okey, 'data')
+    elseif op == 'REMOVE_ASK' then
+        redis.call('ZREM', KEYS[3], oid)
+        redis.call('HDEL', okey, 'data')
+    elseif op == 'UPSERT_BID' then
+        redis.call('ZADD', KEYS[2], score, oid)
+        -- HSET data already written by caller before this script
+    elseif op == 'UPSERT_ASK' then
+        redis.call('ZADD', KEYS[3], score, oid)
+        -- HSET data already written by caller before this script
+    end
+end
+
+redis.call('INCR', KEYS[1])
+return 'OK'
+"#;
+
+/// Apply book mutations atomically via Lua CAS.
+///
+/// Two-phase approach:
+/// 1. Pre-write all HSET (order hash) data for UPSERT ops in a pipeline (outside Lua).
+/// 2. Lua CAS script: check version, ZADD/ZREM, INCR version.
+///    All accessed Redis keys are declared in KEYS[] for Dragonfly compatibility.
+///
+/// If CAS conflicts, the pre-written HSET data may be orphaned temporarily.
+/// It will be cleaned up by a subsequent REMOVE_* or overwritten on next retry.
+pub async fn apply_book_mutations_cas(
+    pool: &Pool,
+    pair_id: &str,
+    expected_version: i64,
+    book_updates: &[Order],
+    incoming_if_resting: Option<&Order>,
+) -> Result<CasResult> {
+    let version_key = format!("version:{pair_id}");
+    let bids_key = format!("book:{pair_id}:bids");
+    let asks_key = format!("book:{pair_id}:asks");
+
+    struct Mutation {
+        op: &'static str,
+        oid: String,
+        order_key: String,
+        score: f64,
+    }
+
+    let mut mutations: Vec<Mutation> = Vec::new();
+    let mut upsert_orders: Vec<&Order> = Vec::new();
+
+    for upd in book_updates {
+        let (op, needs_hset): (&'static str, bool) = match upd.side {
+            Side::Buy => {
+                if upd.status == crate::types::OrderStatus::Filled
+                    || upd.status == crate::types::OrderStatus::Cancelled
+                {
+                    ("REMOVE_BID", false)
+                } else {
+                    ("UPSERT_BID", true)
+                }
+            }
+            Side::Sell => {
+                if upd.status == crate::types::OrderStatus::Filled
+                    || upd.status == crate::types::OrderStatus::Cancelled
+                {
+                    ("REMOVE_ASK", false)
+                } else {
+                    ("UPSERT_ASK", true)
+                }
+            }
+        };
+        if needs_hset {
+            upsert_orders.push(upd);
+        }
+        mutations.push(Mutation {
+            op,
+            oid: upd.id.to_string(),
+            order_key: format!("order:{}", upd.id),
+            score: upd.book_score(),
+        });
+    }
+
+    if let Some(incoming) = incoming_if_resting {
+        let op = match incoming.side {
+            Side::Buy => "UPSERT_BID",
+            Side::Sell => "UPSERT_ASK",
+        };
+        upsert_orders.push(incoming);
+        mutations.push(Mutation {
+            op,
+            oid: incoming.id.to_string(),
+            order_key: format!("order:{}", incoming.id),
+            score: incoming.book_score(),
+        });
+    }
+
+    let mut conn = pool.get().await.context("pool.get")?;
+
+    // Phase 1: Pre-write HSET data for all UPSERT ops (pipeline, no Lua involved)
+    if !upsert_orders.is_empty() {
+        let mut hset_pipe = redis::pipe();
+        for order in &upsert_orders {
+            let okey = format!("order:{}", order.id);
+            let bytes = rmp_serde::to_vec_named(order).context("serialize order to msgpack")?;
+            hset_pipe.cmd("HSET").arg(&okey).arg("data").arg(bytes.as_slice()).ignore();
+        }
+        hset_pipe.query_async::<()>(&mut *conn).await.context("pre-write HSET pipeline")?;
+    }
+
+    // Phase 2: Lua CAS — version check + ZADD/ZREM + INCR
+    // All keys (including order hash keys) declared in KEYS[] for Dragonfly compatibility
+    let n = mutations.len();
+    let script = redis::Script::new(CAS_SCRIPT);
+    let mut invocation = script.prepare_invoke();
+    invocation
+        .key(&version_key)
+        .key(&bids_key)
+        .key(&asks_key);
+
+    // Add one order hash key per mutation (KEYS[4..4+N-1])
+    for m in &mutations {
+        invocation.key(&m.order_key);
+    }
+
+    invocation
+        .arg(expected_version.to_string())
+        .arg(n.to_string());
+
+    for m in &mutations {
+        invocation.arg(m.op).arg(&m.oid).arg(m.score.to_string());
+    }
+
+    let result: redis::RedisResult<String> = invocation.invoke_async(&mut *conn).await;
+
+    match result {
+        Ok(_) => Ok(CasResult::Ok),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("VERSION_CONFLICT") {
+                Ok(CasResult::Conflict)
+            } else {
+                Err(anyhow::anyhow!("CAS script error: {e}"))
+            }
+        }
+    }
+}
+
