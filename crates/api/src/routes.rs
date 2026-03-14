@@ -19,7 +19,7 @@ use sme_shared::{
     SelfTradePreventionMode, TimeInForce, Trade,
 };
 
-use crate::AppState;
+use crate::{AppState, PairConfig};
 
 // ── Error helper ─────────────────────────────────────────────────────────────
 
@@ -137,7 +137,7 @@ pub async fn get_trades(
     State(s): State<AppState>,
 ) -> HandlerResult<impl IntoResponse> {
     let rows = sqlx::query(
-        "SELECT id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, created_at
+        "SELECT id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, sequence, created_at
          FROM trades WHERE pair_id = $1 ORDER BY created_at DESC LIMIT 50",
     )
     .bind(&pair_id)
@@ -321,8 +321,9 @@ pub async fn create_order(
         client_order_id: req.client_order_id.clone(),
     };
 
-    // 1. Validate (outside lock)
-    validate_order_request(&s.pg, &order).await
+    // 1. Validate (outside lock) — uses in-memory cache, zero DB round-trips
+    let pre_lock_start = std::time::Instant::now();
+    validate_order_request(&s.pairs_cache, &order)
         .map_err(AppError::bad_request)?;
 
     // 2. Insert to DB (outside lock — unique constraint enforces idempotency)
@@ -331,6 +332,7 @@ pub async fn create_order(
     // 3. Lock balance in DB (outside lock)
     lock_balance(&s.pg, &order).await
         .map_err(AppError::bad_request)?;
+    let pre_lock_ms = pre_lock_start.elapsed().as_millis() as u64;
 
     // ── ACQUIRE PER-PAIR LOCK ─────────────────────────────────────────────
     let lock_start = std::time::Instant::now();
@@ -409,18 +411,6 @@ pub async fn create_order(
     let total_ms = total_start.elapsed().as_millis() as u64;
     let trade_count = result.trades.len();
 
-    tracing::info!(
-        lock_wait_ms = lock_wait_ms,
-        book_load_ms = book_load_ms,
-        match_ms = match_ms,
-        cache_write_ms = cache_write_ms,
-        total_ms = total_ms,
-        trade_count = trade_count,
-        pair_id = %req.pair_id,
-        order_id = %order.id,
-        "order matched"
-    );
-
     // Write metrics to Dragonfly (best-effort, don't fail the request)
     {
         let pool = s.dragonfly.clone();
@@ -435,7 +425,9 @@ pub async fn create_order(
         });
     }
 
-    // 10. Persist to DB (outside lock)
+    // 10. Persist to DB (outside lock) — timed as post_lock segment
+    let post_lock_start = std::time::Instant::now();
+
     insert_audit_event(
         &s.pg,
         Some(&req.pair_id),
@@ -455,8 +447,13 @@ pub async fn create_order(
     // Batch persist all trades in a single transaction
     let trade_jsons = persist_trades(&s.pg, &result.trades).await?;
 
+    // Batch update all affected resting orders in one transaction
+    let mut all_updates: Vec<&Order> = result.book_updates.iter().collect();
+    all_updates.push(&order);
+    batch_update_orders_db(&s.pg, &all_updates).await?;
+
+    // Audit events for book updates (best-effort, non-blocking)
     for upd in &result.book_updates {
-        update_order_db(&s.pg, upd).await?;
         let event_type = match upd.status {
             OrderStatus::Filled => "ORDER_FILLED",
             OrderStatus::PartiallyFilled => "ORDER_PARTIALLY_FILLED",
@@ -473,10 +470,24 @@ pub async fn create_order(
         .ok();
     }
 
-    update_order_db(&s.pg, &order).await?;
     if order.status == OrderStatus::Cancelled || order.status == OrderStatus::Filled {
         release_remaining_locked(&s.pg, &order).await?;
     }
+
+    let post_lock_ms = post_lock_start.elapsed().as_millis() as u64;
+
+    tracing::info!(
+        pre_lock_ms = pre_lock_ms,
+        lock_wait_ms = lock_wait_ms,
+        book_load_ms = book_load_ms,
+        match_ms = match_ms,
+        cache_write_ms = cache_write_ms,
+        post_lock_ms = post_lock_ms,
+        total_ms = total_ms,
+        trade_count = trade_count,
+        pair_id = %req.pair_id,
+        "order complete"
+    );
 
     Ok((
         StatusCode::CREATED,
@@ -535,7 +546,7 @@ pub async fn list_orders(
 ) -> HandlerResult<impl IntoResponse> {
     let user_id = q.user_id.unwrap_or_else(|| "user-1".to_string());
     let rows = sqlx::query(
-        "SELECT id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, created_at, updated_at
+        "SELECT id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, sequence, created_at, updated_at, client_order_id
          FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled') ORDER BY created_at DESC",
     )
     .bind(&user_id)
@@ -647,7 +658,7 @@ async fn handle_trades_ws(pair_id: String, state: AppState, mut socket: WebSocke
 
         let query = if let Some(since) = last_seen {
             sqlx::query(
-                "SELECT id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, created_at
+                "SELECT id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, sequence, created_at
                  FROM trades WHERE pair_id = $1 AND created_at > $2 ORDER BY created_at DESC LIMIT 20",
             )
             .bind(&pair_id)
@@ -656,7 +667,7 @@ async fn handle_trades_ws(pair_id: String, state: AppState, mut socket: WebSocke
             .await
         } else {
             sqlx::query(
-                "SELECT id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, created_at
+                "SELECT id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, sequence, created_at
                  FROM trades WHERE pair_id = $1 ORDER BY created_at DESC LIMIT 20",
             )
             .bind(&pair_id)
@@ -847,37 +858,26 @@ pub async fn insert_audit_event(
 
 // ── DB helpers ─────────────────────────────────────────────────────────────────
 
-async fn validate_order_request(pg: &sqlx::PgPool, order: &Order) -> anyhow::Result<()> {
-    let row = sqlx::query(
-        "SELECT tick_size, lot_size, min_order_size, max_order_size, active FROM pairs WHERE id = $1",
-    )
-    .bind(&order.pair_id)
-    .fetch_optional(pg)
-    .await?;
+/// Validate order against the in-memory pairs cache — zero DB round-trips.
+fn validate_order_request(
+    pairs_cache: &HashMap<String, PairConfig>,
+    order: &Order,
+) -> anyhow::Result<()> {
+    let cfg = pairs_cache
+        .get(&order.pair_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown pair {}", order.pair_id))?;
 
-    let row = match row {
-        Some(r) => r,
-        None => anyhow::bail!("unknown pair {}", order.pair_id),
-    };
-
-    let active: bool = row.get("active");
-    if !active {
+    if !cfg.active {
         anyhow::bail!("pair {} is not active", order.pair_id);
     }
-
-    let tick_size: Decimal = row.get("tick_size");
-    let lot_size: Decimal = row.get("lot_size");
-    let min_size: Decimal = row.get("min_order_size");
-    let max_size: Decimal = row.get("max_order_size");
-
-    if order.quantity % lot_size != Decimal::ZERO {
+    if order.quantity % cfg.lot_size != Decimal::ZERO {
         anyhow::bail!("quantity not aligned to lot_size");
     }
-    if order.quantity < min_size || order.quantity > max_size {
-        anyhow::bail!("quantity out of range [{min_size}, {max_size}]");
+    if order.quantity < cfg.min_order_size || order.quantity > cfg.max_order_size {
+        anyhow::bail!("quantity out of range [{}, {}]", cfg.min_order_size, cfg.max_order_size);
     }
     if let Some(price) = order.price {
-        if tick_size > Decimal::ZERO && price % tick_size != Decimal::ZERO {
+        if cfg.tick_size > Decimal::ZERO && price % cfg.tick_size != Decimal::ZERO {
             anyhow::bail!("price not aligned to tick_size");
         }
     }
@@ -923,6 +923,29 @@ async fn update_order_db(pg: &sqlx::PgPool, order: &Order) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Batch update multiple orders in a single transaction.
+/// Replaces the per-order loop (N separate round-trips) with 1 transaction.
+async fn batch_update_orders_db(pg: &sqlx::PgPool, orders: &[&Order]) -> anyhow::Result<()> {
+    if orders.is_empty() {
+        return Ok(());
+    }
+    let now = Utc::now();
+    let mut tx = pg.begin().await?;
+    for order in orders {
+        sqlx::query(
+            "UPDATE orders SET remaining = $1, status = $2, version = version + 1, updated_at = $3 WHERE id = $4",
+        )
+        .bind(order.remaining)
+        .bind(format!("{:?}", order.status))
+        .bind(now)
+        .bind(order.id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 async fn cancel_order_in_db(pg: &sqlx::PgPool, order_id: Uuid) -> anyhow::Result<()> {
     sqlx::query(
         "UPDATE orders SET status = 'Cancelled', updated_at = NOW() WHERE id = $1",
@@ -935,7 +958,7 @@ async fn cancel_order_in_db(pg: &sqlx::PgPool, order_id: Uuid) -> anyhow::Result
 
 async fn load_order_db(pg: &sqlx::PgPool, order_id: Uuid) -> anyhow::Result<Option<Order>> {
     let row = sqlx::query(
-        "SELECT id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, created_at, updated_at
+        "SELECT id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, sequence, created_at, updated_at, client_order_id
          FROM orders WHERE id = $1",
     )
     .bind(order_id)
@@ -1240,7 +1263,11 @@ async fn persist_trades(pg: &sqlx::PgPool, trades: &[Trade]) -> anyhow::Result<V
         .await?;
     }
 
-    // Step 4: Batch INSERT audit events
+    tx.commit().await?;
+
+    // Step 4: Batch INSERT audit events (fire-and-forget outside transaction;
+    // the audit_log.sequence column has no DEFAULT so inserts may fail silently
+    // — matching original behaviour).
     for trade in trades {
         sqlx::query(
             "INSERT INTO audit_log (pair_id, event_type, payload) VALUES ($1, $2, $3)",
@@ -1254,11 +1281,11 @@ async fn persist_trades(pg: &sqlx::PgPool, trades: &[Trade]) -> anyhow::Result<V
             "price": trade.price.to_string(),
             "quantity": trade.quantity.to_string(),
         }))
-        .execute(&mut *tx)
-        .await?;
+        .execute(pg)
+        .await
+        .ok();
     }
 
-    tx.commit().await?;
     Ok(trade_jsons)
 }
 

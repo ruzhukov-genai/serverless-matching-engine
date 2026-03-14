@@ -1,17 +1,33 @@
 use anyhow::Result;
 use axum::{Router, routing::get};
 use deadpool_redis::Pool as RedisPool;
+use rust_decimal::Decimal;
 use sqlx::PgPool;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
 
 mod routes;
 
+/// Cached pair configuration — loaded once at startup, never re-queried.
+/// Eliminates the SELECT from pairs on every order validation.
+#[derive(Clone, Debug)]
+pub struct PairConfig {
+    pub tick_size: Decimal,
+    pub lot_size: Decimal,
+    pub min_order_size: Decimal,
+    pub max_order_size: Decimal,
+    pub active: bool,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub dragonfly: RedisPool,
     pub pg: PgPool,
+    /// In-memory pairs cache: pair_id → PairConfig
+    pub pairs_cache: Arc<HashMap<String, PairConfig>>,
 }
 
 #[tokio::main]
@@ -34,7 +50,12 @@ async fn main() -> Result<()> {
     tracing::info!("seeding initial data");
     run_seed(&pg).await?;
 
-    let state = AppState { dragonfly, pg };
+    // Load pairs into memory cache — eliminates SELECT on every order validation
+    tracing::info!("loading pairs cache");
+    let pairs_cache = Arc::new(load_pairs_cache(&pg).await?);
+    tracing::info!(count = pairs_cache.len(), "pairs cache loaded");
+
+    let state = AppState { dragonfly, pg, pairs_cache };
 
     let app = Router::new()
         // Trading API
@@ -71,6 +92,28 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+async fn load_pairs_cache(pg: &PgPool) -> Result<HashMap<String, PairConfig>> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT id, tick_size, lot_size, min_order_size, max_order_size, active FROM pairs",
+    )
+    .fetch_all(pg)
+    .await?;
+
+    let mut map = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let id: String = row.get("id");
+        map.insert(id, PairConfig {
+            tick_size: row.get("tick_size"),
+            lot_size: row.get("lot_size"),
+            min_order_size: row.get("min_order_size"),
+            max_order_size: row.get("max_order_size"),
+            active: row.get("active"),
+        });
+    }
+    Ok(map)
 }
 
 async fn run_seed(pg: &PgPool) -> Result<()> {
