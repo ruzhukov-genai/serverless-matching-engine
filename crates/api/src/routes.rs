@@ -1351,7 +1351,12 @@ async fn persist_trades(pg: &sqlx::PgPool, trades: &[Trade]) -> anyhow::Result<V
     // Step 3: Apply one UPDATE per (user_id, asset).
     // Uses INSERT ON CONFLICT to handle new balance rows (e.g. buyer receiving
     // base asset for the first time).
-    for ((user_id, asset), (locked_decrease, available_increase)) in &deltas {
+    // Sort deltas by (user_id, asset) so every concurrent transaction acquires
+    // row locks in the same order — eliminates ABBA deadlock.
+    let mut sorted_deltas: Vec<_> = deltas.iter().collect();
+    sorted_deltas.sort_by_key(|((uid, asset), _)| (uid.as_str(), asset.as_str()));
+
+    for ((user_id, asset), (locked_decrease, available_increase)) in &sorted_deltas {
         sqlx::query(
             "INSERT INTO balances (user_id, asset, available, locked) VALUES ($3, $4, $2, 0)
              ON CONFLICT (user_id, asset) DO UPDATE
