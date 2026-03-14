@@ -121,7 +121,7 @@ REST_ENDPOINTS = [
     f"/api/trades/{PAIR}",
     f"/api/ticker/{PAIR}",
     "/api/portfolio?user_id=user-1",
-    "/api/orders?user_id=user-1&pair_id=BTC-USDT&limit=20&offset=0",
+    # Orders now served via WS — removed from REST polling
     "/api/metrics",
     "/api/metrics/throughput",
     "/api/metrics/latency",
@@ -210,10 +210,12 @@ async def run_client(client_id: int, deadline: float) -> ClientStats:
         await fetch_static(session, stats)
 
         # Phase 2: run all concurrent activities until deadline
+        user_id = f"user-{(client_id % 5) + 1}"
         tasks = [
             asyncio.create_task(poll_rest(session, stats, deadline)),
             asyncio.create_task(ws_client(session, stats, f"/ws/orderbook/{PAIR}", deadline)),
             asyncio.create_task(ws_client(session, stats, f"/ws/trades/{PAIR}", deadline)),
+            asyncio.create_task(ws_client(session, stats, f"/ws/orders/{user_id}", deadline)),
             asyncio.create_task(place_orders(session, stats, client_id, deadline)),
         ]
         await asyncio.gather(*tasks, return_exceptions=True)

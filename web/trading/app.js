@@ -220,6 +220,7 @@ function connectWebSockets(pairId) {
     const wsBase = API.replace(/^https?/, proto => proto === 'https' ? 'wss' : 'ws');
     connectOrderbookWS(wsBase, pairId);
     connectTradesWS(wsBase, pairId);
+    connectOrdersWS(wsBase);
 }
 
 function connectOrderbookWS(wsBase, pairId) {
@@ -282,6 +283,39 @@ function connectTradesWS(wsBase, pairId) {
         };
     } catch(e) {
         startFallbackPoll('trades', () => loadTrades(pairId), 2500);
+    }
+}
+
+function connectOrdersWS(wsBase) {
+    if (ws.orders) {
+        ws.orders.onclose = null;
+        try { ws.orders.close(); } catch(_) {}
+    }
+    try {
+        const userId = 'user-1'; // TODO: make configurable
+        const sock = new WebSocket(`${wsBase}/ws/orders/${userId}`);
+        ws.orders = sock;
+        sock.onopen = () => clearFallbackPoll('orders');
+        sock.onmessage = e => {
+            try {
+                const msg = JSON.parse(e.data);
+                if (msg.type === 'snapshot') {
+                    // Full order list from server
+                    ordersTotal = msg.total || 0;
+                    renderOpenOrders(msg.orders || []);
+                } else if (msg.type === 'order_created' || msg.type === 'order_cancelled' || msg.type === 'orders_cancelled_all') {
+                    // Refresh orders on any change
+                    loadOpenOrders();
+                    loadPortfolio();
+                }
+            } catch(err) { console.warn('Orders WS parse error:', err); }
+        };
+        sock.onerror = () => {};
+        sock.onclose = () => {
+            startFallbackPoll('orders', () => loadOpenOrders(), 5000);
+        };
+    } catch(e) {
+        startFallbackPoll('orders', () => loadOpenOrders(), 5000);
     }
 }
 
@@ -564,10 +598,9 @@ window.cancelAllOrders = async function() {
 
 function startAutoRefresh() {
     loadPortfolio();
-    loadOpenOrders();
+    // Orders are now pushed via WS — only poll portfolio
     setInterval(() => {
         loadPortfolio();
-        loadOpenOrders();
     }, 5000);
 }
 

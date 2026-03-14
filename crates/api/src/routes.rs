@@ -636,6 +636,9 @@ pub async fn create_order(
         "order complete"
     );
 
+    // Emit order event to WS subscribers
+    emit_order_event(&s.order_events_tx, "order_created", &order, &trade_jsons);
+
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -661,6 +664,8 @@ pub async fn cancel_order(
     )
     .await
     .ok();
+
+    emit_order_status(&s.order_events_tx, "order_cancelled", &order.user_id, &order_id.to_string());
 
     Ok(Json(json!({ "status": "cancelled", "order_id": order_id.to_string() })))
 }
@@ -737,6 +742,11 @@ pub async fn cancel_all_orders(
     // Also release locked balances
     sqlx::query("UPDATE balances SET available = available + locked, locked = 0 WHERE user_id = $1 AND locked > 0")
         .bind(&user_id).execute(&s.pg).await?;
+
+    // Notify WS subscribers that all orders were cancelled
+    if result.rows_affected() > 0 {
+        emit_order_status(&s.order_events_tx, "orders_cancelled_all", &user_id, "");
+    }
 
     Ok(Json(json!({ "cancelled": result.rows_affected() })))
 }
@@ -917,6 +927,86 @@ async fn handle_trades_ws(pair_id: String, state: AppState, mut socket: WebSocke
             }
         }
     }
+}
+
+// ── WebSocket Order Events ───────────────────────────────────────────────────
+
+pub async fn ws_orders(
+    Path(user_id): Path<String>,
+    State(s): State<AppState>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_orders_ws(user_id, s, socket))
+}
+
+async fn handle_orders_ws(user_id: String, state: AppState, mut socket: WebSocket) {
+    let mut rx = state.order_events_tx.subscribe();
+
+    // Send initial snapshot of open orders
+    let initial = sqlx::query(
+        "SELECT id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, sequence, created_at, updated_at, client_order_id
+         FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled') ORDER BY created_at DESC LIMIT 50",
+    )
+    .bind(&user_id)
+    .fetch_all(&state.pg)
+    .await;
+
+    if let Ok(rows) = initial {
+        let orders: Vec<Value> = rows.iter().map(row_to_order_json).collect();
+        let msg = serde_json::to_string(&json!({
+            "type": "snapshot",
+            "orders": orders,
+            "total": orders.len(),
+        }))
+        .unwrap_or_default();
+        if socket.send(Message::Text(msg.into())).await.is_err() {
+            return;
+        }
+    }
+
+    // Stream real-time updates — filter by user_id
+    loop {
+        match rx.recv().await {
+            Ok(msg) => {
+                // Each message is JSON with a "user_id" field — only forward matching ones
+                let is_mine = serde_json::from_str::<Value>(&msg)
+                    .ok()
+                    .and_then(|p| Some(p.get("user_id")?.as_str()? == user_id))
+                    .unwrap_or(false);
+                if is_mine && socket.send(Message::Text(msg.into())).await.is_err() {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::debug!(user = %user_id, lagged = n, "ws orders client lagged");
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+/// Emit an order event to the broadcast channel (best-effort).
+fn emit_order_event(tx: &broadcast::Sender<String>, event_type: &str, order: &Order, trades: &[Value]) {
+    let msg = serde_json::to_string(&json!({
+        "type": event_type,
+        "user_id": order.user_id,
+        "order": order_to_json(order),
+        "trades": trades,
+    }))
+    .unwrap_or_default();
+    let _ = tx.send(msg);
+}
+
+/// Emit a simple order status change event.
+fn emit_order_status(tx: &broadcast::Sender<String>, event_type: &str, user_id: &str, order_id: &str) {
+    let msg = serde_json::to_string(&json!({
+        "type": event_type,
+        "user_id": user_id,
+        "order_id": order_id,
+    }))
+    .unwrap_or_default();
+    let _ = tx.send(msg);
 }
 
 // ── Dashboard API (cached — refreshed every 5s) ──────────────────────────────

@@ -43,6 +43,8 @@ pub struct AppState {
     pub metrics_cache: Arc<RwLock<serde_json::Value>>,
     /// Cached ticker data per pair — refreshed every 2s
     pub ticker_cache: Arc<RwLock<HashMap<String, serde_json::Value>>>,
+    /// Order events broadcast — all order state changes pushed here
+    pub order_events_tx: broadcast::Sender<String>,
 }
 
 #[tokio::main]
@@ -59,8 +61,8 @@ async fn main() -> Result<()> {
 
     // Hot path pool: low latency, fast order inserts + balance locks.
     let pg_hot = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(30)
-        .min_connections(3)
+        .max_connections(60)
+        .min_connections(5)
         .acquire_timeout(Duration::from_secs(5))
         .idle_timeout(Duration::from_secs(120))
         .max_lifetime(Duration::from_secs(1800))
@@ -131,9 +133,12 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Order events broadcast — single channel, WS clients filter by user_id
+    let (order_events_tx, _) = broadcast::channel::<String>(1024);
+
     let state = AppState {
         dragonfly, pg: pg_hot, pg_bg, pairs_cache, persist_tx,
-        book_broadcasts, metrics_cache, ticker_cache,
+        book_broadcasts, metrics_cache, ticker_cache, order_events_tx,
     };
 
     let app = Router::new()
@@ -151,6 +156,7 @@ async fn main() -> Result<()> {
         // WebSocket feeds
         .route("/ws/orderbook/{pair_id}", get(routes::ws_orderbook))
         .route("/ws/trades/{pair_id}", get(routes::ws_trades))
+        .route("/ws/orders/{user_id}", get(routes::ws_orders))
         // Dashboard API
         .route("/api/metrics", get(routes::get_metrics))
         .route("/api/metrics/locks", get(routes::get_lock_metrics))
