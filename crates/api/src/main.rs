@@ -37,6 +37,8 @@ pub struct AppState {
     pub persist_tx: mpsc::Sender<routes::PersistJob>,
     /// Order events broadcast — all order state changes pushed here
     pub order_events_tx: broadcast::Sender<String>,
+    /// Dirty user IDs — notifies cache refresh worker which portfolios to update
+    pub dirty_users_tx: mpsc::Sender<String>,
 }
 
 #[tokio::main]
@@ -95,9 +97,13 @@ async fn main() -> Result<()> {
 
     // Order events broadcast — single channel, gateway WS clients filter by user_id
     let (order_events_tx, _) = broadcast::channel::<String>(1024);
+
+    // Dirty user channel — order workers notify cache refresh which portfolios changed
+    let (dirty_users_tx, dirty_users_rx) = mpsc::channel::<String>(10_000);
+
     let state = AppState {
         dragonfly: dragonfly.clone(), pg: pg_hot, pg_bg: pg_bg.clone(), pairs_cache,
-        persist_tx, order_events_tx,
+        persist_tx, order_events_tx, dirty_users_tx,
     };
 
     // Start the order queue consumer
@@ -109,7 +115,7 @@ async fn main() -> Result<()> {
     // Start cache refresh workers
     let cache_state = state.clone();
     tokio::spawn(async move {
-        worker::cache_refresh_worker(cache_state).await;
+        worker::cache_refresh_worker(cache_state, dirty_users_rx).await;
     });
 
     // Background metrics refresh (same as before)

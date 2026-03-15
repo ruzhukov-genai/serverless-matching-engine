@@ -211,10 +211,10 @@ pub async fn create_order(
         "created_at": now.to_rfc3339(),
     });
 
-    // Queue the order for the worker
+    // Queue the order for the worker — per-pair queue for parallel consumption
     let mut conn = s.dragonfly.get().await?;
     let order_str = serde_json::to_string(&order_json)?;
-    conn.lpush::<_, _, ()>("queue:orders", &order_str).await?;
+    conn.lpush::<_, _, ()>(format!("queue:orders:{}", req.pair_id), &order_str).await?;
 
     tracing::info!(
         order_id = %order_id,
@@ -223,12 +223,13 @@ pub async fn create_order(
         "order queued for processing"
     );
 
-    // Return 202 Accepted with the order details
+    // Return 201 Created — order accepted and queued
     Ok((
-        StatusCode::ACCEPTED,
+        StatusCode::CREATED,
         Json(json!({
             "order": {
                 "id": order_id.to_string(),
+                "status": "Pending",
                 "user_id": user_id,
                 "pair_id": req.pair_id,
                 "side": format!("{:?}", req.side),

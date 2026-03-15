@@ -740,14 +740,36 @@ pub async fn match_order_lua(
 
     let mut conn = pool.get().await.context("pool.get")?;
 
-    // ── Phase 1: fetch resting order IDs from opposite book ──────────────────
+    // ── Phase 1: price-bounded fetch of resting order IDs ────────────────────
+    // For Limit orders we only need counterparty orders that can match our price.
+    // Ask scores are positive (score = price_i). Bid scores are negative (score = -price_i).
+    // Limit=50 — matching more than 50 levels in one shot is extremely rare.
+    let (phase1_min, phase1_max) = match (order.side, order.price) {
+        (Side::Buy, Some(price)) => {
+            // Buying: match asks where ask_price <= our bid price.
+            // Ask scores are positive (score = price_i as f64), so score ≤ our price_i.
+            let max = decimal_to_i64(price) as f64;
+            ("-inf".to_string(), max.to_string())
+        }
+        (Side::Sell, Some(price)) => {
+            // Selling: match bids where bid_price >= our ask price.
+            // Bid scores are negative (score = -price_i as f64), so score ≤ -our price_i.
+            let max = -(decimal_to_i64(price) as f64);
+            ("-inf".to_string(), max.to_string())
+        }
+        _ => {
+            // Market orders (no price) — match everything
+            ("-inf".to_string(), "+inf".to_string())
+        }
+    };
+
     let resting_ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
         .arg(opp_key)
-        .arg("-inf")
-        .arg("+inf")
+        .arg(&phase1_min)
+        .arg(&phase1_max)
         .arg("LIMIT")
         .arg(0i64)
-        .arg(100i64)
+        .arg(50i64)
         .query_async(&mut *conn)
         .await
         .context("ZRANGEBYSCORE resting ids")?;

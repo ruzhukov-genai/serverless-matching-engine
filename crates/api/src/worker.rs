@@ -1,4 +1,4 @@
-//! Worker module — consumes orders from queue:orders and updates cache keys.
+//! Worker module — consumes orders from per-pair queues and updates cache keys.
 
 use deadpool_redis::redis::AsyncCommands;
 use serde_json::{json, Value};
@@ -7,6 +7,7 @@ use rust_decimal::Decimal;
 use std::str::FromStr;
 use uuid::Uuid;
 use sqlx::Row;
+use tokio::sync::mpsc;
 
 use sme_shared::{
     cache, metrics, Order, OrderStatus, OrderType, Side,
@@ -17,9 +18,79 @@ use crate::{AppState, routes::{PersistJob, validate_order_request, insert_order_
 
 const PAIRS: &[&str] = &["BTC-USDT", "ETH-USDT", "SOL-USDT"];
 
-/// Main order queue consumer — processes orders from queue:orders.
+/// Main order queue consumer — spawns one task per pair plus a fallback task.
+///
+/// Per-pair tasks do BRPOP on `queue:orders:{pair_id}`.
+/// Fallback task does BRPOP on `queue:orders` for backward-compat.
+/// Cancellation consumers: one per pair on `queue:cancellations:{pair_id}` + fallback.
 pub async fn order_queue_consumer(state: AppState) {
-    tracing::info!("order queue consumer started");
+    tracing::info!("order queue consumer starting per-pair tasks");
+
+    // Spawn one order consumer per pair
+    for &pair in PAIRS {
+        let s = state.clone();
+        let pair_str = pair.to_string();
+        tokio::spawn(async move {
+            pair_order_consumer(s, pair_str).await;
+        });
+    }
+
+    // Spawn one cancellation consumer per pair
+    for &pair in PAIRS {
+        let s = state.clone();
+        let pair_str = pair.to_string();
+        tokio::spawn(async move {
+            pair_cancellation_consumer(s, pair_str).await;
+        });
+    }
+
+    // Fallback cancellation consumer — handles queue:cancellations
+    {
+        let s = state.clone();
+        tokio::spawn(async move {
+            fallback_cancellation_consumer(s).await;
+        });
+    }
+
+    // Fallback order consumer — handles legacy queue:orders (runs in this task)
+    fallback_order_consumer(state).await;
+}
+
+/// BRPOP loop for a single pair's order queue: `queue:orders:{pair_id}`.
+async fn pair_order_consumer(state: AppState, pair_id: String) {
+    let queue_key = format!("queue:orders:{}", pair_id);
+    tracing::info!(pair_id = %pair_id, queue = %queue_key, "pair order consumer started");
+
+    loop {
+        let mut conn = match state.dragonfly.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, pair_id = %pair_id, "failed to get dragonfly connection");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
+        let result: Option<(String, String)> = match conn.brpop(&queue_key, 1.0).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "BRPOP timeout or error");
+                None
+            }
+        };
+
+        if let Some((_key, order_str)) = result
+            && let Err(e) = process_queued_order(&state, &order_str).await
+        {
+            tracing::error!(error = %e, order_str = %order_str, "failed to process order");
+        }
+    }
+}
+
+/// BRPOP loop for a single pair's cancellation queue: `queue:cancellations:{pair_id}`.
+async fn pair_cancellation_consumer(state: AppState, pair_id: String) {
+    let queue_key = format!("queue:cancellations:{}", pair_id);
+    tracing::info!(pair_id = %pair_id, queue = %queue_key, "pair cancellation consumer started");
 
     loop {
         let mut conn = match state.dragonfly.get().await {
@@ -31,7 +102,36 @@ pub async fn order_queue_consumer(state: AppState) {
             }
         };
 
-        // BRPOP blocks until an order is available (1s timeout)
+        let result: Option<(String, String)> = match conn.brpop(&queue_key, 1.0).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "BRPOP cancellation timeout or error");
+                None
+            }
+        };
+
+        if let Some((_key, cancel_str)) = result
+            && let Err(e) = process_cancellation(&state, &cancel_str).await
+        {
+            tracing::error!(error = %e, cancel_str = %cancel_str, "failed to process cancellation");
+        }
+    }
+}
+
+/// Fallback BRPOP loop on `queue:orders` — backward compat for old producers.
+async fn fallback_order_consumer(state: AppState) {
+    tracing::info!("fallback order consumer started on queue:orders");
+
+    loop {
+        let mut conn = match state.dragonfly.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to get dragonfly connection");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
         let result: Option<(String, String)> = match conn.brpop("queue:orders", 1.0).await {
             Ok(v) => v,
             Err(e) => {
@@ -39,15 +139,39 @@ pub async fn order_queue_consumer(state: AppState) {
                 None
             }
         };
+
         if let Some((_key, order_str)) = result
             && let Err(e) = process_queued_order(&state, &order_str).await
         {
             tracing::error!(error = %e, order_str = %order_str, "failed to process order");
         }
+    }
+}
 
-        // Also try to process a cancellation (non-blocking via RPOP)
-        let cancel: Option<String> = conn.rpop("queue:cancellations", None).await.unwrap_or(None);
-        if let Some(cancel_str) = cancel
+/// Fallback BRPOP loop on `queue:cancellations` — catches cancellations from gateway
+/// that don't know the pair_id.
+async fn fallback_cancellation_consumer(state: AppState) {
+    tracing::info!("fallback cancellation consumer started on queue:cancellations");
+
+    loop {
+        let mut conn = match state.dragonfly.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to get dragonfly connection");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
+        let result: Option<(String, String)> = match conn.brpop("queue:cancellations", 1.0).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "BRPOP cancellation timeout or error");
+                None
+            }
+        };
+
+        if let Some((_key, cancel_str)) = result
             && let Err(e) = process_cancellation(&state, &cancel_str).await
         {
             tracing::error!(error = %e, cancel_str = %cancel_str, "failed to process cancellation");
@@ -126,17 +250,15 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
     };
 
     // 1. Validate (outside lock) — uses in-memory cache, zero DB round-trips
-    let pre_lock_start = std::time::Instant::now();
     validate_order_request(&state.pairs_cache, &order)
         .map_err(|e| anyhow::anyhow!("validation failed: {}", e))?;
 
-    // 2. Insert to DB (outside lock — unique constraint enforces idempotency)
-    insert_order_db(&state.pg, &order).await?;
-
-    // 3. Lock balance in DB (outside lock)
-    lock_balance(&state.pg, &order).await
-        .map_err(|e| anyhow::anyhow!("lock balance failed: {}", e))?;
-    
+    // 2+3. Insert to DB and lock balance in parallel — both are independent operations
+    let pre_lock_start = std::time::Instant::now();
+    tokio::try_join!(
+        insert_order_db(&state.pg, &order),
+        lock_balance(&state.pg, &order),
+    ).map_err(|e| anyhow::anyhow!("pre-match DB ops failed: {}", e))?;
     let _pre_lock_ms = pre_lock_start.elapsed().as_millis() as u64;
 
     // 4. Match the order using Lua atomic EVAL
@@ -163,13 +285,13 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
     // Metrics (best-effort)
     {
         let pool = state.dragonfly.clone();
-        let pair_id = pair_id.to_string();
+        let pair_id_owned = pair_id.to_string();
         tokio::spawn(async move {
-            let _ = metrics::record_match_latency(&pool, &pair_id, lua_ms).await;
-            let _ = metrics::record_lock_wait(&pool, &pair_id, 0).await;
-            let _ = metrics::increment_order_count(&pool, &pair_id).await;
+            let _ = metrics::record_match_latency(&pool, &pair_id_owned, lua_ms).await;
+            let _ = metrics::record_lock_wait(&pool, &pair_id_owned, 0).await;
+            let _ = metrics::increment_order_count(&pool, &pair_id_owned).await;
             if trade_count > 0 {
-                let _ = metrics::increment_trade_count(&pool, &pair_id, trade_count as u64).await;
+                let _ = metrics::increment_trade_count(&pool, &pair_id_owned, trade_count as u64).await;
             }
         });
     }
@@ -197,6 +319,17 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
 
     // Build trade JSON synchronously from Trade structs — no DB round-trip needed
     let trade_jsons: Vec<Value> = trades.iter().map(trade_to_json).collect();
+
+    // Notify dirty-user channel: order owner + counterparties need portfolio refresh
+    let _ = state.dirty_users_tx.try_send(user_id.clone());
+    for lt in &lua_result.trades {
+        if lt.buyer_id != user_id {
+            let _ = state.dirty_users_tx.try_send(lt.buyer_id.clone());
+        }
+        if lt.seller_id != user_id {
+            let _ = state.dirty_users_tx.try_send(lt.seller_id.clone());
+        }
+    }
 
     // Send persist job to background worker (non-blocking)
     let job = PersistJob {
@@ -303,6 +436,9 @@ async fn process_cancellation(state: &AppState, cancel_str: &str) -> anyhow::Res
             sqlx::query("UPDATE balances SET locked = locked - $1, available = available + $1 WHERE user_id = $2 AND asset = $3")
                 .bind(amount).bind(user_id).bind(asset).execute(&state.pg_bg).await?;
 
+            // Mark user portfolio as dirty
+            let _ = state.dirty_users_tx.try_send(user_id.to_string());
+
             tracing::info!(%order_id, "order cancelled");
         }
         "modify" => {
@@ -319,7 +455,11 @@ async fn process_cancellation(state: &AppState, cancel_str: &str) -> anyhow::Res
             if let Some(new_order) = cancel_json.get("new_order") {
                 let mut conn = state.dragonfly.get().await?;
                 let order_str = serde_json::to_string(new_order)?;
-                conn.lpush::<_, _, ()>("queue:orders", &order_str).await?;
+                // Try to route to per-pair queue if pair_id available
+                let pair_id = new_order.get("pair_id").and_then(|v| v.as_str());
+                let queue = pair_id.map(|p| format!("queue:orders:{}", p))
+                    .unwrap_or_else(|| "queue:orders".to_string());
+                conn.lpush::<_, _, ()>(queue, &order_str).await?;
                 tracing::info!(old_order_id = %order_id_str, "modify: replacement order queued");
             }
         }
@@ -360,11 +500,22 @@ async fn update_order_cache_after_processing(
     order: &Order,
     trade_jsons: &[Value],
 ) -> anyhow::Result<()> {
+    // Skip orderbook rebuild if there were no trades and the order didn't rest.
+    // e.g. IOC that didn't match — no book mutation occurred.
+    let order_rested = order.status == OrderStatus::New
+        || order.status == OrderStatus::PartiallyFilled;
+    let had_trades = !trade_jsons.is_empty();
+
+    if !had_trades && !order_rested {
+        // No book change — skip the reload entirely
+        return Ok(());
+    }
+
     let mut conn = state.dragonfly.get().await?;
 
-    // Update cache:orderbook:{pair} - refresh from Dragonfly orderbook data
-    let bids = sme_shared::cache::load_order_book_batched(&state.dragonfly, &order.pair_id, Side::Buy, 0, 200).await?;
-    let asks = sme_shared::cache::load_order_book_batched(&state.dragonfly, &order.pair_id, Side::Sell, 0, 200).await?;
+    // Rebuild orderbook cache: load top-50 levels each side (UI shows ~20 levels)
+    let bids = sme_shared::cache::load_order_book_batched(&state.dragonfly, &order.pair_id, Side::Buy, 0, 50).await?;
+    let asks = sme_shared::cache::load_order_book_batched(&state.dragonfly, &order.pair_id, Side::Sell, 0, 50).await?;
     
     let bids_agg = aggregate_levels(bids);
     let asks_agg = aggregate_levels(asks);
@@ -378,7 +529,7 @@ async fn update_order_cache_after_processing(
     conn.set::<_, _, ()>(format!("cache:orderbook:{}", order.pair_id), &orderbook_str).await?;
 
     // Emit order event to broadcast channel
-    if !trade_jsons.is_empty() {
+    if had_trades {
         let event_msg = serde_json::to_string(&json!({
             "type": "order_created",
             "user_id": order.user_id,
@@ -404,12 +555,16 @@ fn aggregate_levels(orders: Vec<Order>) -> Vec<Value> {
 }
 
 /// Background cache refresh worker — updates ticker, trades, portfolio, metrics.
-pub async fn cache_refresh_worker(state: AppState) {
+///
+/// Ticker/trades: polled every 5s (sub-second freshness not required).
+/// Portfolio: only updates users marked dirty by order processing.
+pub async fn cache_refresh_worker(state: AppState, mut dirty_users_rx: mpsc::Receiver<String>) {
     use tokio::time::{Duration, interval};
     
     tracing::info!("cache refresh worker started");
     
-    let mut ticker = interval(Duration::from_secs(2));
+    // 5s interval — ticker/trades don't need sub-second freshness
+    let mut ticker = interval(Duration::from_secs(5));
 
     loop {
         ticker.tick().await;
@@ -424,9 +579,16 @@ pub async fn cache_refresh_worker(state: AppState) {
             tracing::warn!(error = %e, "failed to update trades caches");
         }
 
-        // Update portfolio caches for all users
-        if let Err(e) = update_portfolio_caches(&state).await {
-            tracing::warn!(error = %e, "failed to update portfolio caches");
+        // Drain dirty users and update only those portfolios
+        let mut dirty: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while let Ok(uid) = dirty_users_rx.try_recv() {
+            dirty.insert(uid);
+        }
+
+        if !dirty.is_empty() {
+            if let Err(e) = update_portfolio_caches_for_users(&state, &dirty).await {
+                tracing::warn!(error = %e, "failed to update portfolio caches");
+            }
         }
     }
 }
@@ -519,28 +681,34 @@ async fn update_trades_caches(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn update_portfolio_caches(state: &AppState) -> anyhow::Result<()> {
-    let mut conn = state.dragonfly.get().await?;
-
-    // Get all users with balances
-    let rows = sqlx::query(
-        "SELECT user_id, asset, available, locked FROM balances ORDER BY user_id, asset",
-    )
-    .fetch_all(&state.pg_bg)
-    .await?;
-
-    let mut by_user: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
-    for r in &rows {
-        let uid: String = r.get("user_id");
-        by_user.entry(uid).or_default().push(json!({
-            "user_id": r.get::<String, _>("user_id"),
-            "asset": r.get::<String, _>("asset"),
-            "available": r.get::<Decimal, _>("available").to_string(),
-            "locked": r.get::<Decimal, _>("locked").to_string(),
-        }));
+/// Update portfolio caches only for the given dirty user IDs.
+async fn update_portfolio_caches_for_users(
+    state: &AppState,
+    user_ids: &std::collections::HashSet<String>,
+) -> anyhow::Result<()> {
+    if user_ids.is_empty() {
+        return Ok(());
     }
 
-    for (user_id, balances) in by_user {
+    let mut conn = state.dragonfly.get().await?;
+
+    for user_id in user_ids {
+        let rows = sqlx::query(
+            "SELECT user_id, asset, available, locked FROM balances WHERE user_id = $1 ORDER BY asset",
+        )
+        .bind(user_id)
+        .fetch_all(&state.pg_bg)
+        .await?;
+
+        let balances: Vec<Value> = rows.iter().map(|r| {
+            json!({
+                "user_id": r.get::<String, _>("user_id"),
+                "asset": r.get::<String, _>("asset"),
+                "available": r.get::<Decimal, _>("available").to_string(),
+                "locked": r.get::<Decimal, _>("locked").to_string(),
+            })
+        }).collect();
+
         let portfolio_json = json!({"balances": balances});
         let portfolio_str = serde_json::to_string(&portfolio_json)?;
         conn.set::<_, _, ()>(format!("cache:portfolio:{}", user_id), &portfolio_str).await?;
