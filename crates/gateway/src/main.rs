@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
@@ -12,13 +13,13 @@ use tracing_subscriber::EnvFilter;
 mod routes;
 
 /// Per-key cache entry: watch channel for zero-contention reads + broadcast for WS fan-out.
-struct CacheEntry {
+/// Values stored as Arc<str> — borrow() returns a refcount bump, zero allocation on read path.
+pub(crate) struct CacheEntry {
     /// WS fan-out — subscribers get pushed new values
-    broadcast_tx: broadcast::Sender<String>,
+    broadcast_tx: broadcast::Sender<Arc<str>>,
     /// Watch channel — REST handlers borrow() with zero allocation, no lock contention.
-    /// Replaces the old RwLock<HashMap> which serialized all reads behind writer locks.
-    watch_tx: tokio::sync::watch::Sender<Option<String>>,
-    watch_rx: tokio::sync::watch::Receiver<Option<String>>,
+    watch_tx: tokio::sync::watch::Sender<Option<Arc<str>>>,
+    watch_rx: tokio::sync::watch::Receiver<Option<Arc<str>>>,
 }
 
 /// Shared cache broadcasts — one poller per key, N subscribers.
@@ -26,26 +27,27 @@ struct CacheEntry {
 /// WS handlers subscribe to the broadcast channel.
 #[derive(Clone)]
 pub struct CacheBroadcasts {
-    entries: Arc<HashMap<String, Arc<CacheEntry>>>,
+    pub entries: Arc<HashMap<String, Arc<CacheEntry>>>,
 }
 
 impl CacheBroadcasts {
     /// Subscribe to updates for a cache key. Returns None if the key is unknown.
-    pub fn subscribe(&self, key: &str) -> Option<broadcast::Receiver<String>> {
+    pub fn subscribe(&self, key: &str) -> Option<broadcast::Receiver<Arc<str>>> {
         self.entries.get(key).map(|e| e.broadcast_tx.subscribe())
     }
 
     /// Get the last polled value for a cache key.
-    /// Uses watch::borrow() — no async, no lock, no allocation beyond the clone.
-    pub async fn get_latest(&self, key: &str) -> Option<String> {
+    /// Uses watch::borrow() — returns Arc<str> clone (refcount bump only, zero allocation).
+    pub fn get_latest(&self, key: &str) -> Option<Arc<str>> {
         self.entries.get(key).and_then(|e| e.watch_rx.borrow().clone())
     }
 
     /// Update a cache key (called by pollers). Sends to both watch + broadcast.
     fn update(&self, key: &str, val: String) {
         if let Some(e) = self.entries.get(key) {
-            let _ = e.watch_tx.send(Some(val.clone()));
-            let _ = e.broadcast_tx.send(val);
+            let arc_val: Arc<str> = Arc::from(val);
+            let _ = e.watch_tx.send(Some(arc_val.clone()));
+            let _ = e.broadcast_tx.send(arc_val);
         }
     }
 }
@@ -85,6 +87,8 @@ async fn spawn_cache_poller(
     }
 }
 
+// Default worker_threads = num_cpus (2 on this machine).
+// Tested worker_threads=8: context-switch overhead on 2 vCPUs caused regression.
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -95,7 +99,15 @@ async fn main() -> Result<()> {
     tracing::info!("sme-gateway starting");
 
     let config = sme_shared::Config::from_env();
-    let dragonfly = sme_shared::cache::create_pool(&config.dragonfly_url).await?;
+    // Gateway needs far fewer connections than default (200):
+    // - 15 cache pollers (1 each)
+    // - Order LPUSH burst (~5 concurrent)
+    // - Per-user fallback reads (declining with TTL cache)
+    // Gateway needs fewer connections than default (200):
+    // - 15 cache pollers (transient checkout per interval)
+    // - Order LPUSH burst (~10 concurrent at peak)
+    // - Per-user fallback reads (declining with TTL cache)
+    let dragonfly = sme_shared::cache::create_pool_sized(&config.dragonfly_url, 30).await?;
 
     // Order events broadcast — single channel, WS clients filter by user_id
     let (order_events_tx, _) = broadcast::channel::<String>(1024);
@@ -118,8 +130,8 @@ async fn main() -> Result<()> {
     let mut entries: HashMap<String, Arc<CacheEntry>> = HashMap::new();
 
     for (key, _interval_ms) in &poll_specs {
-        let (broadcast_tx, _) = broadcast::channel::<String>(64);
-        let (watch_tx, watch_rx) = tokio::sync::watch::channel(None);
+        let (broadcast_tx, _) = broadcast::channel::<Arc<str>>(64);
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel::<Option<Arc<str>>>(None);
         entries.insert(key.clone(), Arc::new(CacheEntry {
             broadcast_tx,
             watch_tx,
@@ -173,6 +185,8 @@ async fn main() -> Result<()> {
         // Serve static files
         .nest_service("/trading", ServeDir::new("web/trading"))
         .nest_service("/dashboard", ServeDir::new("web/dashboard"))
+        // CompressionLayer removed: on 2-vCPU machine, gzip CPU cost exceeds
+        // bandwidth savings for small cached JSON responses. Net regression.
         .layer(CorsLayer::permissive())
         .with_state(state);
 

@@ -4,8 +4,8 @@
 
 use axum::{
     extract::{Path, Query, State, WebSocketUpgrade, ws::Message, ws::WebSocket},
-    http::StatusCode,
-    response::{IntoResponse, Json},
+    http::{StatusCode, header},
+    response::{IntoResponse, Json, Response},
 };
 use chrono::Utc;
 use deadpool_redis::redis::AsyncCommands;
@@ -13,8 +13,8 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use std::sync::{Arc, RwLock};
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use sme_shared::{OrderType, Side, SelfTradePreventionMode, TimeInForce};
@@ -29,6 +29,8 @@ const USER_CACHE_TTL_MS: u128 = 2_000;
 
 #[derive(Clone)]
 pub struct UserCache {
+    // Uses std::sync::RwLock (not tokio) — critical section is a HashMap lookup,
+    // never holds across .await. std::sync avoids async scheduler overhead.
     inner: Arc<RwLock<HashMap<String, (std::time::Instant, String)>>>,
 }
 
@@ -39,7 +41,7 @@ impl UserCache {
 
     /// Get cached value if TTL hasn't expired.
     pub async fn get(&self, key: &str) -> Option<String> {
-        let map = self.inner.read().await;
+        let map = self.inner.read().unwrap();
         if let Some((ts, val)) = map.get(key) {
             if ts.elapsed().as_millis() < USER_CACHE_TTL_MS {
                 return Some(val.clone());
@@ -50,7 +52,7 @@ impl UserCache {
 
     /// Store a value with current timestamp.
     pub async fn set(&self, key: String, val: String) {
-        let mut map = self.inner.write().await;
+        let mut map = self.inner.write().unwrap();
         map.insert(key, (std::time::Instant::now(), val));
         // Evict stale entries if map grows large (>1000 entries)
         if map.len() > 1000 {
@@ -96,14 +98,34 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
 
 type HandlerResult<T> = Result<T, AppError>;
 
+/// Return a pre-serialized JSON string as a response without parse→reserialize overhead.
+/// Skips serde_json::from_str + Json() which was the dominant per-request cost.
+#[inline]
+fn raw_json(body: impl Into<String>) -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body.into(),
+    ).into_response()
+}
+
+/// Return a pre-serialized Arc<str> JSON as response — zero-copy from cache.
+#[inline]
+fn raw_json_arc(body: &std::sync::Arc<str>) -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    ).into_response()
+}
+
 // ── GET /api/pairs ────────────────────────────────────────────────────────────
 
-pub async fn list_pairs(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    if let Some(cached) = s.cache.get_latest("cache:pairs").await {
-        let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({"pairs": []}));
-        return Ok(Json(parsed));
+pub async fn list_pairs(State(s): State<AppState>) -> HandlerResult<Response> {
+    if let Some(cached) = s.cache.get_latest("cache:pairs") {
+        return Ok(raw_json_arc(&cached));
     }
-    Ok(Json(json!({"pairs": []})))
+    Ok(raw_json(r#"{"pairs":[]}"#))
 }
 
 // ── GET /api/orderbook/{pair_id} ──────────────────────────────────────────────
@@ -111,21 +133,12 @@ pub async fn list_pairs(State(s): State<AppState>) -> HandlerResult<impl IntoRes
 pub async fn get_orderbook(
     Path(pair_id): Path<String>,
     State(s): State<AppState>,
-) -> HandlerResult<impl IntoResponse> {
+) -> HandlerResult<Response> {
     let cache_key = format!("cache:orderbook:{}", pair_id);
-    if let Some(cached) = s.cache.get_latest(&cache_key).await {
-        let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({
-            "pair": pair_id,
-            "bids": [],
-            "asks": []
-        }));
-        return Ok(Json(parsed));
+    if let Some(cached) = s.cache.get_latest(&cache_key) {
+        return Ok(raw_json_arc(&cached));
     }
-    Ok(Json(json!({
-        "pair": pair_id,
-        "bids": [],
-        "asks": []
-    })))
+    Ok(raw_json(format!(r#"{{"pair":"{}","bids":[],"asks":[]}}"#, pair_id)))
 }
 
 // ── GET /api/trades/{pair_id} ─────────────────────────────────────────────────
@@ -133,19 +146,12 @@ pub async fn get_orderbook(
 pub async fn get_trades(
     Path(pair_id): Path<String>,
     State(s): State<AppState>,
-) -> HandlerResult<impl IntoResponse> {
+) -> HandlerResult<Response> {
     let cache_key = format!("cache:trades:{}", pair_id);
-    if let Some(cached) = s.cache.get_latest(&cache_key).await {
-        let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({
-            "pair": pair_id,
-            "trades": []
-        }));
-        return Ok(Json(parsed));
+    if let Some(cached) = s.cache.get_latest(&cache_key) {
+        return Ok(raw_json_arc(&cached));
     }
-    Ok(Json(json!({
-        "pair": pair_id,
-        "trades": []
-    })))
+    Ok(raw_json(format!(r#"{{"pair":"{}","trades":[]}}"#, pair_id)))
 }
 
 // ── GET /api/ticker/{pair_id} ─────────────────────────────────────────────────
@@ -153,25 +159,15 @@ pub async fn get_trades(
 pub async fn get_ticker(
     Path(pair_id): Path<String>,
     State(s): State<AppState>,
-) -> HandlerResult<impl IntoResponse> {
+) -> HandlerResult<Response> {
     let cache_key = format!("cache:ticker:{}", pair_id);
-    if let Some(cached) = s.cache.get_latest(&cache_key).await {
-        let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({
-            "pair": pair_id,
-            "last": null,
-            "high_24h": null,
-            "low_24h": null,
-            "volume_24h": null
-        }));
-        return Ok(Json(parsed));
+    if let Some(cached) = s.cache.get_latest(&cache_key) {
+        return Ok(raw_json_arc(&cached));
     }
-    Ok(Json(json!({
-        "pair": pair_id,
-        "last": null,
-        "high_24h": null,
-        "low_24h": null,
-        "volume_24h": null
-    })))
+    Ok(raw_json(format!(
+        r#"{{"pair":"{}","last":null,"high_24h":null,"low_24h":null,"volume_24h":null}}"#,
+        pair_id
+    )))
 }
 
 // ── POST /api/orders ──────────────────────────────────────────────────────────
@@ -266,23 +262,22 @@ pub async fn create_order(
 pub struct OrdersQuery {
     pub user_id: Option<String>,
     pub pair_id: Option<String>,
+    #[allow(dead_code)]
     pub limit: Option<i64>,
+    #[allow(dead_code)]
     pub offset: Option<i64>,
 }
 
 pub async fn list_orders(
     Query(q): Query<OrdersQuery>,
     State(s): State<AppState>,
-) -> HandlerResult<impl IntoResponse> {
+) -> HandlerResult<Response> {
     let user_id = q.user_id.unwrap_or_else(|| "user-1".to_string());
     let cache_key = format!("cache:orders:{}", user_id);
 
     // Check gateway-side TTL cache first (avoids Dragonfly round-trip)
     if let Some(cached) = s.user_cache.get(&cache_key).await {
-        let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({
-            "orders": [], "total": 0, "limit": 50, "offset": 0
-        }));
-        return Ok(Json(parsed));
+        return Ok(raw_json(cached));
     }
 
     // Fallback to Dragonfly
@@ -291,18 +286,10 @@ pub async fn list_orders(
 
     if cached != "{}" {
         s.user_cache.set(cache_key, cached.clone()).await;
-        let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({
-            "orders": [], "total": 0, "limit": 50, "offset": 0
-        }));
-        return Ok(Json(parsed));
+        return Ok(raw_json(cached));
     }
 
-    Ok(Json(json!({
-        "orders": [],
-        "total": 0,
-        "limit": q.limit.unwrap_or(50),
-        "offset": q.offset.unwrap_or(0)
-    })))
+    Ok(raw_json(r#"{"orders":[],"total":0,"limit":50,"offset":0}"#))
 }
 
 // ── DELETE /api/orders/{order_id} ─────────────────────────────────────────────
@@ -385,14 +372,13 @@ pub struct PortfolioQuery {
 pub async fn get_portfolio(
     Query(q): Query<PortfolioQuery>,
     State(s): State<AppState>,
-) -> HandlerResult<impl IntoResponse> {
+) -> HandlerResult<Response> {
     let user_id = q.user_id.unwrap_or_else(|| "user-1".to_string());
     let cache_key = format!("cache:portfolio:{}", user_id);
 
     // Check gateway-side TTL cache first
     if let Some(cached) = s.user_cache.get(&cache_key).await {
-        let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({"balances": []}));
-        return Ok(Json(parsed));
+        return Ok(raw_json(cached));
     }
 
     // Fallback to Dragonfly
@@ -401,53 +387,37 @@ pub async fn get_portfolio(
 
     if cached != "{}" {
         s.user_cache.set(cache_key, cached.clone()).await;
-        let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({"balances": []}));
-        return Ok(Json(parsed));
+        return Ok(raw_json(cached));
     }
 
-    Ok(Json(json!({"balances": []})))
+    Ok(raw_json(r#"{"balances":[]}"#))
 }
 
 // ── Dashboard API — read from CacheBroadcasts (zero Dragonfly) ────────────────
 
-pub async fn get_metrics(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let cached = s.cache.get_latest("cache:metrics").await;
-    let parsed: Value = cached
-        .and_then(|v| serde_json::from_str(&v).ok())
-        .unwrap_or(json!({}));
-    Ok(Json(parsed))
+pub async fn get_metrics(State(s): State<AppState>) -> HandlerResult<Response> {
+    Ok(raw_json(s.cache.get_latest("cache:metrics")
+        .map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string())))
 }
 
-pub async fn get_lock_metrics(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let cached = s.cache.get_latest("cache:lock_metrics").await;
-    let parsed: Value = cached
-        .and_then(|v| serde_json::from_str(&v).ok())
-        .unwrap_or(json!({}));
-    Ok(Json(parsed))
+pub async fn get_lock_metrics(State(s): State<AppState>) -> HandlerResult<Response> {
+    Ok(raw_json(s.cache.get_latest("cache:lock_metrics")
+        .map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string())))
 }
 
-pub async fn get_throughput(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let cached = s.cache.get_latest("cache:throughput").await;
-    let parsed: Value = cached
-        .and_then(|v| serde_json::from_str(&v).ok())
-        .unwrap_or(json!({"series": []}));
-    Ok(Json(parsed))
+pub async fn get_throughput(State(s): State<AppState>) -> HandlerResult<Response> {
+    Ok(raw_json(s.cache.get_latest("cache:throughput")
+        .map(|v| v.to_string()).unwrap_or_else(|| r#"{"series":[]}"#.to_string())))
 }
 
-pub async fn get_latency_percentiles(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let cached = s.cache.get_latest("cache:latency_metrics").await;
-    let parsed: Value = cached
-        .and_then(|v| serde_json::from_str(&v).ok())
-        .unwrap_or(json!({}));
-    Ok(Json(parsed))
+pub async fn get_latency_percentiles(State(s): State<AppState>) -> HandlerResult<Response> {
+    Ok(raw_json(s.cache.get_latest("cache:latency_metrics")
+        .map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string())))
 }
 
-pub async fn get_audit(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let cached = s.cache.get_latest("cache:audit").await;
-    let parsed: Value = cached
-        .and_then(|v| serde_json::from_str(&v).ok())
-        .unwrap_or(json!({"audit": [], "events": []}));
-    Ok(Json(parsed))
+pub async fn get_audit(State(s): State<AppState>) -> HandlerResult<Response> {
+    Ok(raw_json(s.cache.get_latest("cache:audit")
+        .map(|v| v.to_string()).unwrap_or_else(|| r#"{"audit":[],"events":[]}"#.to_string())))
 }
 
 // ── WebSocket Feeds ───────────────────────────────────────────────────────────
@@ -465,8 +435,8 @@ async fn cache_broadcast_ws(
     };
 
     // Send the current value immediately so the client doesn't wait up to interval_ms
-    if let Some(val) = state.cache.get_latest(&cache_key).await {
-        if socket.send(Message::Text(val.into())).await.is_err() {
+    if let Some(val) = state.cache.get_latest(&cache_key) {
+        if socket.send(Message::Text(val.to_string().into())).await.is_err() {
             return;
         }
     }
@@ -476,7 +446,7 @@ async fn cache_broadcast_ws(
             result = rx.recv() => {
                 match result {
                     Ok(val) => {
-                        if socket.send(Message::Text(val.into())).await.is_err() {
+                        if socket.send(Message::Text(val.to_string().into())).await.is_err() {
                             return;
                         }
                     }

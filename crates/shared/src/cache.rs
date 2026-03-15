@@ -54,10 +54,16 @@ pub fn i64_to_decimal(i: i64) -> Decimal {
 // ── Pool ─────────────────────────────────────────────────────────────────────
 
 pub async fn create_pool(url: &str) -> Result<Pool> {
+    create_pool_sized(url, 200).await
+}
+
+/// Create a Dragonfly connection pool with a specific max size.
+/// Use smaller pools where fewer connections are needed (e.g. gateway: ~20).
+pub async fn create_pool_sized(url: &str, max_size: usize) -> Result<Pool> {
     let pool = DPConfig::from_url(url)
         .builder()
         .context("failed to create redis pool builder")?
-        .max_size(200)
+        .max_size(max_size)
         .wait_timeout(Some(Duration::from_secs(3)))
         .runtime(Runtime::Tokio1)
         .build()
