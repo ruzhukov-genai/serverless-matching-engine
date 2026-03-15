@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List
 
 BASE_URL = "http://localhost:3001"
-WS_BASE = "ws://localhost:3001"
+WS_BASE = "ws://127.0.0.1:3001"
 PAIR = "BTC-USDT"
 TEST_DURATION = 20  # seconds per phase
 CLIENT_COUNTS = [1, 5, 10, 25, 50, 100]
@@ -155,17 +155,24 @@ async def poll_rest(session, stats, deadline):
         await asyncio.sleep(2.0)
 
 async def ws_client(session, stats, path, deadline):
+    import websockets
     t0 = time.monotonic()
     try:
-        async with session.ws_connect(f"{WS_BASE}{path}", timeout=5) as ws:
-            ms = (time.monotonic() - t0) * 1000
-            stats.ws_connect.record(ms)
+        ws = await asyncio.wait_for(
+            websockets.connect(f"{WS_BASE}{path}"),
+            timeout=5
+        )
+        ms = (time.monotonic() - t0) * 1000
+        stats.ws_connect.record(ms)
+        try:
             while time.monotonic() < deadline:
                 try:
-                    msg = await asyncio.wait_for(ws.receive(), timeout=2.0)
-                    if msg.type == aiohttp.WSMsgType.TEXT: stats.ws_messages += 1
-                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR): break
+                    msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                    if isinstance(msg, str): stats.ws_messages += 1
                 except asyncio.TimeoutError: continue
+                except Exception: break
+        finally:
+            await asyncio.wait_for(ws.close(), timeout=1)
     except: stats.ws_connect.record_error()
 
 async def place_orders(session, stats, client_id, deadline):

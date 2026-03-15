@@ -454,29 +454,20 @@ async fn handle_orderbook_ws(pair_id: String, state: AppState, mut socket: WebSo
     use tokio::time::{Duration, interval};
     let mut ticker = interval(Duration::from_millis(500));
     let cache_key = format!("cache:orderbook:{}", pair_id);
-    tracing::debug!(pair_id = %pair_id, "orderbook WS connected");
-
     loop {
         ticker.tick().await;
-        tracing::debug!("orderbook WS tick");
 
         let cached: String = match state.dragonfly.get().await {
-            Ok(mut conn) => {
-                tracing::debug!("got DF conn");
-                match conn.get(&cache_key).await {
-                    Ok(v) => v,
-                    Err(e) => { tracing::warn!(error=%e, "GET failed"); continue; }
-                }
-            }
-            Err(e) => { tracing::warn!(error=%e, "pool get failed"); continue; }
+            Ok(mut conn) => match conn.get(&cache_key).await {
+                Ok(v) => v,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
         };
 
-        tracing::debug!(len = cached.len(), "sending");
         if !cached.is_empty() && cached != "{}" {
-            let msg = Message::Text(cached.into());
-            match socket.send(msg).await {
-                Ok(()) => tracing::debug!("sent ok"),
-                Err(e) => { tracing::warn!(error=%e, "send failed"); break; }
+            if socket.send(Message::Text(cached.into())).await.is_err() {
+                break;
             }
         }
     }
