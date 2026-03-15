@@ -1,18 +1,69 @@
 use anyhow::Result;
 use axum::{Router, routing::get};
 use deadpool_redis::Pool as RedisPool;
-use tokio::sync::broadcast;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
 
 mod routes;
 
+/// Shared cache broadcasts — one poller per key, N subscribers.
+/// REST handlers read from `latest` (zero Dragonfly ops).
+/// WS handlers subscribe to the broadcast channel.
+#[derive(Clone)]
+pub struct CacheBroadcasts {
+    senders: Arc<HashMap<String, broadcast::Sender<String>>>,
+    latest: Arc<RwLock<HashMap<String, String>>>,
+}
+
+impl CacheBroadcasts {
+    /// Subscribe to updates for a cache key. Returns None if the key is unknown.
+    pub fn subscribe(&self, key: &str) -> Option<broadcast::Receiver<String>> {
+        self.senders.get(key).map(|tx| tx.subscribe())
+    }
+
+    /// Get the last polled value for a cache key (zero Dragonfly, reads RAM).
+    pub async fn get_latest(&self, key: &str) -> Option<String> {
+        self.latest.read().await.get(key).cloned()
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub dragonfly: RedisPool,
     /// Order events broadcast — single channel, WS clients filter by user_id
     pub order_events_tx: broadcast::Sender<String>,
+    /// Shared cache broadcasts — one poller per key, N subscribers
+    pub cache: CacheBroadcasts,
+}
+
+/// Background poller: reads one key from Dragonfly at `interval_ms`, broadcasts to all subscribers,
+/// and stores the latest value in the shared `latest` map.
+async fn spawn_cache_poller(
+    pool: RedisPool,
+    key: String,
+    tx: broadcast::Sender<String>,
+    latest: Arc<RwLock<HashMap<String, String>>>,
+    interval_ms: u64,
+) {
+    use deadpool_redis::redis::AsyncCommands;
+    use tokio::time::{Duration, interval};
+
+    let mut ticker = interval(Duration::from_millis(interval_ms));
+    loop {
+        ticker.tick().await;
+        if let Ok(mut conn) = pool.get().await {
+            if let Ok(val) = conn.get::<_, String>(&key).await {
+                if !val.is_empty() && val != "{}" {
+                    latest.write().await.insert(key.clone(), val.clone());
+                    let _ = tx.send(val);
+                }
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -30,9 +81,45 @@ async fn main() -> Result<()> {
     // Order events broadcast — single channel, WS clients filter by user_id
     let (order_events_tx, _) = broadcast::channel::<String>(1024);
 
+    // ── Build CacheBroadcasts ─────────────────────────────────────────────────
+    let pairs = ["BTC-USDT", "ETH-USDT", "SOL-USDT"];
+
+    // Define all polled cache keys and their intervals (ms)
+    let mut poll_specs: Vec<(String, u64)> = Vec::new();
+    for pair in &pairs {
+        poll_specs.push((format!("cache:orderbook:{}", pair), 500));
+        poll_specs.push((format!("cache:trades:{}", pair), 500));
+        poll_specs.push((format!("cache:ticker:{}", pair), 1000));
+    }
+    for key in &["cache:metrics", "cache:lock_metrics", "cache:throughput", "cache:latency_metrics", "cache:audit"] {
+        poll_specs.push((key.to_string(), 2000));
+    }
+    poll_specs.push(("cache:pairs".to_string(), 5000));
+
+    let latest: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
+    let mut senders: HashMap<String, broadcast::Sender<String>> = HashMap::new();
+
+    for (key, interval_ms) in &poll_specs {
+        let (tx, _) = broadcast::channel::<String>(64);
+        senders.insert(key.clone(), tx.clone());
+        tokio::spawn(spawn_cache_poller(
+            dragonfly.clone(),
+            key.clone(),
+            tx,
+            Arc::clone(&latest),
+            *interval_ms,
+        ));
+    }
+
+    let cache = CacheBroadcasts {
+        senders: Arc::new(senders),
+        latest,
+    };
+
     let state = AppState {
         dragonfly,
         order_events_tx,
+        cache,
     };
 
     let app = Router::new()

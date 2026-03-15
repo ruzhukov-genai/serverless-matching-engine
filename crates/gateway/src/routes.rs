@@ -35,14 +35,12 @@ impl AppError {
     pub fn bad_request(e: impl Into<anyhow::Error>) -> Self {
         AppError { kind: AppErrorKind::BadRequest, inner: e.into() }
     }
-
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let status = match self.kind {
             AppErrorKind::BadRequest => StatusCode::BAD_REQUEST,
-
             AppErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
         tracing::error!("gateway error: {:?}", self.inner);
@@ -61,16 +59,10 @@ type HandlerResult<T> = Result<T, AppError>;
 // ── GET /api/pairs ────────────────────────────────────────────────────────────
 
 pub async fn list_pairs(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
-    let cached: String = conn.get("cache:pairs").await.unwrap_or_else(|_| "{}".to_string());
-    
-    // Return the cached JSON directly (worker pre-computes this)
-    if cached != "{}" {
+    if let Some(cached) = s.cache.get_latest("cache:pairs").await {
         let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({"pairs": []}));
         return Ok(Json(parsed));
     }
-    
-    // Fallback if cache is empty
     Ok(Json(json!({"pairs": []})))
 }
 
@@ -80,11 +72,8 @@ pub async fn get_orderbook(
     Path(pair_id): Path<String>,
     State(s): State<AppState>,
 ) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
     let cache_key = format!("cache:orderbook:{}", pair_id);
-    let cached: String = conn.get(&cache_key).await.unwrap_or_else(|_| "{}".to_string());
-    
-    if cached != "{}" {
+    if let Some(cached) = s.cache.get_latest(&cache_key).await {
         let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({
             "pair": pair_id,
             "bids": [],
@@ -92,8 +81,6 @@ pub async fn get_orderbook(
         }));
         return Ok(Json(parsed));
     }
-    
-    // Fallback empty orderbook
     Ok(Json(json!({
         "pair": pair_id,
         "bids": [],
@@ -107,19 +94,14 @@ pub async fn get_trades(
     Path(pair_id): Path<String>,
     State(s): State<AppState>,
 ) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
     let cache_key = format!("cache:trades:{}", pair_id);
-    let cached: String = conn.get(&cache_key).await.unwrap_or_else(|_| "{}".to_string());
-    
-    if cached != "{}" {
+    if let Some(cached) = s.cache.get_latest(&cache_key).await {
         let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({
             "pair": pair_id,
             "trades": []
         }));
         return Ok(Json(parsed));
     }
-    
-    // Fallback empty trades
     Ok(Json(json!({
         "pair": pair_id,
         "trades": []
@@ -132,11 +114,8 @@ pub async fn get_ticker(
     Path(pair_id): Path<String>,
     State(s): State<AppState>,
 ) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
     let cache_key = format!("cache:ticker:{}", pair_id);
-    let cached: String = conn.get(&cache_key).await.unwrap_or_else(|_| "{}".to_string());
-    
-    if cached != "{}" {
+    if let Some(cached) = s.cache.get_latest(&cache_key).await {
         let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({
             "pair": pair_id,
             "last": null,
@@ -146,8 +125,6 @@ pub async fn get_ticker(
         }));
         return Ok(Json(parsed));
     }
-    
-    // Fallback empty ticker
     Ok(Json(json!({
         "pair": pair_id,
         "last": null,
@@ -180,15 +157,12 @@ pub async fn create_order(
     let tif = req.tif.unwrap_or(TimeInForce::GTC);
     let stp_mode = req.stp_mode.unwrap_or(SelfTradePreventionMode::None);
 
-    // Basic validation (could load pairs from cache for more thorough validation)
     if req.quantity <= Decimal::ZERO {
         return Err(AppError::bad_request(anyhow::anyhow!("quantity must be positive")));
     }
-
     if req.order_type == OrderType::Limit && req.price.is_none() {
         return Err(AppError::bad_request(anyhow::anyhow!("limit orders require price")));
     }
-
     if req.order_type == OrderType::Market && req.price.is_some() {
         return Err(AppError::bad_request(anyhow::anyhow!("market orders cannot have price")));
     }
@@ -196,7 +170,6 @@ pub async fn create_order(
     let now = Utc::now();
     let order_id = Uuid::new_v4();
 
-    // Create order JSON for the queue
     let order_json = json!({
         "id": order_id.to_string(),
         "user_id": user_id,
@@ -211,7 +184,7 @@ pub async fn create_order(
         "created_at": now.to_rfc3339(),
     });
 
-    // Queue the order for the worker — per-pair queue for parallel consumption
+    // Queue the order for the worker (write path — direct Dragonfly)
     let mut conn = s.dragonfly.get().await?;
     let order_str = serde_json::to_string(&order_json)?;
     conn.lpush::<_, _, ()>(format!("queue:orders:{}", req.pair_id), &order_str).await?;
@@ -223,7 +196,6 @@ pub async fn create_order(
         "order queued for processing"
     );
 
-    // Return 201 Created — order accepted and queued
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -263,12 +235,12 @@ pub async fn list_orders(
     State(s): State<AppState>,
 ) -> HandlerResult<impl IntoResponse> {
     let user_id = q.user_id.unwrap_or_else(|| "user-1".to_string());
-    
-    // Get cached user orders (worker maintains this cache)
+
+    // Per-user cache — still goes direct to Dragonfly (user-specific, not shared)
     let mut conn = s.dragonfly.get().await?;
     let cache_key = format!("cache:orders:{}", user_id);
     let cached: String = conn.get(&cache_key).await.unwrap_or_else(|_| "{}".to_string());
-    
+
     if cached != "{}" {
         let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({
             "orders": [],
@@ -278,8 +250,7 @@ pub async fn list_orders(
         }));
         return Ok(Json(parsed));
     }
-    
-    // Fallback empty response
+
     Ok(Json(json!({
         "orders": [],
         "total": 0,
@@ -294,14 +265,12 @@ pub async fn cancel_order(
     Path(order_id): Path<Uuid>,
     State(s): State<AppState>,
 ) -> HandlerResult<impl IntoResponse> {
-    // Queue the cancellation request
     let mut conn = s.dragonfly.get().await?;
     let cancel_json = json!({
         "type": "cancel",
         "order_id": order_id.to_string(),
         "requested_at": Utc::now().to_rfc3339(),
     });
-    
     let cancel_str = serde_json::to_string(&cancel_json)?;
     conn.lpush::<_, _, ()>("queue:cancellations", &cancel_str).await?;
 
@@ -319,14 +288,12 @@ pub async fn modify_order(
     State(s): State<AppState>,
     Json(_req): Json<CreateOrderRequest>,
 ) -> HandlerResult<impl IntoResponse> {
-    // Queue the modification (which is cancel + new order)
     let mut conn = s.dragonfly.get().await?;
     let modify_json = json!({
         "type": "modify",
         "order_id": order_id.to_string(),
         "requested_at": Utc::now().to_rfc3339(),
     });
-    
     let modify_str = serde_json::to_string(&modify_json)?;
     conn.lpush::<_, _, ()>("queue:cancellations", &modify_str).await?;
 
@@ -345,7 +312,6 @@ pub async fn cancel_all_orders(
 ) -> HandlerResult<impl IntoResponse> {
     let user_id = q.user_id.unwrap_or_else(|| "user-1".to_string());
 
-    // Queue the cancel-all request
     let mut conn = s.dragonfly.get().await?;
     let cancel_all_json = json!({
         "type": "cancel_all",
@@ -353,7 +319,6 @@ pub async fn cancel_all_orders(
         "pair_id": q.pair_id,
         "requested_at": Utc::now().to_rfc3339(),
     });
-    
     let cancel_str = serde_json::to_string(&cancel_all_json)?;
     conn.lpush::<_, _, ()>("queue:cancellations", &cancel_str).await?;
 
@@ -377,96 +342,93 @@ pub async fn get_portfolio(
 ) -> HandlerResult<impl IntoResponse> {
     let user_id = q.user_id.unwrap_or_else(|| "user-1".to_string());
 
+    // Per-user cache — direct Dragonfly
     let mut conn = s.dragonfly.get().await?;
     let cache_key = format!("cache:portfolio:{}", user_id);
     let cached: String = conn.get(&cache_key).await.unwrap_or_else(|_| "{}".to_string());
-    
+
     if cached != "{}" {
         let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({"balances": []}));
         return Ok(Json(parsed));
     }
-    
-    // Fallback empty balances
+
     Ok(Json(json!({"balances": []})))
 }
 
-// ── Dashboard API ─────────────────────────────────────────────────────────────
+// ── Dashboard API — read from CacheBroadcasts (zero Dragonfly) ────────────────
 
 pub async fn get_metrics(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
-    let cached: String = conn.get("cache:metrics").await.unwrap_or_else(|_| "{}".to_string());
-    
-    let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({}));
+    let cached = s.cache.get_latest("cache:metrics").await;
+    let parsed: Value = cached
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or(json!({}));
     Ok(Json(parsed))
 }
 
 pub async fn get_lock_metrics(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
-    let cached: String = conn.get("cache:lock_metrics").await.unwrap_or_else(|_| "{}".to_string());
-    
-    let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({}));
+    let cached = s.cache.get_latest("cache:lock_metrics").await;
+    let parsed: Value = cached
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or(json!({}));
     Ok(Json(parsed))
 }
 
 pub async fn get_throughput(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
-    let cached: String = conn.get("cache:throughput").await.unwrap_or_else(|_| "{}".to_string());
-    
-    let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({"series": []}));
+    let cached = s.cache.get_latest("cache:throughput").await;
+    let parsed: Value = cached
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or(json!({"series": []}));
     Ok(Json(parsed))
 }
 
 pub async fn get_latency_percentiles(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
-    let cached: String = conn.get("cache:latency_metrics").await.unwrap_or_else(|_| "{}".to_string());
-    
-    let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({}));
+    let cached = s.cache.get_latest("cache:latency_metrics").await;
+    let parsed: Value = cached
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or(json!({}));
     Ok(Json(parsed))
 }
 
 pub async fn get_audit(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
-    let cached: String = conn.get("cache:audit").await.unwrap_or_else(|_| "{}".to_string());
-    
-    let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({"audit": [], "events": []}));
+    let cached = s.cache.get_latest("cache:audit").await;
+    let parsed: Value = cached
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or(json!({"audit": [], "events": []}));
     Ok(Json(parsed))
 }
 
 // ── WebSocket Feeds ───────────────────────────────────────────────────────────
 
-pub async fn ws_orderbook(
-    Path(pair_id): Path<String>,
-    State(s): State<AppState>,
-    ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_orderbook_ws(pair_id, s, socket))
-}
-
-/// Generic cache-polling WS handler — polls a Dragonfly key, sends to client,
-/// handles close/ping frames via select!
-async fn cache_poll_ws(
+/// Shared-broadcast WS handler — subscribes to a CacheBroadcasts channel
+/// instead of polling Dragonfly directly. One Dragonfly poller feeds N clients.
+async fn cache_broadcast_ws(
     cache_key: String,
     state: AppState,
     mut socket: WebSocket,
-    interval_ms: u64,
 ) {
-    use tokio::time::{Duration, interval};
-    let mut ticker = interval(Duration::from_millis(interval_ms));
+    let mut rx = match state.cache.subscribe(&cache_key) {
+        Some(rx) => rx,
+        None => return, // unknown key — no poller registered
+    };
+
+    // Send the current value immediately so the client doesn't wait up to interval_ms
+    if let Some(val) = state.cache.get_latest(&cache_key).await {
+        if socket.send(Message::Text(val.into())).await.is_err() {
+            return;
+        }
+    }
 
     loop {
         tokio::select! {
-            _ = ticker.tick() => {
-                let cached: String = match state.dragonfly.get().await {
-                    Ok(mut conn) => match conn.get(&cache_key).await {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    },
-                    Err(_) => continue,
-                };
-                if !cached.is_empty() && cached != "{}"
-                    && socket.send(Message::Text(cached.into())).await.is_err()
-                {
-                    return;
+            result = rx.recv() => {
+                match result {
+                    Ok(val) => {
+                        if socket.send(Message::Text(val.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
             msg = socket.recv() => {
@@ -482,9 +444,15 @@ async fn cache_poll_ws(
     }
 }
 
-async fn handle_orderbook_ws(pair_id: String, state: AppState, socket: WebSocket) {
-    let cache_key = format!("cache:orderbook:{}", pair_id);
-    cache_poll_ws(cache_key, state, socket, 500).await;
+pub async fn ws_orderbook(
+    Path(pair_id): Path<String>,
+    State(s): State<AppState>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| {
+        let cache_key = format!("cache:orderbook:{}", pair_id);
+        cache_broadcast_ws(cache_key, s, socket)
+    })
 }
 
 pub async fn ws_trades(
@@ -492,12 +460,10 @@ pub async fn ws_trades(
     State(s): State<AppState>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_trades_ws(pair_id, s, socket))
-}
-
-async fn handle_trades_ws(pair_id: String, state: AppState, socket: WebSocket) {
-    let cache_key = format!("cache:trades:{}", pair_id);
-    cache_poll_ws(cache_key, state, socket, 500).await;
+    ws.on_upgrade(move |socket| {
+        let cache_key = format!("cache:trades:{}", pair_id);
+        cache_broadcast_ws(cache_key, s, socket)
+    })
 }
 
 pub async fn ws_orders(
