@@ -703,18 +703,13 @@ fn redis_value_to_string(v: &redis::Value) -> Option<String> {
     }
 }
 
-/// Match an incoming order atomically inside Dragonfly via a two-phase approach:
+/// Match an incoming order atomically inside Dragonfly via a single EVAL round-trip.
 ///
-/// **Phase 1 (RT1):** `ZRANGEBYSCORE` — fetch up to 100 resting order IDs from
-///   the opposite book side. This gives us the candidate list.
+/// The Lua script calls ZRANGEBYSCORE internally to fetch resting order IDs,
+/// then accesses their hashes directly. Dragonfly (non-cluster) allows undeclared
+/// key access in scripts — no Phase 1 round-trip needed.
 ///
-/// **Phase 2 (RT2):** `EVAL` — the Lua script receives all resting order keys
-///   pre-declared in `KEYS[]` (Dragonfly enforces that scripts only access declared
-///   keys). It reads each resting order, runs price-time priority matching, commits
-///   all mutations (fills, partial fills, adding resting incoming order), and returns
-///   trade results — all atomically in a single script execution.
-///
-/// Total: 2 round-trips, no lock, no retry, no CAS version check.
+/// Total: 1 round-trip, no lock, no retry, no CAS version check.
 ///
 /// # FOK note
 /// FOK orders are NOT handled here. See the OCC/CAS path in routes.rs.
@@ -729,72 +724,39 @@ pub async fn match_order_lua(
     let version_key = format!("version:{}", order.pair_id);
     let incoming_order_key = format!("order:{}", order.id);
 
-    // Determine opposite book key (we read from opponent's side)
-    let opp_key = match order.side {
-        Side::Buy => &asks_key,
-        Side::Sell => &bids_key,
-    };
-
     let price_i = order.price.map(decimal_to_i64).unwrap_or(0);
     let score = order.book_score();
 
-    let mut conn = pool.get().await.context("pool.get")?;
-
-    // ── Phase 1: price-bounded fetch of resting order IDs ────────────────────
-    // For Limit orders we only need counterparty orders that can match our price.
-    // Ask scores are positive (score = price_i). Bid scores are negative (score = -price_i).
-    // Limit=50 — matching more than 50 levels in one shot is extremely rare.
-    let (phase1_min, phase1_max) = match (order.side, order.price) {
+    // Calculate price bound (max_score) for ZRANGEBYSCORE inside Lua.
+    // Ask scores are positive (+price_i). Bid scores are negative (-price_i).
+    let max_score = match (order.side, order.price) {
         (Side::Buy, Some(price)) => {
-            // Buying: match asks where ask_price <= our bid price.
-            // Ask scores are positive (score = price_i as f64), so score ≤ our price_i.
+            // Buying: match asks where ask_score <= our price_i
             let max = decimal_to_i64(price) as f64;
-            ("-inf".to_string(), max.to_string())
+            max.to_string()
         }
         (Side::Sell, Some(price)) => {
-            // Selling: match bids where bid_price >= our ask price.
-            // Bid scores are negative (score = -price_i as f64), so score ≤ -our price_i.
+            // Selling: match bids where bid_score <= -our price_i
             let max = -(decimal_to_i64(price) as f64);
-            ("-inf".to_string(), max.to_string())
+            max.to_string()
         }
-        _ => {
-            // Market orders (no price) — match everything
-            ("-inf".to_string(), "+inf".to_string())
-        }
+        _ => "+inf".to_string(), // Market orders — match everything
     };
 
-    let resting_ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
-        .arg(opp_key)
-        .arg(&phase1_min)
-        .arg(&phase1_max)
-        .arg("LIMIT")
-        .arg(0i64)
-        .arg(50i64)
-        .query_async(&mut *conn)
-        .await
-        .context("ZRANGEBYSCORE resting ids")?;
+    let mut conn = pool.get().await.context("pool.get")?;
 
-    // ── Phase 2: Lua EVAL with all keys declared ──────────────────────────────
-    // KEYS: [1]=bids, [2]=asks, [3]=version, [4]=order:{incoming_id},
-    //       [5..4+N]=order:{resting_id_i}
-    // ARGV: [1..11]=order fields, [12]=N, [13..12+N]=resting_id strings
-    let n = resting_ids.len();
-
+    // Single Lua EVAL — ZRANGEBYSCORE + matching all in one atomic call
+    // KEYS: [1]=bids, [2]=asks, [3]=version, [4]=order:{incoming_id}
+    // ARGV: [1..11]=order fields, [12]=max_score
     let script = redis::Script::new(lua_script);
     let mut invocation = script.prepare_invoke();
 
-    // KEYS
     invocation
         .key(&bids_key)
         .key(&asks_key)
         .key(&version_key)
         .key(&incoming_order_key);
 
-    for rid in &resting_ids {
-        invocation.key(format!("order:{rid}"));
-    }
-
-    // ARGV: order fields
     invocation
         .arg(order.id.to_string())
         .arg(side_char(order.side))
@@ -807,12 +769,7 @@ pub async fn match_order_lua(
         .arg(order.created_at.timestamp_millis().to_string())
         .arg(&order.pair_id)
         .arg(score.to_string())
-        // N + resting IDs
-        .arg(n.to_string());
-
-    for rid in &resting_ids {
-        invocation.arg(rid);
-    }
+        .arg(&max_score);
 
     let raw: redis::Value = invocation
         .invoke_async(&mut *conn)

@@ -47,6 +47,9 @@ pub fn spawn_persist_worker(
 pub async fn process_persist_job(pg: &sqlx::PgPool, job: PersistJob) -> anyhow::Result<()> {
     let persist_start = std::time::Instant::now();
 
+    // 0. Insert order to DB (deferred from hot path)
+    insert_order_db(pg, &job.order).await?;
+
     // 1. Audit: ORDER_CREATED
     insert_audit_event(
         pg,

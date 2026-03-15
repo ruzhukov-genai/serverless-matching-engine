@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use chrono::Utc;
 use rust_decimal::Decimal;
 use std::str::FromStr;
+use std::sync::Arc;
 use uuid::Uuid;
 use sqlx::Row;
 use tokio::sync::mpsc;
@@ -14,7 +15,7 @@ use sme_shared::{
     SelfTradePreventionMode, TimeInForce, Trade,
 };
 
-use crate::{AppState, routes::{PersistJob, validate_order_request, insert_order_db, lock_balance, order_to_json, trade_to_json}};
+use crate::{AppState, routes::{PersistJob, validate_order_request, lock_balance, order_to_json, trade_to_json}};
 
 const PAIRS: &[&str] = &["BTC-USDT", "ETH-USDT", "SOL-USDT"];
 
@@ -57,9 +58,14 @@ pub async fn order_queue_consumer(state: AppState) {
 }
 
 /// BRPOP loop for a single pair's order queue: `queue:orders:{pair_id}`.
+/// After each BRPOP wake, drains up to 9 more orders with non-blocking RPOP,
+/// then spawns each order's processing concurrently (up to 10 in-flight per pair).
 async fn pair_order_consumer(state: AppState, pair_id: String) {
     let queue_key = format!("queue:orders:{}", pair_id);
     tracing::info!(pair_id = %pair_id, queue = %queue_key, "pair order consumer started");
+
+    // Semaphore: at most 10 orders in-flight concurrently per pair
+    let sem = Arc::new(tokio::sync::Semaphore::new(10));
 
     loop {
         let mut conn = match state.dragonfly.get().await {
@@ -79,10 +85,32 @@ async fn pair_order_consumer(state: AppState, pair_id: String) {
             }
         };
 
-        if let Some((_key, order_str)) = result
-            && let Err(e) = process_queued_order(&state, &order_str).await
-        {
-            tracing::error!(error = %e, order_str = %order_str, "failed to process order");
+        let first_order = match result {
+            Some((_key, s)) => s,
+            None => continue,
+        };
+
+        // Drain up to 9 more orders non-blocking (batch on burst)
+        let mut batch = vec![first_order];
+        for _ in 0..9 {
+            let extra: Option<String> = conn.rpop(&queue_key, None).await.unwrap_or(None);
+            match extra {
+                Some(s) => batch.push(s),
+                None => break,
+            }
+        }
+        drop(conn); // release connection before spawning
+
+        // Spawn each order concurrently, limited by semaphore
+        for order_str in batch {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = process_queued_order(&state_clone, &order_str).await {
+                    tracing::error!(error = %e, order_str = %order_str, "failed to process order");
+                }
+                drop(permit);
+            });
         }
     }
 }
@@ -91,6 +119,9 @@ async fn pair_order_consumer(state: AppState, pair_id: String) {
 async fn pair_cancellation_consumer(state: AppState, pair_id: String) {
     let queue_key = format!("queue:cancellations:{}", pair_id);
     tracing::info!(pair_id = %pair_id, queue = %queue_key, "pair cancellation consumer started");
+
+    // Semaphore: at most 5 cancellations in-flight concurrently per pair
+    let sem = Arc::new(tokio::sync::Semaphore::new(5));
 
     loop {
         let mut conn = match state.dragonfly.get().await {
@@ -110,10 +141,15 @@ async fn pair_cancellation_consumer(state: AppState, pair_id: String) {
             }
         };
 
-        if let Some((_key, cancel_str)) = result
-            && let Err(e) = process_cancellation(&state, &cancel_str).await
-        {
-            tracing::error!(error = %e, cancel_str = %cancel_str, "failed to process cancellation");
+        if let Some((_key, cancel_str)) = result {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = process_cancellation(&state_clone, &cancel_str).await {
+                    tracing::error!(error = %e, cancel_str = %cancel_str, "failed to process cancellation");
+                }
+                drop(permit);
+            });
         }
     }
 }
@@ -121,6 +157,9 @@ async fn pair_cancellation_consumer(state: AppState, pair_id: String) {
 /// Fallback BRPOP loop on `queue:orders` — backward compat for old producers.
 async fn fallback_order_consumer(state: AppState) {
     tracing::info!("fallback order consumer started on queue:orders");
+
+    // Semaphore: at most 10 orders in-flight concurrently
+    let sem = Arc::new(tokio::sync::Semaphore::new(10));
 
     loop {
         let mut conn = match state.dragonfly.get().await {
@@ -140,10 +179,31 @@ async fn fallback_order_consumer(state: AppState) {
             }
         };
 
-        if let Some((_key, order_str)) = result
-            && let Err(e) = process_queued_order(&state, &order_str).await
-        {
-            tracing::error!(error = %e, order_str = %order_str, "failed to process order");
+        let first_order = match result {
+            Some((_key, s)) => s,
+            None => continue,
+        };
+
+        // Drain up to 9 more non-blocking
+        let mut batch = vec![first_order];
+        for _ in 0..9 {
+            let extra: Option<String> = conn.rpop("queue:orders", None).await.unwrap_or(None);
+            match extra {
+                Some(s) => batch.push(s),
+                None => break,
+            }
+        }
+        drop(conn);
+
+        for order_str in batch {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = process_queued_order(&state_clone, &order_str).await {
+                    tracing::error!(error = %e, order_str = %order_str, "failed to process order");
+                }
+                drop(permit);
+            });
         }
     }
 }
@@ -152,6 +212,9 @@ async fn fallback_order_consumer(state: AppState) {
 /// that don't know the pair_id.
 async fn fallback_cancellation_consumer(state: AppState) {
     tracing::info!("fallback cancellation consumer started on queue:cancellations");
+
+    // Semaphore: at most 5 cancellations in-flight concurrently
+    let sem = Arc::new(tokio::sync::Semaphore::new(5));
 
     loop {
         let mut conn = match state.dragonfly.get().await {
@@ -171,10 +234,15 @@ async fn fallback_cancellation_consumer(state: AppState) {
             }
         };
 
-        if let Some((_key, cancel_str)) = result
-            && let Err(e) = process_cancellation(&state, &cancel_str).await
-        {
-            tracing::error!(error = %e, cancel_str = %cancel_str, "failed to process cancellation");
+        if let Some((_key, cancel_str)) = result {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = process_cancellation(&state_clone, &cancel_str).await {
+                    tracing::error!(error = %e, cancel_str = %cancel_str, "failed to process cancellation");
+                }
+                drop(permit);
+            });
         }
     }
 }
@@ -184,6 +252,7 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
     let total_start = std::time::Instant::now();
 
     // Parse the order JSON from the gateway
+    let parse_start = std::time::Instant::now();
     let order_json: Value = serde_json::from_str(order_str)?;
     
     let user_id = order_json.get("user_id").and_then(|v| v.as_str()).unwrap_or("user-1").to_string();
@@ -249,17 +318,27 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
         client_order_id,
     };
 
+    let parse_us = parse_start.elapsed().as_micros() as u64;
+
+    // Measure queue-to-pickup latency (gateway created_at → now)
+    let queue_latency_us = {
+        let now_ts = Utc::now().timestamp_micros();
+        let created_ts = order.created_at.timestamp_micros();
+        (now_ts - created_ts).max(0) as u64
+    };
+
     // 1. Validate (outside lock) — uses in-memory cache, zero DB round-trips
+    let validate_start = std::time::Instant::now();
     validate_order_request(&state.pairs_cache, &order)
         .map_err(|e| anyhow::anyhow!("validation failed: {}", e))?;
+    let validate_us = validate_start.elapsed().as_micros() as u64;
 
-    // 2+3. Insert to DB and lock balance in parallel — both are independent operations
+    // 2. Lock balance (pre-match) — insert_order_db deferred to persist worker
     let pre_lock_start = std::time::Instant::now();
-    tokio::try_join!(
-        insert_order_db(&state.pg, &order),
-        lock_balance(&state.pg, &order),
-    ).map_err(|e| anyhow::anyhow!("pre-match DB ops failed: {}", e))?;
-    let _pre_lock_ms = pre_lock_start.elapsed().as_millis() as u64;
+    lock_balance(&state.pg, &order)
+        .await
+        .map_err(|e| anyhow::anyhow!("lock balance failed: {}", e))?;
+    let db_pre_us = pre_lock_start.elapsed().as_micros() as u64;
 
     // 4. Match the order using Lua atomic EVAL
     let match_start = std::time::Instant::now();
@@ -274,7 +353,7 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
 
     // Non-FOK: single atomic Lua EVAL — no lock, no retry
     let lua_result = cache::match_order_lua(&state.dragonfly, &order).await?;
-    let lua_ms = match_start.elapsed().as_millis() as u64;
+    let lua_us = match_start.elapsed().as_micros() as u64;
 
     // Apply Lua result to the incoming order struct
     order.remaining = lua_result.remaining;
@@ -287,7 +366,7 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
         let pool = state.dragonfly.clone();
         let pair_id_owned = pair_id.to_string();
         tokio::spawn(async move {
-            let _ = metrics::record_match_latency(&pool, &pair_id_owned, lua_ms).await;
+            let _ = metrics::record_match_latency(&pool, &pair_id_owned, lua_us / 1000).await;
             let _ = metrics::record_lock_wait(&pool, &pair_id_owned, 0).await;
             let _ = metrics::increment_order_count(&pool, &pair_id_owned).await;
             if trade_count > 0 {
@@ -352,19 +431,43 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
         }
     }
 
-    let total_ms = total_start.elapsed().as_millis() as u64;
+    // 5. Emit WS event synchronously (just a channel send — negligible latency)
+    if !trade_jsons.is_empty() {
+        let event_msg = serde_json::to_string(&json!({
+            "type": "order_created",
+            "user_id": order.user_id,
+            "order": order_to_json(&order),
+            "trades": &trade_jsons,
+        })).unwrap_or_default();
+        let _ = state.order_events_tx.send(event_msg);
+    }
+
+    // 5b. Update orderbook cache — fire-and-forget (eventually consistent)
+    let cache_state = state.clone();
+    let cache_order = order.clone();
+    let cache_trades = trade_jsons;
+    tokio::spawn(async move {
+        if let Err(e) = update_order_cache_after_processing(&cache_state, &cache_order, &cache_trades).await {
+            tracing::warn!(error = %e, "async cache update failed");
+        }
+    });
+    let cache_us = 0u64;
+
+    let total_us = total_start.elapsed().as_micros() as u64;
 
     tracing::info!(
-        lua_ms = lua_ms,
-        total_ms = total_ms,
+        queue_latency_us = queue_latency_us,
+        parse_us = parse_us,
+        validate_us = validate_us,
+        db_pre_us = db_pre_us,
+        lua_us = lua_us,
+        cache_us = cache_us,
+        total_us = total_us,
         trade_count = trade_count,
         pair_id = %order.pair_id,
         order_id = %order.id,
-        "order processed"
+        "order processed [segments]"
     );
-
-    // Update caches after successful processing
-    update_order_cache_after_processing(state, &order, &trade_jsons).await?;
 
     Ok(())
 }
@@ -527,17 +630,6 @@ async fn update_order_cache_after_processing(
     });
     let orderbook_str = serde_json::to_string(&orderbook_json)?;
     conn.set::<_, _, ()>(format!("cache:orderbook:{}", order.pair_id), &orderbook_str).await?;
-
-    // Emit order event to broadcast channel
-    if had_trades {
-        let event_msg = serde_json::to_string(&json!({
-            "type": "order_created",
-            "user_id": order.user_id,
-            "order": order_to_json(order),
-            "trades": trade_jsons,
-        })).unwrap_or_default();
-        let _ = state.order_events_tx.send(event_msg);
-    }
 
     Ok(())
 }
