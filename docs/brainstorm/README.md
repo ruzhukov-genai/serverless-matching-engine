@@ -4,52 +4,41 @@ Open questions, explorations, and half-formed ideas. Nothing here is decided.
 
 ## Resolved ✅
 
-- **Language:** Rust (tokio async) → [ADR-005](../decisions/ADR-005-rust-implementation.md)
-- **Cache/Queue:** Dragonfly (Redis-compatible, 10-25x throughput) → [ADR-004](../decisions/ADR-004-dragonfly-postgresql.md)
-- **Database:** PostgreSQL (ACID, indexing, Aurora migration path) → [ADR-004](../decisions/ADR-004-dragonfly-postgresql.md)
-- **Queue mechanism:** Dragonfly Streams (XADD/XREADGROUP) — no separate queue service needed
-- **Stateless mode:** Load-per-invocation with cache → [ADR-003](../decisions/ADR-003-stateless-matching-engine.md)
+- **Language:** Rust (tokio async) — chosen for perf + safety
+- **Cache/Queue:** Dragonfly (Redis-compatible, multi-threaded)
+- **Database:** PostgreSQL (ACID, Aurora migration path)
+- **Stateless workers:** Load-per-invocation from Dragonfly → ADR-001
+- **Matching:** Atomic Lua EVAL in Dragonfly → ADR-004
+- **Architecture:** Gateway/Worker split — gateway serves HTTP/WS, worker consumes queues
+- **Queue mechanism:** Per-pair BRPOP queues (replaced Streams) → ADR-005
+- **DB persistence:** Async, off hot path → ADR-003
+- **Gateway scaling:** Shared cache broadcasts → ADR-002
 
 ## Open Questions
 
-### Matching Engine
-- **Order book size limits?**
-  - Lazy loading breaks down when a single order fills across 100s of price levels
-  - May need a "full load" fallback threshold
+### Deployment
+- **Lambda cold start:** How does ~5ms pairs config load + Dragonfly pool creation affect Lambda latency?
+- **Lambda concurrency:** Per-pair invocations or shared workers? Semaphore model (ADR-005) may not apply.
+- **SQS vs Dragonfly queues:** Lambda trigger from SQS vs BRPOP? SQS has built-in retry/DLQ.
 
-### Dragonfly-specific
-- **Streams consumer group behavior under high contention?**
-  - Need to benchmark XREADGROUP with many concurrent consumers per group
-  - Pending Entry List (PEL) management and XACK patterns
+### Reliability
+- **Crash recovery:** Worker crashes after Lua match but before PG persist. Dragonfly has the trade, PG doesn't. Need WAL or idempotent replay for production.
+- **Dragonfly persistence:** RDB snapshots only (no AOF). Acceptable since PG is source of truth.
+- **Multi-gateway order events:** Currently `tokio::broadcast` (single-process). Need Dragonfly pub/sub for multi-gateway.
 
-- **Persistence strategy?**
-  - Dragonfly uses RDB snapshots only (no AOF)
-  - Acceptable since Dragonfly is cache/queue layer; PostgreSQL is source of truth
-  - Define snapshot interval for local dev
+### Performance
+- **Tokio runtime contention:** At 100+ clients, pure scheduling overhead dominates (~280ms for in-memory reads). Multi-threaded runtime? Separate gateway instances?
+- **Batch matching:** Accumulate N orders per pair, match in one Lua call. Better throughput but more complex.
+- **Dragonfly Lua serialization:** Single-threaded Lua executor causes p95 spikes under concurrent EVALs.
 
-### Observability
-- How do we trace a single order across 3 services + API?
-  - Correlation IDs (order_id / trace_id) propagated through all streams
-  - `tracing` crate with OpenTelemetry exporter for local dev
-
-### Schema Design
-- PostgreSQL schema for orders: partitioning by pair_id?
-- Order versioning: integer version column vs. event sourcing?
-- Trade event schema for stream messages
-
-## Ideas to Explore
-
-- [ ] Event sourcing for order book reconstruction from audit trail
-- [ ] WebSocket push for real-time order status updates (implemented in `crates/api`)
-- [ ] Chaos testing: lock expiry under load
-- [ ] Dragonfly cluster mode for horizontal scaling
-- [ ] Benchmarking Dragonfly Streams vs. dedicated message broker at scale
+### Features
+- **FOK orders:** Not implemented in worker (auto-cancelled). Need speculative matching in Lua or OCC/CAS path.
+- **Event sourcing:** Reconstruct order book from audit trail for compliance.
+- **Rate limiting:** Per-user order rate limits in gateway.
 
 ## References
 
 - [Dragonfly](https://www.dragonflydb.io/) — multi-threaded Redis replacement
-- [Dragonfly Streams docs](https://www.dragonflydb.io/docs/category/streams)
-- [RedLock](https://redis.io/docs/latest/develop/use/patterns/distributed-locks/) — distributed locking algorithm
 - [redis-rs](https://docs.rs/redis/) — Rust Redis client
-- [sqlx](https://docs.rs/sqlx/) — Rust async PostgreSQL with compile-time checked queries
+- [sqlx](https://docs.rs/sqlx/) — Rust async PostgreSQL
 - [axum](https://docs.rs/axum/) — Rust web framework
