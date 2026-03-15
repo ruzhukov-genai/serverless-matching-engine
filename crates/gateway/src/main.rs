@@ -3,31 +3,50 @@ use axum::{Router, routing::get};
 use deadpool_redis::Pool as RedisPool;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
 
 mod routes;
 
+/// Per-key cache entry: watch channel for zero-contention reads + broadcast for WS fan-out.
+struct CacheEntry {
+    /// WS fan-out — subscribers get pushed new values
+    broadcast_tx: broadcast::Sender<String>,
+    /// Watch channel — REST handlers borrow() with zero allocation, no lock contention.
+    /// Replaces the old RwLock<HashMap> which serialized all reads behind writer locks.
+    watch_tx: tokio::sync::watch::Sender<Option<String>>,
+    watch_rx: tokio::sync::watch::Receiver<Option<String>>,
+}
+
 /// Shared cache broadcasts — one poller per key, N subscribers.
-/// REST handlers read from `latest` (zero Dragonfly ops).
+/// REST handlers read via watch::borrow() (zero contention, zero allocation).
 /// WS handlers subscribe to the broadcast channel.
 #[derive(Clone)]
 pub struct CacheBroadcasts {
-    senders: Arc<HashMap<String, broadcast::Sender<String>>>,
-    latest: Arc<RwLock<HashMap<String, String>>>,
+    entries: Arc<HashMap<String, Arc<CacheEntry>>>,
 }
 
 impl CacheBroadcasts {
     /// Subscribe to updates for a cache key. Returns None if the key is unknown.
     pub fn subscribe(&self, key: &str) -> Option<broadcast::Receiver<String>> {
-        self.senders.get(key).map(|tx| tx.subscribe())
+        self.entries.get(key).map(|e| e.broadcast_tx.subscribe())
     }
 
-    /// Get the last polled value for a cache key (zero Dragonfly, reads RAM).
+    /// Get the last polled value for a cache key.
+    /// Uses watch::borrow() — no async, no lock, no allocation beyond the clone.
     pub async fn get_latest(&self, key: &str) -> Option<String> {
-        self.latest.read().await.get(key).cloned()
+        self.entries.get(key).and_then(|e| e.watch_rx.borrow().clone())
+    }
+
+    /// Update a cache key (called by pollers). Sends to both watch + broadcast.
+    fn update(&self, key: &str, val: String) {
+        if let Some(e) = self.entries.get(key) {
+            let _ = e.watch_tx.send(Some(val.clone()));
+            let _ = e.broadcast_tx.send(val);
+        }
     }
 }
 
@@ -38,15 +57,16 @@ pub struct AppState {
     pub order_events_tx: broadcast::Sender<String>,
     /// Shared cache broadcasts — one poller per key, N subscribers
     pub cache: CacheBroadcasts,
+    /// Per-user TTL cache — avoids Dragonfly round-trips for orders/portfolio
+    pub user_cache: routes::UserCache,
 }
 
-/// Background poller: reads one key from Dragonfly at `interval_ms`, broadcasts to all subscribers,
-/// and stores the latest value in the shared `latest` map.
+/// Background poller: reads one key from Dragonfly at `interval_ms`,
+/// updates the CacheBroadcasts entry (watch + broadcast channels).
 async fn spawn_cache_poller(
     pool: RedisPool,
     key: String,
-    tx: broadcast::Sender<String>,
-    latest: Arc<RwLock<HashMap<String, String>>>,
+    cache: CacheBroadcasts,
     interval_ms: u64,
 ) {
     use deadpool_redis::redis::AsyncCommands;
@@ -58,8 +78,7 @@ async fn spawn_cache_poller(
         if let Ok(mut conn) = pool.get().await {
             if let Ok(val) = conn.get::<_, String>(&key).await {
                 if !val.is_empty() && val != "{}" {
-                    latest.write().await.insert(key.clone(), val.clone());
-                    let _ = tx.send(val);
+                    cache.update(&key, val);
                 }
             }
         }
@@ -96,30 +115,36 @@ async fn main() -> Result<()> {
     }
     poll_specs.push(("cache:pairs".to_string(), 5000));
 
-    let latest: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
-    let mut senders: HashMap<String, broadcast::Sender<String>> = HashMap::new();
+    let mut entries: HashMap<String, Arc<CacheEntry>> = HashMap::new();
+
+    for (key, _interval_ms) in &poll_specs {
+        let (broadcast_tx, _) = broadcast::channel::<String>(64);
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel(None);
+        entries.insert(key.clone(), Arc::new(CacheEntry {
+            broadcast_tx,
+            watch_tx,
+            watch_rx,
+        }));
+    }
+
+    let cache = CacheBroadcasts {
+        entries: Arc::new(entries),
+    };
 
     for (key, interval_ms) in &poll_specs {
-        let (tx, _) = broadcast::channel::<String>(64);
-        senders.insert(key.clone(), tx.clone());
         tokio::spawn(spawn_cache_poller(
             dragonfly.clone(),
             key.clone(),
-            tx,
-            Arc::clone(&latest),
+            cache.clone(),
             *interval_ms,
         ));
     }
 
-    let cache = CacheBroadcasts {
-        senders: Arc::new(senders),
-        latest,
-    };
-
     let state = AppState {
-        dragonfly,
+        dragonfly: dragonfly.clone(),
         order_events_tx,
-        cache,
+        cache: cache.clone(),
+        user_cache: routes::UserCache::new(),
     };
 
     let app = Router::new()
@@ -150,6 +175,34 @@ async fn main() -> Result<()> {
         .nest_service("/dashboard", ServeDir::new("web/dashboard"))
         .layer(CorsLayer::permissive())
         .with_state(state);
+
+    // ── Gateway instrumentation — log request stats every 30s ───────────────
+    let request_count = Arc::new(AtomicU64::new(0));
+    let ws_connections = Arc::new(AtomicU64::new(0));
+    {
+        let req_count = request_count.clone();
+        let ws_conns = ws_connections.clone();
+        let cache_ref = cache.clone();
+        let pool_ref = dragonfly.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                ticker.tick().await;
+                let reqs = req_count.swap(0, Ordering::Relaxed);
+                let ws = ws_conns.load(Ordering::Relaxed);
+                let pool_status = pool_ref.status();
+                let cache_keys = cache_ref.entries.len();
+                tracing::info!(
+                    requests_30s = reqs,
+                    ws_connections = ws,
+                    df_pool_size = pool_status.size,
+                    df_pool_available = pool_status.available,
+                    cache_keys = cache_keys,
+                    "[gateway-stats]"
+                );
+            }
+        });
+    }
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
     let addr = format!("0.0.0.0:{}", port);

@@ -5,6 +5,7 @@ use rust_decimal::Decimal;
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tracing_subscriber::EnvFilter;
@@ -39,6 +40,10 @@ pub struct AppState {
     pub order_events_tx: broadcast::Sender<String>,
     /// Dirty user IDs — notifies cache refresh worker which portfolios to update
     pub dirty_users_tx: mpsc::Sender<String>,
+    /// Batched metrics — accumulated in-memory, flushed to Dragonfly every 2s
+    pub metrics_batch: Arc<worker::MetricsBatch>,
+    /// Orderbook rebuild debouncer — coalesces rapid rebuilds per pair
+    pub orderbook_debouncer: Arc<worker::OrderbookDebouncer>,
 }
 
 #[tokio::main]
@@ -93,6 +98,7 @@ async fn main() -> Result<()> {
 
     // Spawn background persistence worker — uses dedicated pg_bg pool
     let (persist_tx, persist_rx) = mpsc::channel::<routes::PersistJob>(1000);
+    let persist_tx_clone = persist_tx.clone();
     routes::spawn_persist_worker(pg_bg.clone(), persist_rx);
 
     // Order events broadcast — single channel, gateway WS clients filter by user_id
@@ -101,9 +107,13 @@ async fn main() -> Result<()> {
     // Dirty user channel — order workers notify cache refresh which portfolios changed
     let (dirty_users_tx, dirty_users_rx) = mpsc::channel::<String>(10_000);
 
+    let metrics_batch = Arc::new(worker::MetricsBatch::new());
+    let orderbook_debouncer = Arc::new(worker::OrderbookDebouncer::new());
+
     let state = AppState {
         dragonfly: dragonfly.clone(), pg: pg_hot, pg_bg: pg_bg.clone(), pairs_cache,
         persist_tx, order_events_tx, dirty_users_tx,
+        metrics_batch: metrics_batch.clone(), orderbook_debouncer: orderbook_debouncer.clone(),
     };
 
     // Start the order queue consumer
@@ -112,32 +122,66 @@ async fn main() -> Result<()> {
         worker::order_queue_consumer(worker_state).await;
     });
 
-    // Start cache refresh workers
+    // Single cache refresh worker — handles ticker, trades, dirty-user portfolios.
+    // Replaces the previous 3 separate workers that duplicated ticker/trades/portfolio refresh.
     let cache_state = state.clone();
     tokio::spawn(async move {
         worker::cache_refresh_worker(cache_state, dirty_users_rx).await;
     });
 
-    // Background metrics refresh (same as before)
+    // Metrics refresh — writes to Dragonfly cache keys read by gateway
     let metrics_dragonfly = dragonfly.clone();
     let metrics_pg = pg_bg.clone();
     tokio::spawn(async move {
         routes::metrics_refresh_loop_worker(metrics_dragonfly, metrics_pg).await;
     });
 
-    // Background ticker + trades refresh (same as before)
-    let ticker_dragonfly = dragonfly.clone();
-    let ticker_pg = pg_bg.clone();
+    // Metrics batch flush — drains accumulated order/trade/latency counters to Dragonfly every 2s
+    let flush_pool = dragonfly.clone();
+    let flush_batch = metrics_batch.clone();
     tokio::spawn(async move {
-        routes::ticker_trades_refresh_loop_worker(ticker_dragonfly, ticker_pg).await;
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            ticker.tick().await;
+            flush_batch.flush(&flush_pool).await;
+        }
     });
 
-    // Background portfolio refresh (same as before)
-    let portfolio_dragonfly = dragonfly.clone();
-    let portfolio_pg = pg_bg.clone();
-    tokio::spawn(async move {
-        routes::portfolio_refresh_loop_worker(portfolio_dragonfly, portfolio_pg).await;
-    });
+    // Orderbook debounce workers — one per pair, coalesces rapid rebuilds
+    worker::spawn_orderbook_debounce_workers(orderbook_debouncer, state.clone());
+
+    // ── Worker instrumentation — log stats every 30s ─────────────────────────
+    {
+        let _persist_tx_ref = persist_tx_clone.clone();
+        let pg_ref = state.pg.clone();
+        let pg_bg_ref = state.pg_bg.clone();
+        let df_ref = dragonfly.clone();
+        let batch_ref = metrics_batch.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                ticker.tick().await;
+                let pg_hot_status = pg_ref.size();
+                let pg_hot_idle = pg_ref.num_idle();
+                let pg_bg_status = pg_bg_ref.size();
+                let pg_bg_idle = pg_bg_ref.num_idle();
+                let df_status = df_ref.status();
+                // Accumulator snapshot (non-destructive peek)
+                let pending_orders: u64 = batch_ref.order_counts.iter()
+                    .map(|c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed)).sum();
+                tracing::info!(
+                    pg_hot_size = pg_hot_status,
+                    pg_hot_idle = pg_hot_idle,
+                    pg_bg_size = pg_bg_status,
+                    pg_bg_idle = pg_bg_idle,
+                    df_pool_size = df_status.size,
+                    df_pool_available = df_status.available,
+                    pending_metrics_orders = pending_orders,
+                    "[worker-stats]"
+                );
+            }
+        });
+    }
 
     tracing::info!("worker started, listening for orders on queue:orders");
 

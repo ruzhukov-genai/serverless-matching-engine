@@ -43,13 +43,22 @@ pub async fn record_lock_wait(pool: &Pool, pair_id: &str, ms: u64) -> Result<()>
 
 /// Increment per-pair order counter.
 pub async fn increment_order_count(pool: &Pool, pair_id: &str) -> Result<i64> {
+    increment_order_count_by(pool, pair_id, 1).await
+}
+
+/// Add `count` to the per-pair order counter (batched variant).
+pub async fn increment_order_count_by(pool: &Pool, pair_id: &str, count: u64) -> Result<i64> {
+    if count == 0 {
+        return Ok(0);
+    }
     let mut conn = pool.get().await.context("pool.get")?;
     let key = format!("metrics:{pair_id}:orders");
-    let v: i64 = redis::cmd("INCR")
+    let v: i64 = redis::cmd("INCRBY")
         .arg(&key)
+        .arg(count)
         .query_async(&mut *conn)
         .await
-        .context("increment_order_count")?;
+        .context("increment_order_count_by")?;
     Ok(v)
 }
 

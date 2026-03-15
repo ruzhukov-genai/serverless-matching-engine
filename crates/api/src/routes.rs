@@ -597,48 +597,10 @@ fn _sort_score(order: &Order) -> f64 {
     order.book_score()
 }
 
-// ── Background portfolio refresh ─────────────────────────────────────────────
-
-/// Refreshes all user balances every 2 seconds (worker version).
-pub async fn portfolio_refresh_loop_worker(
-    dragonfly: deadpool_redis::Pool,
-    pg: sqlx::PgPool,
-) {
-    use deadpool_redis::redis::AsyncCommands;
-    
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-        let rows = match sqlx::query(
-            "SELECT user_id, asset, available, locked FROM balances ORDER BY user_id, asset",
-        )
-        .fetch_all(&pg)
-        .await {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
-        let mut by_user: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
-        for r in &rows {
-            let uid: String = r.get("user_id");
-            by_user.entry(uid).or_default().push(json!({
-                "user_id": r.get::<String, _>("user_id"),
-                "asset": r.get::<String, _>("asset"),
-                "available": r.get::<Decimal, _>("available").to_string(),
-                "locked": r.get::<Decimal, _>("locked").to_string(),
-            }));
-        }
-
-        // Update portfolio cache in Dragonfly
-        if let Ok(mut conn) = dragonfly.get().await {
-            for (user_id, balances) in by_user {
-                let portfolio_json = json!({ "balances": balances });
-                let portfolio_str = serde_json::to_string(&portfolio_json).unwrap_or("{}".to_string());
-                let _: Result<(), _> = conn.set(format!("cache:portfolio:{}", user_id), &portfolio_str).await;
-            }
-        }
-    }
-}
+// portfolio_refresh_loop_worker REMOVED — was duplicating cache_refresh_worker's
+// dirty-user portfolio refresh AND scanning all users every 2s regardless of activity.
+// Portfolio refresh now handled exclusively by cache_refresh_worker (dirty-users only).
+#[allow(dead_code)]
 fn row_to_trade(r: &sqlx::postgres::PgRow) -> Trade {
     Trade {
         id: r.get("id"),
@@ -654,106 +616,14 @@ fn row_to_trade(r: &sqlx::postgres::PgRow) -> Trade {
     }
 }
 
+#[allow(dead_code)]
 fn row_to_trade_json(r: &sqlx::postgres::PgRow) -> Value {
     let trade = row_to_trade(r);
     trade_to_json(&trade)
 }
 
-pub async fn ticker_trades_refresh_loop_worker(
-    dragonfly: deadpool_redis::Pool,
-    pg: sqlx::PgPool,
-) {
-    use deadpool_redis::redis::AsyncCommands;
-    use tokio::time::{Duration, interval};
-    let mut ticker = interval(Duration::from_secs(2));
-
-    loop {
-        ticker.tick().await;
-
-        // Single query for all pairs — one round trip instead of N
-        let rows = sqlx::query(
-            "SELECT pair_id,
-                    MAX(price) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') as high_24h,
-                    MIN(price) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') as low_24h,
-                    SUM(quantity) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') as volume_24h
-             FROM trades GROUP BY pair_id",
-        )
-        .fetch_all(&pg)
-        .await;
-
-        let agg_rows = match rows {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(error = %e, "ticker refresh failed (agg)");
-                continue;
-            }
-        };
-
-        // Get last prices in one query
-        let last_rows = sqlx::query(
-            "SELECT DISTINCT ON (pair_id) pair_id, price as last_price
-             FROM trades ORDER BY pair_id, created_at DESC",
-        )
-        .fetch_all(&pg)
-        .await;
-
-        let last_prices: std::collections::HashMap<String, Decimal> = match last_rows {
-            Ok(r) => r.iter().map(|row| {
-                let pid: String = row.get("pair_id");
-                let price: Decimal = row.get("last_price");
-                (pid, price)
-            }).collect(),
-            Err(e) => {
-                tracing::warn!(error = %e, "ticker refresh failed (last)");
-                continue;
-            }
-        };
-
-        // Update ticker cache in Dragonfly
-        if let Ok(mut conn) = dragonfly.get().await {
-            for row in &agg_rows {
-                let pair_id: String = row.get("pair_id");
-                let last = last_prices.get(&pair_id).map(|v| v.to_string());
-                let ticker_json = json!({
-                    "pair": pair_id,
-                    "last": last,
-                    "high_24h": row.get::<Option<Decimal>, _>("high_24h").map(|v| v.to_string()),
-                    "low_24h": row.get::<Option<Decimal>, _>("low_24h").map(|v| v.to_string()),
-                    "volume_24h": row.get::<Option<Decimal>, _>("volume_24h").map(|v| v.to_string()),
-                });
-                let ticker_str = serde_json::to_string(&ticker_json).unwrap_or("{}".to_string());
-                let _: Result<(), _> = conn.set(format!("cache:ticker:{}", pair_id), &ticker_str).await;
-            }
-        }
-
-        // Refresh recent trades for all pairs (single query, last hour, top 150)
-        if let Ok(rows) = sqlx::query(
-            "SELECT id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, sequence, created_at
-             FROM trades WHERE created_at >= NOW() - INTERVAL '1 hour' ORDER BY created_at DESC LIMIT 150",
-        )
-        .fetch_all(&pg)
-        .await {
-            let mut by_pair: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
-            for r in &rows {
-                let pair: String = r.get("pair_id");
-                let entry = by_pair.entry(pair).or_default();
-                if entry.len() < 50 {
-                    entry.push(row_to_trade_json(r));
-                }
-            }
-            
-            // Update trades cache in Dragonfly
-            if let Ok(mut conn) = dragonfly.get().await {
-                for pair_id in PAIRS {
-                    let trades = by_pair.get(*pair_id).cloned().unwrap_or_default();
-                    let trades_json = json!({ "pair": pair_id, "trades": trades });
-                    let trades_str = serde_json::to_string(&trades_json).unwrap_or("{}".to_string());
-                    let _: Result<(), _> = conn.set(format!("cache:trades:{}", pair_id), &trades_str).await;
-                }
-            }
-        }
-    }
-}
+// ticker_trades_refresh_loop_worker REMOVED — was duplicating cache_refresh_worker's
+// ticker + trades refresh at 2s interval. Now handled exclusively by cache_refresh_worker (5s).
 
 /// Runs forever, refreshing ticker + recent trades for all pairs every 2 seconds (original in-memory version).
 pub async fn metrics_refresh_loop_worker(

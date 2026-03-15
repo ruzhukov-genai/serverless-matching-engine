@@ -12,12 +12,52 @@ use deadpool_redis::redis::AsyncCommands;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::broadcast;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 
 use sme_shared::{OrderType, Side, SelfTradePreventionMode, TimeInForce};
 
 use crate::AppState;
+
+// ── Per-user TTL cache ───────────────────────────────────────────────────────
+// Avoids hitting Dragonfly on every /api/orders and /api/portfolio request.
+// Short TTL (2s) — eventual consistency acceptable for read-your-writes.
+
+const USER_CACHE_TTL_MS: u128 = 2_000;
+
+#[derive(Clone)]
+pub struct UserCache {
+    inner: Arc<RwLock<HashMap<String, (std::time::Instant, String)>>>,
+}
+
+impl UserCache {
+    pub fn new() -> Self {
+        Self { inner: Arc::new(RwLock::new(HashMap::new())) }
+    }
+
+    /// Get cached value if TTL hasn't expired.
+    pub async fn get(&self, key: &str) -> Option<String> {
+        let map = self.inner.read().await;
+        if let Some((ts, val)) = map.get(key) {
+            if ts.elapsed().as_millis() < USER_CACHE_TTL_MS {
+                return Some(val.clone());
+            }
+        }
+        None
+    }
+
+    /// Store a value with current timestamp.
+    pub async fn set(&self, key: String, val: String) {
+        let mut map = self.inner.write().await;
+        map.insert(key, (std::time::Instant::now(), val));
+        // Evict stale entries if map grows large (>1000 entries)
+        if map.len() > 1000 {
+            map.retain(|_, (ts, _)| ts.elapsed().as_millis() < USER_CACHE_TTL_MS * 2);
+        }
+    }
+}
 
 // ── Error helper ─────────────────────────────────────────────────────────────
 
@@ -235,18 +275,24 @@ pub async fn list_orders(
     State(s): State<AppState>,
 ) -> HandlerResult<impl IntoResponse> {
     let user_id = q.user_id.unwrap_or_else(|| "user-1".to_string());
-
-    // Per-user cache — still goes direct to Dragonfly (user-specific, not shared)
-    let mut conn = s.dragonfly.get().await?;
     let cache_key = format!("cache:orders:{}", user_id);
+
+    // Check gateway-side TTL cache first (avoids Dragonfly round-trip)
+    if let Some(cached) = s.user_cache.get(&cache_key).await {
+        let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({
+            "orders": [], "total": 0, "limit": 50, "offset": 0
+        }));
+        return Ok(Json(parsed));
+    }
+
+    // Fallback to Dragonfly
+    let mut conn = s.dragonfly.get().await?;
     let cached: String = conn.get(&cache_key).await.unwrap_or_else(|_| "{}".to_string());
 
     if cached != "{}" {
+        s.user_cache.set(cache_key, cached.clone()).await;
         let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({
-            "orders": [],
-            "total": 0,
-            "limit": 50,
-            "offset": 0
+            "orders": [], "total": 0, "limit": 50, "offset": 0
         }));
         return Ok(Json(parsed));
     }
@@ -341,13 +387,20 @@ pub async fn get_portfolio(
     State(s): State<AppState>,
 ) -> HandlerResult<impl IntoResponse> {
     let user_id = q.user_id.unwrap_or_else(|| "user-1".to_string());
-
-    // Per-user cache — direct Dragonfly
-    let mut conn = s.dragonfly.get().await?;
     let cache_key = format!("cache:portfolio:{}", user_id);
+
+    // Check gateway-side TTL cache first
+    if let Some(cached) = s.user_cache.get(&cache_key).await {
+        let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({"balances": []}));
+        return Ok(Json(parsed));
+    }
+
+    // Fallback to Dragonfly
+    let mut conn = s.dragonfly.get().await?;
     let cached: String = conn.get(&cache_key).await.unwrap_or_else(|_| "{}".to_string());
 
     if cached != "{}" {
+        s.user_cache.set(cache_key, cached.clone()).await;
         let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({"balances": []}));
         return Ok(Json(parsed));
     }
