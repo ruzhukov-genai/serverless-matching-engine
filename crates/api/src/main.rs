@@ -1,5 +1,6 @@
 use anyhow::Result;
 use deadpool_redis::Pool as RedisPool;
+#[allow(unused_imports)]
 use deadpool_redis::redis::AsyncCommands;
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Row};
@@ -264,8 +265,6 @@ async fn initialize_cache_keys(
     pg: &PgPool,
     pairs_cache: &HashMap<String, PairConfig>,
 ) -> Result<()> {
-    let mut conn = dragonfly.get().await?;
-
     // Initialize cache:pairs
     let rows = sqlx::query("SELECT id, base, quote, tick_size, lot_size, min_order_size, max_order_size, price_precision, qty_precision, price_band_pct, active FROM pairs WHERE active = true")
         .fetch_all(pg)
@@ -292,45 +291,29 @@ async fn initialize_cache_keys(
 
     let pairs_json = json!({"pairs": pairs});
     let pairs_str = serde_json::to_string(&pairs_json)?;
-    conn.set::<_, _, ()>("cache:pairs", &pairs_str).await?;
+    sme_shared::cache::set_and_publish(dragonfly, "cache:pairs", &pairs_str).await?;
 
     // Initialize empty caches for each pair
     for pair_id in pairs_cache.keys() {
-        // Empty orderbook
-        let empty_book = json!({
-            "pair": pair_id,
-            "bids": [],
-            "asks": []
-        });
+        let empty_book = json!({ "pair": pair_id, "bids": [], "asks": [] });
         let book_str = serde_json::to_string(&empty_book)?;
-        conn.set::<_, _, ()>(format!("cache:orderbook:{}", pair_id), &book_str).await?;
+        sme_shared::cache::set_and_publish(dragonfly, &format!("cache:orderbook:{}", pair_id), &book_str).await?;
 
-        // Empty ticker
-        let empty_ticker = json!({
-            "pair": pair_id,
-            "last": null,
-            "high_24h": null,
-            "low_24h": null,
-            "volume_24h": null
-        });
+        let empty_ticker = json!({ "pair": pair_id, "last": null, "high_24h": null, "low_24h": null, "volume_24h": null });
         let ticker_str = serde_json::to_string(&empty_ticker)?;
-        conn.set::<_, _, ()>(format!("cache:ticker:{}", pair_id), &ticker_str).await?;
+        sme_shared::cache::set_and_publish(dragonfly, &format!("cache:ticker:{}", pair_id), &ticker_str).await?;
 
-        // Empty trades
-        let empty_trades = json!({
-            "pair": pair_id,
-            "trades": []
-        });
+        let empty_trades = json!({ "pair": pair_id, "trades": [] });
         let trades_str = serde_json::to_string(&empty_trades)?;
-        conn.set::<_, _, ()>(format!("cache:trades:{}", pair_id), &trades_str).await?;
+        sme_shared::cache::set_and_publish(dragonfly, &format!("cache:trades:{}", pair_id), &trades_str).await?;
     }
 
     // Empty metrics caches
-    conn.set::<_, _, ()>("cache:metrics", "{}").await?;
-    conn.set::<_, _, ()>("cache:lock_metrics", "{}").await?;
-    conn.set::<_, _, ()>("cache:throughput", "{\"series\": []}").await?;
-    conn.set::<_, _, ()>("cache:latency_metrics", "{}").await?;
-    conn.set::<_, _, ()>("cache:audit", "{\"audit\": [], \"events\": []}").await?;
+    sme_shared::cache::set_and_publish(dragonfly, "cache:metrics", "{}").await?;
+    sme_shared::cache::set_and_publish(dragonfly, "cache:lock_metrics", "{}").await?;
+    sme_shared::cache::set_and_publish(dragonfly, "cache:throughput", r#"{"series":[]}"#).await?;
+    sme_shared::cache::set_and_publish(dragonfly, "cache:latency_metrics", "{}").await?;
+    sme_shared::cache::set_and_publish(dragonfly, "cache:audit", r#"{"audit":[],"events":[]}"#).await?;
 
     tracing::info!("cache keys initialized");
     Ok(())

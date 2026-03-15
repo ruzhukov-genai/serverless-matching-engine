@@ -630,7 +630,6 @@ pub async fn metrics_refresh_loop_worker(
     dragonfly: deadpool_redis::Pool,
     pg: sqlx::PgPool,
 ) {
-    use deadpool_redis::redis::AsyncCommands;
     use tokio::time::{Duration, interval};
     let mut ticker = interval(Duration::from_secs(5));
 
@@ -722,20 +721,18 @@ pub async fn metrics_refresh_loop_worker(
             Err(_) => json!({ "series": [] }),
         };
 
-        // Write to Dragonfly cache keys
-        if let Ok(mut conn) = dragonfly.get().await {
-            let metrics_str = serde_json::to_string(&metrics_val).unwrap_or("{}".to_string());
-            let _: Result<(), _> = conn.set("cache:metrics", &metrics_str).await;
-            
-            let locks_str = serde_json::to_string(&locks_val).unwrap_or("{}".to_string());
-            let _: Result<(), _> = conn.set("cache:lock_metrics", &locks_str).await;
-            
-            let latency_str = serde_json::to_string(&latency_val).unwrap_or("{}".to_string());
-            let _: Result<(), _> = conn.set("cache:latency_metrics", &latency_str).await;
-            
-            let throughput_str = serde_json::to_string(&throughput_val).unwrap_or("{}".to_string());
-            let _: Result<(), _> = conn.set("cache:throughput", &throughput_str).await;
-        }
+        // Write to Dragonfly cache keys + PUBLISH for gateway subscribers
+        let metrics_str = serde_json::to_string(&metrics_val).unwrap_or("{}".to_string());
+        let _ = sme_shared::cache::set_and_publish(&dragonfly, "cache:metrics", &metrics_str).await;
+        
+        let locks_str = serde_json::to_string(&locks_val).unwrap_or("{}".to_string());
+        let _ = sme_shared::cache::set_and_publish(&dragonfly, "cache:lock_metrics", &locks_str).await;
+        
+        let latency_str = serde_json::to_string(&latency_val).unwrap_or("{}".to_string());
+        let _ = sme_shared::cache::set_and_publish(&dragonfly, "cache:latency_metrics", &latency_str).await;
+        
+        let throughput_str = serde_json::to_string(&throughput_val).unwrap_or("{}".to_string());
+        let _ = sme_shared::cache::set_and_publish(&dragonfly, "cache:throughput", &throughput_str).await;
     }
 }
 

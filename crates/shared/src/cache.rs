@@ -28,6 +28,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
 use deadpool_redis::{Config as DPConfig, Pool, Runtime};
+use deadpool_redis::redis::AsyncCommands;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use uuid::Uuid;
@@ -69,6 +70,21 @@ pub async fn create_pool_sized(url: &str, max_size: usize) -> Result<Pool> {
         .build()
         .context("failed to create deadpool-redis pool")?;
     Ok(pool)
+}
+
+// ── Pub/Sub cache update ──────────────────────────────────────────────────────
+
+/// Channel name for cache update pub/sub notifications.
+pub const CACHE_UPDATES_CHANNEL: &str = "cache_updates";
+
+/// SET a cache key in Dragonfly AND PUBLISH the update for gateway subscribers.
+/// Format: "key\nvalue" — simple, zero-allocation parse on the subscriber side.
+pub async fn set_and_publish(pool: &Pool, key: &str, value: &str) -> Result<()> {
+    let mut conn = pool.get().await.context("pool.get")?;
+    conn.set::<_, _, ()>(key, value).await.context("SET")?;
+    let msg = format!("{}\n{}", key, value);
+    conn.publish::<_, _, ()>(CACHE_UPDATES_CHANNEL, &msg).await.context("PUBLISH")?;
+    Ok(())
 }
 
 // ── Health ────────────────────────────────────────────────────────────────────

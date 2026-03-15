@@ -147,7 +147,6 @@ pub fn spawn_orderbook_debounce_workers(
 
 /// Rebuild orderbook cache for a single pair — extracted from update_order_cache_after_processing.
 async fn rebuild_orderbook_cache(state: &AppState, pair_id: &str) -> anyhow::Result<()> {
-    let mut conn = state.dragonfly.get().await?;
     let bids = cache::load_order_book_batched(&state.dragonfly, pair_id, Side::Buy, 0, 50).await?;
     let asks = cache::load_order_book_batched(&state.dragonfly, pair_id, Side::Sell, 0, 50).await?;
 
@@ -160,7 +159,8 @@ async fn rebuild_orderbook_cache(state: &AppState, pair_id: &str) -> anyhow::Res
         "asks": asks_agg,
     });
     let orderbook_str = serde_json::to_string(&orderbook_json)?;
-    conn.set::<_, _, ()>(format!("cache:orderbook:{}", pair_id), &orderbook_str).await?;
+    let cache_key = format!("cache:orderbook:{}", pair_id);
+    cache::set_and_publish(&state.dragonfly, &cache_key, &orderbook_str).await?;
     Ok(())
 }
 
@@ -821,10 +821,7 @@ pub async fn cache_refresh_worker(state: AppState, mut dirty_users_rx: mpsc::Rec
 }
 
 async fn update_ticker_caches(state: &AppState) -> anyhow::Result<()> {
-    let mut conn = state.dragonfly.get().await?;
-
     for pair_id in PAIRS {
-        // Query latest ticker data from DB
         let ticker_row = sqlx::query(
             "SELECT 
                 MAX(price) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') as high_24h,
@@ -864,15 +861,14 @@ async fn update_ticker_caches(state: &AppState) -> anyhow::Result<()> {
         };
 
         let ticker_str = serde_json::to_string(&ticker_json)?;
-        conn.set::<_, _, ()>(format!("cache:ticker:{}", pair_id), &ticker_str).await?;
+        let cache_key = format!("cache:ticker:{}", pair_id);
+        cache::set_and_publish(&state.dragonfly, &cache_key, &ticker_str).await?;
     }
 
     Ok(())
 }
 
 async fn update_trades_caches(state: &AppState) -> anyhow::Result<()> {
-    let mut conn = state.dragonfly.get().await?;
-
     for pair_id in PAIRS {
         let rows = sqlx::query(
             "SELECT id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, sequence, created_at
@@ -902,7 +898,8 @@ async fn update_trades_caches(state: &AppState) -> anyhow::Result<()> {
         });
         
         let trades_str = serde_json::to_string(&trades_json)?;
-        conn.set::<_, _, ()>(format!("cache:trades:{}", pair_id), &trades_str).await?;
+        let cache_key = format!("cache:trades:{}", pair_id);
+        cache::set_and_publish(&state.dragonfly, &cache_key, &trades_str).await?;
     }
 
     Ok(())
@@ -917,6 +914,8 @@ async fn update_portfolio_caches_for_users(
         return Ok(());
     }
 
+    // Portfolio is per-user, not subscribed by gateway cache broadcasts.
+    // Use plain SET (no PUBLISH needed — gateway uses TTL cache for per-user data).
     let mut conn = state.dragonfly.get().await?;
 
     for user_id in user_ids {

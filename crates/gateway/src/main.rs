@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
-use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
@@ -63,24 +62,91 @@ pub struct AppState {
     pub user_cache: routes::UserCache,
 }
 
-/// Background poller: reads one key from Dragonfly at `interval_ms`,
-/// updates the CacheBroadcasts entry (watch + broadcast channels).
-async fn spawn_cache_poller(
-    pool: RedisPool,
-    key: String,
+/// Subscribe to Dragonfly pub/sub channel for cache updates.
+/// Replaces 15 per-key polling tasks with a single subscriber.
+/// Message format: "key\nvalue" (key on first line, rest is JSON value).
+async fn spawn_cache_subscriber(
+    dragonfly_url: String,
     cache: CacheBroadcasts,
-    interval_ms: u64,
+) {
+    use deadpool_redis::redis::Client;
+    use futures_util::StreamExt;
+
+    loop {
+        // Create a dedicated connection for SUBSCRIBE (can't use pool — blocks)
+        let client = match Client::open(dragonfly_url.as_str()) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to create redis client for pub/sub");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+
+        let mut pubsub = match client.get_async_pubsub().await {
+            Ok(ps) => ps,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to connect for pub/sub");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+
+        if let Err(e) = pubsub.subscribe(sme_shared::cache::CACHE_UPDATES_CHANNEL).await {
+            tracing::error!(error = %e, "failed to subscribe to cache_updates");
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            continue;
+        }
+
+        tracing::info!("cache subscriber connected to pub/sub channel");
+        let mut msg_stream = pubsub.on_message();
+
+        loop {
+            match msg_stream.next().await {
+                Some(msg) => {
+                    let payload: String = match msg.get_payload() {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    // Parse "key\nvalue" format
+                    if let Some(newline_pos) = payload.find('\n') {
+                        let key = &payload[..newline_pos];
+                        let value = &payload[newline_pos + 1..];
+                        if !value.is_empty() && value != "{}" {
+                            cache.update(key, value.to_string());
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!("pub/sub stream ended, reconnecting...");
+                    break; // reconnect
+                }
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// Slow fallback poller — refreshes all cache keys every 30s.
+/// Handles missed pub/sub messages (e.g. during reconnection).
+async fn spawn_fallback_poller(
+    pool: RedisPool,
+    cache: CacheBroadcasts,
+    keys: Vec<String>,
 ) {
     use deadpool_redis::redis::AsyncCommands;
     use tokio::time::{Duration, interval};
 
-    let mut ticker = interval(Duration::from_millis(interval_ms));
+    let mut ticker = interval(Duration::from_secs(30));
     loop {
         ticker.tick().await;
         if let Ok(mut conn) = pool.get().await {
-            if let Ok(val) = conn.get::<_, String>(&key).await {
-                if !val.is_empty() && val != "{}" {
-                    cache.update(&key, val);
+            for key in &keys {
+                if let Ok(val) = conn.get::<_, String>(key).await {
+                    if !val.is_empty() && val != "{}" {
+                        cache.update(key, val);
+                    }
                 }
             }
         }
@@ -143,14 +209,34 @@ async fn main() -> Result<()> {
         entries: Arc::new(entries),
     };
 
-    for (key, interval_ms) in &poll_specs {
-        tokio::spawn(spawn_cache_poller(
-            dragonfly.clone(),
-            key.clone(),
-            cache.clone(),
-            *interval_ms,
-        ));
+    // Warm cache: one-time GET for all keys (pub/sub only delivers new messages)
+    {
+        use deadpool_redis::redis::AsyncCommands;
+        if let Ok(mut conn) = dragonfly.get().await {
+            for (key, _) in &poll_specs {
+                if let Ok(val) = conn.get::<_, String>(key).await {
+                    if !val.is_empty() && val != "{}" {
+                        cache.update(key, val);
+                    }
+                }
+            }
+        }
+        tracing::info!(keys = poll_specs.len(), "cache warmed from Dragonfly");
     }
+
+    // Single pub/sub subscriber replaces 15 per-key pollers
+    let all_keys: Vec<String> = poll_specs.iter().map(|(k, _)| k.clone()).collect();
+    tokio::spawn(spawn_cache_subscriber(
+        config.dragonfly_url.clone(),
+        cache.clone(),
+    ));
+
+    // Slow fallback poller (every 30s) — handles missed messages during reconnection
+    tokio::spawn(spawn_fallback_poller(
+        dragonfly.clone(),
+        cache.clone(),
+        all_keys,
+    ));
 
     let state = AppState {
         dragonfly: dragonfly.clone(),
