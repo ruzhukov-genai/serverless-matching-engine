@@ -1,7 +1,6 @@
 use anyhow::Result;
 use axum::{Router, routing::get};
 use deadpool_redis::Pool as RedisPool;
-use std::sync::Arc;
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;

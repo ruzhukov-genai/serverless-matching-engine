@@ -39,18 +39,18 @@ pub async fn order_queue_consumer(state: AppState) {
                 None
             }
         };
-        if let Some((_key, order_str)) = result {
-            if let Err(e) = process_queued_order(&state, &order_str).await {
-                tracing::error!(error = %e, order_str = %order_str, "failed to process order");
-            }
+        if let Some((_key, order_str)) = result
+            && let Err(e) = process_queued_order(&state, &order_str).await
+        {
+            tracing::error!(error = %e, order_str = %order_str, "failed to process order");
         }
 
         // Also try to process a cancellation (non-blocking via RPOP)
         let cancel: Option<String> = conn.rpop("queue:cancellations", None).await.unwrap_or(None);
-        if let Some(cancel_str) = cancel {
-            if let Err(e) = process_cancellation(&state, &cancel_str).await {
-                tracing::error!(error = %e, cancel_str = %cancel_str, "failed to process cancellation");
-            }
+        if let Some(cancel_str) = cancel
+            && let Err(e) = process_cancellation(&state, &cancel_str).await
+        {
+            tracing::error!(error = %e, cancel_str = %cancel_str, "failed to process cancellation");
         }
     }
 }
@@ -146,7 +146,7 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
     if tif == TimeInForce::FOK {
         tracing::warn!("FOK orders not implemented in worker yet, cancelling");
         order.status = OrderStatus::Cancelled;
-        update_order_cache_after_processing(&state, &order, &[]).await?;
+        update_order_cache_after_processing(state, &order, &[]).await?;
         return Ok(());
     }
 
@@ -231,43 +231,123 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
     );
 
     // Update caches after successful processing
-    update_order_cache_after_processing(&state, &order, &trade_jsons).await?;
+    update_order_cache_after_processing(state, &order, &trade_jsons).await?;
 
     Ok(())
 }
 
 /// Process a cancellation request from the queue.
-async fn process_cancellation(_state: &AppState, cancel_str: &str) -> anyhow::Result<()> {
+async fn process_cancellation(state: &AppState, cancel_str: &str) -> anyhow::Result<()> {
     let cancel_json: Value = serde_json::from_str(cancel_str)?;
-    
     let cancel_type = cancel_json.get("type").and_then(|v| v.as_str()).unwrap_or("cancel");
-    
+
     match cancel_type {
         "cancel" => {
             let order_id_str = cancel_json.get("order_id").and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("missing order_id"))?;
             let order_id = Uuid::parse_str(order_id_str)?;
-            
-            // Implementation needed: cancel single order
-            tracing::info!(order_id = %order_id, "cancellation processed");
+            let user_id = cancel_json.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
+
+            // 1. Get current order from DB
+            let row = sqlx::query("SELECT pair_id, side, price, remaining, status FROM orders WHERE id = $1 AND user_id = $2")
+                .bind(order_id).bind(user_id)
+                .fetch_optional(&state.pg).await?;
+
+            let row = match row {
+                Some(r) => r,
+                None => { tracing::warn!(%order_id, "cancel: order not found"); return Ok(()); }
+            };
+
+            let status: String = row.get("status");
+            if status != "New" && status != "PartiallyFilled" {
+                tracing::warn!(%order_id, %status, "cancel: order not cancellable");
+                return Ok(());
+            }
+
+            let pair_id: String = row.get("pair_id");
+            let side: String = row.get("side");
+            let price: Option<Decimal> = row.get("price");
+            let remaining: Decimal = row.get("remaining");
+
+            // 2. Remove from Dragonfly book
+            let side_enum = if side == "Buy" { Side::Buy } else { Side::Sell };
+            let cancel_order = Order {
+                id: order_id,
+                user_id: user_id.to_string(),
+                pair_id: pair_id.clone(),
+                side: side_enum,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::GTC,
+                price,
+                quantity: remaining,
+                remaining,
+                status: OrderStatus::Cancelled,
+                stp_mode: SelfTradePreventionMode::None,
+                version: 1, sequence: 0,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                client_order_id: None,
+            };
+            cache::remove_order_from_book(&state.dragonfly, &cancel_order).await?;
+
+            // 3. Update DB status
+            sqlx::query("UPDATE orders SET status = 'Cancelled', remaining = 0, updated_at = NOW() WHERE id = $1")
+                .bind(order_id).execute(&state.pg).await?;
+
+            // 4. Release locked balance
+            let (asset, amount) = if side == "Buy" {
+                ("USDT", remaining * price.unwrap_or(Decimal::ZERO))
+            } else {
+                (pair_id.split('-').next().unwrap_or("BTC"), remaining)
+            };
+            sqlx::query("UPDATE balances SET locked = locked - $1, available = available + $1 WHERE user_id = $2 AND asset = $3")
+                .bind(amount).bind(user_id).bind(asset).execute(&state.pg_bg).await?;
+
+            tracing::info!(%order_id, "order cancelled");
         }
         "modify" => {
+            // Cancel-and-replace: cancel the old, queue a new order
             let order_id_str = cancel_json.get("order_id").and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("missing order_id"))?;
-            let order_id = Uuid::parse_str(order_id_str)?;
             
-            // Implementation needed: cancel order for modification
-            tracing::info!(order_id = %order_id, "modification processed");
+            // Cancel the existing order first
+            let cancel_msg = json!({"type": "cancel", "order_id": order_id_str,
+                "user_id": cancel_json.get("user_id").and_then(|v| v.as_str()).unwrap_or("")}).to_string();
+            Box::pin(process_cancellation(state, &cancel_msg)).await?;
+
+            // Queue the replacement order if new_order data provided
+            if let Some(new_order) = cancel_json.get("new_order") {
+                let mut conn = state.dragonfly.get().await?;
+                let order_str = serde_json::to_string(new_order)?;
+                conn.lpush::<_, _, ()>("queue:orders", &order_str).await?;
+                tracing::info!(old_order_id = %order_id_str, "modify: replacement order queued");
+            }
         }
         "cancel_all" => {
             let user_id = cancel_json.get("user_id").and_then(|v| v.as_str()).unwrap_or("user-1");
             let pair_id = cancel_json.get("pair_id").and_then(|v| v.as_str());
-            
-            // Implementation needed: cancel all orders for user
-            tracing::info!(user_id = %user_id, pair_id = ?pair_id, "cancel all processed");
+
+            // Get all open orders for user
+            let query = if let Some(pair) = pair_id {
+                sqlx::query("SELECT id, pair_id, side, price, remaining FROM orders WHERE user_id = $1 AND pair_id = $2 AND status IN ('New','PartiallyFilled')")
+                    .bind(user_id).bind(pair).fetch_all(&state.pg).await?
+            } else {
+                sqlx::query("SELECT id, pair_id, side, price, remaining FROM orders WHERE user_id = $1 AND status IN ('New','PartiallyFilled')")
+                    .bind(user_id).fetch_all(&state.pg).await?
+            };
+
+            let count = query.len();
+            for row in &query {
+                let oid: Uuid = row.get("id");
+                let cancel_msg = json!({"type": "cancel", "order_id": oid.to_string(), "user_id": user_id}).to_string();
+                if let Err(e) = Box::pin(process_cancellation(state, &cancel_msg)).await {
+                    tracing::warn!(error = %e, order_id = %oid, "cancel_all: failed to cancel order");
+                }
+            }
+            tracing::info!(%user_id, pair_id = ?pair_id, count, "cancel_all processed");
         }
         _ => {
-            tracing::warn!(cancel_type = %cancel_type, "unknown cancellation type");
+            tracing::warn!(%cancel_type, "unknown cancellation type");
         }
     }
 

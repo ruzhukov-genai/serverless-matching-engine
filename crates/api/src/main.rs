@@ -6,7 +6,7 @@ use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc};
 use tracing_subscriber::EnvFilter;
 use serde_json::{json, Value};
 
@@ -35,24 +35,8 @@ pub struct AppState {
     pub pairs_cache: Arc<HashMap<String, PairConfig>>,
     /// Channel to the background persistence worker
     pub persist_tx: mpsc::Sender<routes::PersistJob>,
-    /// Cached orderbook snapshots — updated by broadcast pollers
-    pub book_snapshots: Arc<RwLock<HashMap<String, serde_json::Value>>>,
     /// Order events broadcast — all order state changes pushed here
     pub order_events_tx: broadcast::Sender<String>,
-    // Legacy fields kept for compile compat with old handlers in routes.rs
-    // These are unused in the worker — gateway reads from Dragonfly cache keys instead
-    #[allow(dead_code)]
-    pub pairs_list_cache: Arc<RwLock<Vec<serde_json::Value>>>,
-    #[allow(dead_code)]
-    pub metrics_cache: Arc<RwLock<serde_json::Value>>,
-    #[allow(dead_code)]
-    pub ticker_cache: Arc<RwLock<HashMap<String, serde_json::Value>>>,
-    #[allow(dead_code)]
-    pub trades_cache: Arc<RwLock<HashMap<String, serde_json::Value>>>,
-    #[allow(dead_code)]
-    pub portfolio_cache: Arc<RwLock<HashMap<String, serde_json::Value>>>,
-    #[allow(dead_code)]
-    pub book_broadcasts: Arc<HashMap<String, broadcast::Sender<String>>>,
 }
 
 #[tokio::main]
@@ -111,21 +95,9 @@ async fn main() -> Result<()> {
 
     // Order events broadcast — single channel, gateway WS clients filter by user_id
     let (order_events_tx, _) = broadcast::channel::<String>(1024);
-    let book_snapshots = Arc::new(RwLock::new(HashMap::<String, serde_json::Value>::new()));
-
-    let book_broadcasts = Arc::new(HashMap::<String, broadcast::Sender<String>>::new());
-
     let state = AppState {
         dragonfly: dragonfly.clone(), pg: pg_hot, pg_bg: pg_bg.clone(), pairs_cache,
-        persist_tx,
-        book_snapshots, order_events_tx,
-        // Legacy (unused by worker, kept for compile compat)
-        pairs_list_cache: Arc::new(RwLock::new(Vec::new())),
-        metrics_cache: Arc::new(RwLock::new(json!({}))),
-        ticker_cache: Arc::new(RwLock::new(HashMap::new())),
-        trades_cache: Arc::new(RwLock::new(HashMap::new())),
-        portfolio_cache: Arc::new(RwLock::new(HashMap::new())),
-        book_broadcasts,
+        persist_tx, order_events_tx,
     };
 
     // Start the order queue consumer

@@ -12,11 +12,10 @@ use deadpool_redis::redis::AsyncCommands;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use sme_shared::{OrderStatus, OrderType, Side, SelfTradePreventionMode, TimeInForce};
+use sme_shared::{OrderType, Side, SelfTradePreventionMode, TimeInForce};
 
 use crate::AppState;
 
@@ -24,8 +23,6 @@ use crate::AppState;
 
 pub enum AppErrorKind {
     BadRequest,
-    NotFound,
-    Conflict,
     Internal,
 }
 
@@ -38,20 +35,14 @@ impl AppError {
     pub fn bad_request(e: impl Into<anyhow::Error>) -> Self {
         AppError { kind: AppErrorKind::BadRequest, inner: e.into() }
     }
-    pub fn not_found(e: impl Into<anyhow::Error>) -> Self {
-        AppError { kind: AppErrorKind::NotFound, inner: e.into() }
-    }
-    pub fn conflict(e: impl Into<anyhow::Error>) -> Self {
-        AppError { kind: AppErrorKind::Conflict, inner: e.into() }
-    }
+
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let status = match self.kind {
             AppErrorKind::BadRequest => StatusCode::BAD_REQUEST,
-            AppErrorKind::NotFound => StatusCode::NOT_FOUND,
-            AppErrorKind::Conflict => StatusCode::CONFLICT,
+
             AppErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
         tracing::error!("gateway error: {:?}", self.inner);
@@ -450,27 +441,49 @@ pub async fn ws_orderbook(
     ws.on_upgrade(move |socket| handle_orderbook_ws(pair_id, s, socket))
 }
 
-async fn handle_orderbook_ws(pair_id: String, state: AppState, mut socket: WebSocket) {
+/// Generic cache-polling WS handler — polls a Dragonfly key, sends to client,
+/// handles close/ping frames via select!
+async fn cache_poll_ws(
+    cache_key: String,
+    state: AppState,
+    mut socket: WebSocket,
+    interval_ms: u64,
+) {
     use tokio::time::{Duration, interval};
-    let mut ticker = interval(Duration::from_millis(500));
-    let cache_key = format!("cache:orderbook:{}", pair_id);
+    let mut ticker = interval(Duration::from_millis(interval_ms));
+
     loop {
-        ticker.tick().await;
-
-        let cached: String = match state.dragonfly.get().await {
-            Ok(mut conn) => match conn.get(&cache_key).await {
-                Ok(v) => v,
-                Err(_) => continue,
-            },
-            Err(_) => continue,
-        };
-
-        if !cached.is_empty() && cached != "{}" {
-            if socket.send(Message::Text(cached.into())).await.is_err() {
-                break;
+        tokio::select! {
+            _ = ticker.tick() => {
+                let cached: String = match state.dragonfly.get().await {
+                    Ok(mut conn) => match conn.get(&cache_key).await {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    },
+                    Err(_) => continue,
+                };
+                if !cached.is_empty() && cached != "{}"
+                    && socket.send(Message::Text(cached.into())).await.is_err()
+                {
+                    return;
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Close(_))) | None => return,
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = socket.send(Message::Pong(data)).await;
+                    }
+                    _ => {} // ignore text/binary from client
+                }
             }
         }
     }
+}
+
+async fn handle_orderbook_ws(pair_id: String, state: AppState, socket: WebSocket) {
+    let cache_key = format!("cache:orderbook:{}", pair_id);
+    cache_poll_ws(cache_key, state, socket, 500).await;
 }
 
 pub async fn ws_trades(
@@ -481,28 +494,9 @@ pub async fn ws_trades(
     ws.on_upgrade(move |socket| handle_trades_ws(pair_id, s, socket))
 }
 
-async fn handle_trades_ws(pair_id: String, state: AppState, mut socket: WebSocket) {
-    use tokio::time::{Duration, interval};
-    let mut ticker = interval(Duration::from_millis(500));
+async fn handle_trades_ws(pair_id: String, state: AppState, socket: WebSocket) {
     let cache_key = format!("cache:trades:{}", pair_id);
-
-    loop {
-        ticker.tick().await;
-
-        let cached: String = match state.dragonfly.get().await {
-            Ok(mut conn) => match conn.get(&cache_key).await {
-                Ok(v) => v,
-                Err(_) => continue,
-            },
-            Err(_) => continue,
-        };
-
-        if !cached.is_empty() && cached != "{}" {
-            if socket.send(Message::Text(cached.into())).await.is_err() {
-                break;
-            }
-        }
-    }
+    cache_poll_ws(cache_key, state, socket, 500).await;
 }
 
 pub async fn ws_orders(
@@ -516,24 +510,32 @@ pub async fn ws_orders(
 async fn handle_orders_ws(user_id: String, state: AppState, mut socket: WebSocket) {
     let mut rx = state.order_events_tx.subscribe();
 
-    // Stream real-time updates — filter by user_id
     loop {
-        match rx.recv().await {
-            Ok(msg) => {
-                // Each message is JSON with a "user_id" field — only forward matching ones
-                let is_mine = serde_json::from_str::<Value>(&msg)
-                    .ok()
-                    .and_then(|p| Some(p.get("user_id")?.as_str()? == user_id))
-                    .unwrap_or(false);
-                if is_mine && socket.send(Message::Text(msg.into())).await.is_err() {
-                    break;
+        tokio::select! {
+            result = rx.recv() => {
+                match result {
+                    Ok(msg) => {
+                        let is_mine = serde_json::from_str::<Value>(&msg)
+                            .ok()
+                            .and_then(|p| Some(p.get("user_id")?.as_str()? == user_id))
+                            .unwrap_or(false);
+                        if is_mine && socket.send(Message::Text(msg.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::debug!(user = %user_id, lagged = n, "ws orders client lagged");
-                continue;
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Close(_))) | None => return,
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = socket.send(Message::Pong(data)).await;
+                    }
+                    _ => {}
+                }
             }
-            Err(broadcast::error::RecvError::Closed) => break,
         }
     }
 }
