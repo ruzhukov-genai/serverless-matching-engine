@@ -315,6 +315,7 @@ pub fn trade_to_json(t: &Trade) -> Value {
     })
 }
 
+#[allow(dead_code)]
 pub async fn lock_balance(pg: &sqlx::PgPool, order: &Order) -> anyhow::Result<()> {
     let (asset, amount) = get_lock_asset_amount(pg, order).await?;
     let rows_affected = sqlx::query(
@@ -374,6 +375,7 @@ async fn release_remaining_locked(pg: &sqlx::PgPool, order: &Order) -> anyhow::R
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn get_lock_asset_amount(
     _pg: &sqlx::PgPool,
     order: &Order,

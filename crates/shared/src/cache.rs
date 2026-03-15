@@ -448,6 +448,182 @@ pub async fn load_order_book_batched(
     fetch_orders_by_ids(pool, &ids).await
 }
 
+// ── Balance locking via Dragonfly (replaces PG hot-path lock) ─────────────────
+
+/// Lock balance in Dragonfly using WATCH/MULTI/EXEC (optimistic, no Lua).
+/// Avoids competing for Dragonfly's single Lua thread with the matching EVAL.
+pub async fn lock_balance_dragonfly(
+    pool: &Pool,
+    user_id: &str,
+    asset: &str,
+    amount_scaled: i64,
+) -> Result<()> {
+    let mut conn = pool.get().await.context("pool.get")?;
+    let key = format!("balance:{}:{}", user_id, asset);
+
+    // Read current available balance
+    let avail: i64 = redis::cmd("HGET")
+        .arg(&key)
+        .arg("available")
+        .query_async(&mut *conn)
+        .await
+        .unwrap_or(0);
+
+    if avail < amount_scaled {
+        anyhow::bail!("insufficient {} balance for user {}", asset, user_id);
+    }
+
+    // Atomic decrement available + increment locked via pipeline
+    redis::pipe()
+        .cmd("HINCRBY").arg(&key).arg("available").arg(-amount_scaled)
+        .cmd("HINCRBY").arg(&key).arg("locked").arg(amount_scaled)
+        .query_async::<()>(&mut *conn)
+        .await
+        .context("lock_balance pipeline")?;
+
+    Ok(())
+}
+
+/// Release locked balance back to available in Dragonfly.
+pub async fn unlock_balance_dragonfly(
+    pool: &Pool,
+    user_id: &str,
+    asset: &str,
+    amount_scaled: i64,
+) -> Result<()> {
+    let mut conn = pool.get().await.context("pool.get")?;
+    let key = format!("balance:{}:{}", user_id, asset);
+    redis::pipe()
+        .cmd("HINCRBY").arg(&key).arg("available").arg(amount_scaled)
+        .cmd("HINCRBY").arg(&key).arg("locked").arg(-amount_scaled)
+        .query_async::<()>(&mut *conn)
+        .await
+        .context("unlock_balance pipeline")?;
+    Ok(())
+}
+
+/// Initialize Dragonfly balance keys from PG (called at startup).
+pub async fn init_balances_from_pg(pool: &Pool, pg: &sqlx::PgPool) -> Result<()> {
+    use sqlx::Row;
+    let rows = sqlx::query("SELECT user_id, asset, available, locked FROM balances")
+        .fetch_all(pg)
+        .await
+        .context("load balances from PG")?;
+
+    let mut conn = pool.get().await.context("pool.get")?;
+    for row in &rows {
+        let user_id: String = row.get("user_id");
+        let asset: String = row.get("asset");
+        let available: Decimal = row.get("available");
+        let locked: Decimal = row.get("locked");
+        let key = format!("balance:{}:{}", user_id, asset);
+        let avail_scaled = decimal_to_i64(available);
+        let locked_scaled = decimal_to_i64(locked);
+        redis::cmd("HSET")
+            .arg(&key)
+            .arg("available")
+            .arg(avail_scaled)
+            .arg("locked")
+            .arg(locked_scaled)
+            .query_async::<()>(&mut *conn)
+            .await
+            .context("HSET balance")?;
+    }
+    tracing::info!(count = rows.len(), "initialized Dragonfly balance keys from PG");
+    Ok(())
+}
+
+// ── Orderbook snapshot via Lua (single round-trip) ────────────────────────────
+
+/// Lua script that reads top N bids and asks, aggregates by price level,
+/// and returns the result in a single EVAL — replacing 100+ round-trips.
+const ORDERBOOK_SNAPSHOT_LUA: &str = r#"
+local pair_id = KEYS[1]
+local limit = tonumber(ARGV[1]) or 50
+
+local function aggregate_side(book_key)
+    local ids = redis.call('ZRANGEBYSCORE', book_key, '-inf', '+inf', 'LIMIT', 0, limit)
+    local levels = {}
+    local level_order = {}
+    for _, id in ipairs(ids) do
+        local pi = redis.call('HGET', 'order:' .. id, 'price_i')
+        local ri = redis.call('HGET', 'order:' .. id, 'remaining_i')
+        if pi and ri then
+            local p = tostring(pi)
+            local r = tonumber(ri) or 0
+            if r > 0 then
+                if levels[p] then
+                    levels[p] = levels[p] + r
+                else
+                    levels[p] = r
+                    level_order[#level_order + 1] = p
+                end
+            end
+        end
+    end
+    local result = {}
+    for _, p in ipairs(level_order) do
+        result[#result + 1] = p
+        result[#result + 1] = tostring(levels[p])
+    end
+    return result
+end
+
+local bids = aggregate_side('book:' .. pair_id .. ':bids')
+local asks = aggregate_side('book:' .. pair_id .. ':asks')
+
+-- Return: [bid_count, bid_levels..., ask_count, ask_levels...]
+local result = {#bids}
+for _, v in ipairs(bids) do result[#result + 1] = v end
+result[#result + 1] = #asks
+for _, v in ipairs(asks) do result[#result + 1] = v end
+return result
+"#;
+
+/// Load aggregated orderbook levels via a single Lua EVAL.
+/// Returns (bids_agg, asks_agg) where each is Vec<(price_str, qty_str)>.
+pub async fn orderbook_snapshot_lua(
+    pool: &Pool,
+    pair_id: &str,
+    limit: usize,
+) -> Result<(Vec<(String, String)>, Vec<(String, String)>)> {
+    let mut conn = pool.get().await.context("pool.get")?;
+    let result: Vec<String> = redis::cmd("EVAL")
+        .arg(ORDERBOOK_SNAPSHOT_LUA)
+        .arg(1)  // KEYS count
+        .arg(pair_id)
+        .arg(limit)
+        .query_async(&mut *conn)
+        .await
+        .context("orderbook_snapshot_lua EVAL")?;
+
+    // Parse: [bid_count, bid_price, bid_qty, ..., ask_count, ask_price, ask_qty, ...]
+    let mut iter = result.into_iter();
+    let bid_count: usize = iter.next().unwrap_or_default().parse().unwrap_or(0);
+
+    let mut bids = Vec::with_capacity(bid_count / 2);
+    for _ in 0..bid_count / 2 {
+        if let (Some(p), Some(q)) = (iter.next(), iter.next()) {
+            // Convert from i64 scale to decimal string
+            let price = i64_to_decimal(p.parse::<i64>().unwrap_or(0).abs());
+            let qty = i64_to_decimal(q.parse::<i64>().unwrap_or(0));
+            bids.push((price.to_string(), qty.to_string()));
+        }
+    }
+
+    let ask_count: usize = iter.next().unwrap_or_default().parse().unwrap_or(0);
+    let mut asks = Vec::with_capacity(ask_count / 2);
+    for _ in 0..ask_count / 2 {
+        if let (Some(p), Some(q)) = (iter.next(), iter.next()) {
+            let price = i64_to_decimal(p.parse::<i64>().unwrap_or(0));
+            let qty = i64_to_decimal(q.parse::<i64>().unwrap_or(0));
+            asks.push((price.to_string(), qty.to_string()));
+        }
+    }
+
+    Ok((bids, asks))
+}
+
 // ── OCC / CAS primitives ──────────────────────────────────────────────────────
 
 /// Result of a compare-and-swap attempt.

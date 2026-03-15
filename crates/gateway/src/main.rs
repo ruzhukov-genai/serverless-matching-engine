@@ -14,12 +14,17 @@ mod routes;
 /// Per-key cache entry: watch channel for zero-contention reads + broadcast for WS fan-out.
 /// Values stored as Arc<str> — borrow() returns a refcount bump, zero allocation on read path.
 pub(crate) struct CacheEntry {
-    /// WS fan-out — subscribers get pushed new values
+    /// WS fan-out — subscribers get pushed new values (throttled to MAX_WS_BROADCASTS_PER_SEC)
     broadcast_tx: broadcast::Sender<Arc<str>>,
     /// Watch channel — REST handlers borrow() with zero allocation, no lock contention.
     watch_tx: tokio::sync::watch::Sender<Option<Arc<str>>>,
     watch_rx: tokio::sync::watch::Receiver<Option<Arc<str>>>,
+    /// Last time this key was broadcast to WS clients — for rate limiting
+    last_broadcast: std::sync::Mutex<std::time::Instant>,
 }
+
+/// Max WS broadcasts per key per second. Reduces fan-out from ~60/sec to 10/sec.
+const WS_BROADCAST_INTERVAL_MS: u128 = 100;
 
 /// Shared cache broadcasts — one poller per key, N subscribers.
 /// REST handlers read via watch::borrow() (zero contention, zero allocation).
@@ -41,12 +46,20 @@ impl CacheBroadcasts {
         self.entries.get(key).and_then(|e| e.watch_rx.borrow().clone())
     }
 
-    /// Update a cache key (called by pollers). Sends to both watch + broadcast.
+    /// Update a cache key. Watch channel (REST) always gets latest.
+    /// Broadcast channel (WS fan-out) is throttled to max 10/sec per key.
     fn update(&self, key: &str, val: String) {
         if let Some(e) = self.entries.get(key) {
             let arc_val: Arc<str> = Arc::from(val);
+            // REST: always instant
             let _ = e.watch_tx.send(Some(arc_val.clone()));
-            let _ = e.broadcast_tx.send(arc_val);
+            // WS: throttled — skip broadcast if <100ms since last
+            if let Ok(mut last) = e.last_broadcast.lock() {
+                if last.elapsed().as_millis() >= WS_BROADCAST_INTERVAL_MS {
+                    let _ = e.broadcast_tx.send(arc_val);
+                    *last = std::time::Instant::now();
+                }
+            }
         }
     }
 }
@@ -202,6 +215,7 @@ async fn main() -> Result<()> {
             broadcast_tx,
             watch_tx,
             watch_rx,
+            last_broadcast: std::sync::Mutex::new(std::time::Instant::now()),
         }));
     }
 

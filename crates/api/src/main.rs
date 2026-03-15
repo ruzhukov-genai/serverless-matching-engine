@@ -184,6 +184,9 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Initialize Dragonfly balance keys from PG — fast-path balance locking
+    sme_shared::cache::init_balances_from_pg(&dragonfly, &pg_bg).await?;
+
     tracing::info!("worker started, listening for orders on queue:orders");
 
     // Keep the worker alive

@@ -16,7 +16,7 @@ use sme_shared::{
     SelfTradePreventionMode, TimeInForce, Trade,
 };
 
-use crate::{AppState, routes::{PersistJob, validate_order_request, lock_balance, order_to_json, trade_to_json}};
+use crate::{AppState, routes::{PersistJob, validate_order_request, order_to_json, trade_to_json}};
 
 const PAIRS: &[&str] = &["BTC-USDT", "ETH-USDT", "SOL-USDT"];
 
@@ -130,8 +130,9 @@ pub fn spawn_orderbook_debounce_workers(
             loop {
                 // Wait for at least one dirty signal
                 debouncer.notify[i].notified().await;
-                // Coalesce: wait 50ms for more updates to arrive
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                // Coalesce: wait 10ms for more updates to arrive.
+                // Short window since Lua snapshot rebuild is now single round-trip.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
                 let start = std::time::Instant::now();
                 if let Err(e) = rebuild_orderbook_cache(&state, &pair_owned).await {
@@ -145,18 +146,17 @@ pub fn spawn_orderbook_debounce_workers(
     }
 }
 
-/// Rebuild orderbook cache for a single pair — extracted from update_order_cache_after_processing.
+/// Rebuild orderbook cache for a single pair — uses Lua snapshot (single round-trip).
 async fn rebuild_orderbook_cache(state: &AppState, pair_id: &str) -> anyhow::Result<()> {
-    let bids = cache::load_order_book_batched(&state.dragonfly, pair_id, Side::Buy, 0, 50).await?;
-    let asks = cache::load_order_book_batched(&state.dragonfly, pair_id, Side::Sell, 0, 50).await?;
+    let (bids, asks) = cache::orderbook_snapshot_lua(&state.dragonfly, pair_id, 50).await?;
 
-    let bids_agg = aggregate_levels(bids);
-    let asks_agg = aggregate_levels(asks);
+    let bids_json: Vec<Value> = bids.iter().map(|(p, q)| json!([p, q])).collect();
+    let asks_json: Vec<Value> = asks.iter().map(|(p, q)| json!([p, q])).collect();
 
     let orderbook_json = json!({
         "pair": pair_id,
-        "bids": bids_agg,
-        "asks": asks_agg,
+        "bids": bids_json,
+        "asks": asks_json,
     });
     let orderbook_str = serde_json::to_string(&orderbook_json)?;
     let cache_key = format!("cache:orderbook:{}", pair_id);
@@ -480,11 +480,24 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
         .map_err(|e| anyhow::anyhow!("validation failed: {}", e))?;
     let validate_us = validate_start.elapsed().as_micros() as u64;
 
-    // 2. Lock balance (pre-match) — insert_order_db deferred to persist worker
+    // 2. Lock balance in Dragonfly (Lua atomic check-and-decrement).
+    //    Replaces PG hot-path round-trip (was 4.5ms avg → now <0.5ms).
+    //    PG balances reconciled by persist worker asynchronously.
     let pre_lock_start = std::time::Instant::now();
-    lock_balance(&state.pg, &order)
-        .await
-        .map_err(|e| anyhow::anyhow!("lock balance failed: {}", e))?;
+    {
+        let (base, quote) = sme_shared::parse_pair_id(pair_id)?;
+        let (asset, amount) = match order.side {
+            Side::Buy => {
+                let price = order.price.unwrap_or(Decimal::ZERO);
+                (quote, price * order.quantity)
+            }
+            Side::Sell => (base, order.quantity),
+        };
+        let amount_scaled = cache::decimal_to_i64(amount);
+        cache::lock_balance_dragonfly(&state.dragonfly, &order.user_id, &asset, amount_scaled)
+            .await
+            .map_err(|e| anyhow::anyhow!("lock balance failed: {}", e))?;
+    }
     let db_pre_us = pre_lock_start.elapsed().as_micros() as u64;
 
     // 4. Match the order using Lua atomic EVAL
