@@ -13,6 +13,7 @@ services:
       dragonfly
       --logtostderr
       --cache_mode=true
+      --default_lua_flags=allow-undeclared-keys
     ulimits:
       memlock: -1
     healthcheck:

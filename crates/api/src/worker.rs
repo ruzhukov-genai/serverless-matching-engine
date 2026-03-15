@@ -64,8 +64,10 @@ async fn pair_order_consumer(state: AppState, pair_id: String) {
     let queue_key = format!("queue:orders:{}", pair_id);
     tracing::info!(pair_id = %pair_id, queue = %queue_key, "pair order consumer started");
 
-    // Semaphore: at most 10 orders in-flight concurrently per pair
-    let sem = Arc::new(tokio::sync::Semaphore::new(10));
+    // Semaphore: at most 3 orders in-flight concurrently per pair.
+    // Higher values cause PG row-lock contention on balances and
+    // Dragonfly Lua executor serialization under burst.
+    let sem = Arc::new(tokio::sync::Semaphore::new(3));
 
     loop {
         let mut conn = match state.dragonfly.get().await {
@@ -90,9 +92,9 @@ async fn pair_order_consumer(state: AppState, pair_id: String) {
             None => continue,
         };
 
-        // Drain up to 9 more orders non-blocking (batch on burst)
+        // Drain up to 2 more orders non-blocking (batch of 3 max)
         let mut batch = vec![first_order];
-        for _ in 0..9 {
+        for _ in 0..2 {
             let extra: Option<String> = conn.rpop(&queue_key, None).await.unwrap_or(None);
             match extra {
                 Some(s) => batch.push(s),
@@ -158,8 +160,8 @@ async fn pair_cancellation_consumer(state: AppState, pair_id: String) {
 async fn fallback_order_consumer(state: AppState) {
     tracing::info!("fallback order consumer started on queue:orders");
 
-    // Semaphore: at most 10 orders in-flight concurrently
-    let sem = Arc::new(tokio::sync::Semaphore::new(10));
+    // Semaphore: at most 3 orders in-flight concurrently
+    let sem = Arc::new(tokio::sync::Semaphore::new(3));
 
     loop {
         let mut conn = match state.dragonfly.get().await {
