@@ -321,8 +321,39 @@ async fn main() -> Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
     let addr = format!("0.0.0.0:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("listening on http://{}", addr);
-    axum::serve(listener, app).await?;
+    tracing::info!("listening on http://{} (h2c enabled)", addr);
 
-    Ok(())
+    // Use hyper directly for HTTP/1.1 + h2c (cleartext HTTP/2) auto-detection.
+    // This allows clients to multiplex many requests over fewer TCP connections,
+    // reducing the 1006-connection overhead at 100 concurrent UI clients.
+    loop {
+        let (stream, _remote) = listener.accept().await?;
+        let app = app.clone();
+        tokio::spawn(async move {
+            let hyper_svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                let app = app.clone();
+                async move {
+                    let (parts, body) = req.into_parts();
+                    let body = axum::body::Body::new(body);
+                    let req = hyper::Request::from_parts(parts, body);
+                    let resp = tower_service::Service::call(&mut app.clone(), req).await;
+                    resp.map(|r| {
+                        let (parts, body) = r.into_parts();
+                        hyper::Response::from_parts(parts, body)
+                    })
+                }
+            });
+            let builder = hyper_util::server::conn::auto::Builder::new(
+                hyper_util::rt::TokioExecutor::new(),
+            );
+            if let Err(e) = builder.serve_connection_with_upgrades(
+                hyper_util::rt::TokioIo::new(stream),
+                hyper_svc,
+            ).await {
+                if !e.to_string().contains("connection reset") {
+                    tracing::debug!(error = %e, "connection ended");
+                }
+            }
+        });
+    }
 }
