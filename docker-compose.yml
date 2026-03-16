@@ -14,8 +14,16 @@ services:
       --logtostderr
       --cache_mode=true
       --default_lua_flags=allow-undeclared-keys
+      --proactor_threads=2
+      --maxmemory=2gb
+      --hz=100
     ulimits:
       memlock: -1
+    deploy:
+      resources:
+        limits:
+          cpus: "1.4"
+          memory: 2500M
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -35,14 +43,22 @@ services:
       - postgres-data:/var/lib/postgresql/data
     command: >
       postgres
-      -c max_connections=500
-      -c shared_buffers=256MB
-      -c work_mem=8MB
-      -c effective_cache_size=512MB
-      -c maintenance_work_mem=64MB
+      -c max_connections=50
+      -c shared_buffers=512MB
+      -c work_mem=16MB
+      -c effective_cache_size=2GB
+      -c maintenance_work_mem=128MB
       -c checkpoint_completion_target=0.9
       -c wal_buffers=16MB
       -c random_page_cost=1.1
+      -c synchronous_commit=off
+      -c max_wal_senders=0
+      -c wal_level=minimal
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1000M
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U sme -d matching_engine"]
       interval: 5s
