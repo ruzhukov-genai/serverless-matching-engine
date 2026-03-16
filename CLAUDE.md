@@ -12,18 +12,31 @@ Dragonfly (Redis-compatible) for distributed locking/caching, PostgreSQL for per
 
 ```
 crates/
-  shared/       → types, config, cache (sorted sets), lock (SET NX EX), DB, engine, streams
-  api/          → axum REST + WebSocket server (port 3001)
+  gateway/      → stateless HTTP/WS gateway (port 3001), reads Dragonfly cache
+  api/          → worker process, BRPOP queue consumer, matching, PG writes
+  shared/       → types, config, cache (sorted sets + Lua matching), DB, engine
   matching-engine/  → re-exports shared engine (standalone binary, unused in PoC)
   order-service/    → stream consumer (reference impl, unused in PoC)
   transaction-service/ → stream consumer (reference impl, unused in PoC)
 web/
   trading/      → vanilla HTML/CSS/JS trading UI
   dashboard/    → vanilla HTML/CSS/JS admin dashboard
+docs/
+  adr/          → Architecture Decision Records (READ THESE FIRST)
 ```
 
-**Core flow (inline in API handler):**
-`POST /api/orders` → validate → insert DB → lock balance → **acquire per-pair lock** → load book → match → update cache → **release lock** → persist trades/updates to DB
+**Core flow (gateway → worker queue):**
+`POST /api/orders` → gateway validates → `LPUSH queue:orders:{pair_id}` → 202 Accepted
+→ worker BRPOP → lock balance (PG) → Lua EVAL match (Dragonfly) → async persist (PG) → update cache
+
+**Key design constraints (see ADRs):**
+- Workers MUST be stateless — future Lambda deployment (ADR-001)
+- Only dictionary-style rarely-changing data may be cached in worker RAM
+- Dragonfly is the primary cache layer; PG is persistence
+- Gateway uses shared cache broadcasts for reads (ADR-002)
+- DB persistence is off the hot path (ADR-003)
+- Matching is atomic Lua in Dragonfly (ADR-004)
+- Per-pair queues with bounded concurrency, sem=3 (ADR-005)
 
 ## Stack
 
@@ -52,12 +65,12 @@ web/
 - All tests must pass before commit: `cargo test && cargo test --features integration -- --test-threads=1`
 
 ### Concurrency
-- **Every operation that reads or writes the order book cache MUST hold the per-pair lock**
-- Lock key: `book:{pair_id}:lock` (SET NX EX, 5s TTL)
-- Fence token: `book:{pair_id}:fence` (monotonic INCR on acquisition)
-- Version counter: `version:{pair_id}` (INCR after book mutation)
-- Cancel and modify operations re-check order status inside the lock (double-check pattern)
-- Incoming orders are saved to cache only AFTER matching, only if they rest (GTC with remaining qty)
+- **Matching is atomic via Lua EVAL** — no distributed lock needed (ADR-004)
+- Version counter: `version:{pair_id}` (INCR inside Lua after book mutation)
+- Per-pair queue consumers with bounded concurrency: `Semaphore(3)` per pair (ADR-005)
+- Cancel and modify operations re-check order status in PG before acting
+- Incoming orders rest in cache only after matching (GTC with remaining qty), written inside Lua
+- Balance locking: `UPDATE balances SET available=available-X, locked=locked+X WHERE available >= X` (row-level PG lock)
 
 ### Frontend
 - Dark theme, consistent between Trading UI and Dashboard
@@ -83,31 +96,62 @@ cargo build
 cargo test                                                    # unit tests (0.01s)
 cargo test --features integration -- --test-threads=1         # integration (needs Docker)
 
-# Run API
+# Run worker (queue consumer, matching, PG writes)
 DATABASE_URL=postgres://sme:sme_dev@localhost:5432/matching_engine \
 DRAGONFLY_URL=redis://localhost:6379 \
+RUST_LOG=info \
+./target/release/sme-api
+
+# Run gateway (HTTP/WS, reads Dragonfly, serves UI)
 PORT=3001 \
-cargo run --bin sme-api
+DRAGONFLY_URL=redis://localhost:6379 \
+RUST_LOG=info \
+./target/release/sme-gateway
+
+# Run benchmark
+python3 tools/benchmark.py
 ```
 
 ### Key URLs (dev)
 - Trading UI: `http://localhost:3001/trading/`
 - Dashboard: `http://localhost:3001/dashboard/`
 - API: `http://localhost:3001/api/pairs`
+- WebSocket: `ws://localhost:3001/ws/orderbook/BTC-USDT`
 
 ## File Map
 
+### Code
 | Path | Purpose |
 |------|---------|
+| `crates/gateway/src/main.rs` | Gateway startup, CacheBroadcasts, AppState |
+| `crates/gateway/src/routes.rs` | REST handlers, WS feeds, order submission |
+| `crates/api/src/main.rs` | Worker startup, PG pools, seed data |
+| `crates/api/src/worker.rs` | Queue consumers, order processing, cache refresh |
+| `crates/api/src/routes.rs` | Persist worker, balance lock, validation |
 | `crates/shared/src/engine.rs` | Matching algorithm + 47 unit tests |
+| `crates/shared/src/cache.rs` | Order book cache (sorted sets + Lua matching) |
+| `crates/shared/src/lua/match_order.lua` | Atomic Lua matching script |
 | `crates/shared/src/lock.rs` | Distributed locking (SET NX EX + fencing) |
-| `crates/shared/src/cache.rs` | Order book cache (sorted sets + hashes) |
-| `crates/shared/src/integration_tests.rs` | 34 integration tests (cache + DB + lock + collision) |
-| `crates/api/src/routes.rs` | All API handlers (orders, matching, portfolio) |
+| `crates/shared/src/integration_tests.rs` | 64 integration tests |
+
+### Docs (all paths relative to repo root)
+| Path | Purpose |
+|------|---------|
+| `docs/adr/*.md` | Architecture Decision Records (5 active) |
+| `docs/specs/features.md` | Feature spec (Tier 1/2/3 order types, TIF, STP) |
+| `docs/specs/matching-engine.md` | Matching engine spec |
+| `docs/specs/common-functions.md` | Shared functions spec (locking, cache keys) |
 | `docs/planning/roadmap.md` | Phase status + what's done/remaining |
-| `docs/planning/tasks.md` | Granular task backlog (one task = one commit) |
-| `docs/specs/features.md` | Feature spec (Tier 1/2/3) |
-| `docs/decisions/ADR-*.md` | Architecture Decision Records |
+| `docs/planning/tasks.md` | Task backlog |
+| `docs/benchmarks/` | Historical benchmark results (2026-03-14) |
+| `docs/brainstorm/README.md` | Open questions + resolved decisions |
+| `tools/benchmark.py` | Comprehensive load test + server profiling |
+
+### Symlinks
+| Path | Target |
+|------|--------|
+| `AGENTS.md` | → `CLAUDE.md` |
+| `.github/copilot-instructions.md` | → `CLAUDE.md` |
 
 ## Don'ts
 

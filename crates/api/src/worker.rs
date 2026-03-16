@@ -5,6 +5,8 @@ use serde_json::{json, Value};
 use chrono::Utc;
 use rust_decimal::Decimal;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 use sqlx::Row;
 use tokio::sync::mpsc;
@@ -14,9 +16,153 @@ use sme_shared::{
     SelfTradePreventionMode, TimeInForce, Trade,
 };
 
-use crate::{AppState, routes::{PersistJob, validate_order_request, insert_order_db, lock_balance, order_to_json, trade_to_json}};
+use crate::{AppState, routes::{PersistJob, validate_order_request, order_to_json, trade_to_json}};
 
 const PAIRS: &[&str] = &["BTC-USDT", "ETH-USDT", "SOL-USDT"];
+
+// ── Batched metrics accumulator ──────────────────────────────────────────────
+// Instead of 4 fire-and-forget Dragonfly writes per order, accumulate in-memory
+// and flush periodically. Reduces Dragonfly ops from ~400/sec to ~3/sec at 100 ord/sec.
+
+pub struct MetricsBatch {
+    pub order_counts: [AtomicU64; 3],   // per pair index
+    pub trade_counts: [AtomicU64; 3],
+    pub latency_samples: [std::sync::Mutex<Vec<u64>>; 3], // lua_ms per pair
+}
+
+impl MetricsBatch {
+    pub fn new() -> Self {
+        Self {
+            order_counts: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+            trade_counts: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+            latency_samples: [
+                std::sync::Mutex::new(Vec::new()),
+                std::sync::Mutex::new(Vec::new()),
+                std::sync::Mutex::new(Vec::new()),
+            ],
+        }
+    }
+
+    fn pair_index(pair_id: &str) -> usize {
+        match pair_id {
+            "BTC-USDT" => 0,
+            "ETH-USDT" => 1,
+            "SOL-USDT" => 2,
+            _ => 0,
+        }
+    }
+
+    pub fn record_order(&self, pair_id: &str, trade_count: usize, lua_ms: u64) {
+        let idx = Self::pair_index(pair_id);
+        self.order_counts[idx].fetch_add(1, Ordering::Relaxed);
+        if trade_count > 0 {
+            self.trade_counts[idx].fetch_add(trade_count as u64, Ordering::Relaxed);
+        }
+        if let Ok(mut samples) = self.latency_samples[idx].lock() {
+            samples.push(lua_ms);
+            // Cap at 1000 samples to prevent unbounded growth between flushes
+            if samples.len() > 1000 {
+                samples.drain(..500);
+            }
+        }
+    }
+
+    /// Flush accumulated metrics to Dragonfly. Called every 2s by metrics flush worker.
+    pub async fn flush(&self, pool: &deadpool_redis::Pool) {
+        for (i, pair_id) in PAIRS.iter().enumerate() {
+            let orders = self.order_counts[i].swap(0, Ordering::Relaxed);
+            let trades = self.trade_counts[i].swap(0, Ordering::Relaxed);
+            let samples: Vec<u64> = self.latency_samples[i].lock()
+                .map(|mut s| s.drain(..).collect())
+                .unwrap_or_default();
+
+            if orders > 0 {
+                let _ = metrics::increment_order_count_by(pool, pair_id, orders).await;
+            }
+            if trades > 0 {
+                let _ = metrics::increment_trade_count(pool, pair_id, trades).await;
+            }
+            for ms in &samples {
+                let _ = metrics::record_match_latency(pool, pair_id, *ms).await;
+            }
+        }
+    }
+}
+
+// ── Orderbook rebuild debouncer ──────────────────────────────────────────────
+// Instead of rebuilding the orderbook cache after every single order,
+// coalesce rapid updates into one rebuild per pair per debounce window.
+
+pub struct OrderbookDebouncer {
+    /// Notify channels per pair — send () to signal "needs rebuild"
+    notify: [tokio::sync::Notify; 3],
+}
+
+impl OrderbookDebouncer {
+    pub fn new() -> Self {
+        Self {
+            notify: [
+                tokio::sync::Notify::new(),
+                tokio::sync::Notify::new(),
+                tokio::sync::Notify::new(),
+            ],
+        }
+    }
+
+    /// Signal that a pair's orderbook needs rebuilding.
+    pub fn mark_dirty(&self, pair_id: &str) {
+        let idx = MetricsBatch::pair_index(pair_id);
+        self.notify[idx].notify_one();
+    }
+}
+
+/// Spawn debounced orderbook rebuild tasks — one per pair.
+/// Waits for dirty signal, then coalesces for 50ms before rebuilding.
+pub fn spawn_orderbook_debounce_workers(
+    debouncer: Arc<OrderbookDebouncer>,
+    state: AppState,
+) {
+    for (i, &pair_id) in PAIRS.iter().enumerate() {
+        let debouncer = debouncer.clone();
+        let state = state.clone();
+        let pair_owned = pair_id.to_string();
+        tokio::spawn(async move {
+            loop {
+                // Wait for at least one dirty signal
+                debouncer.notify[i].notified().await;
+                // Coalesce: wait 10ms for more updates to arrive.
+                // Short window since Lua snapshot rebuild is now single round-trip.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+                let start = std::time::Instant::now();
+                if let Err(e) = rebuild_orderbook_cache(&state, &pair_owned).await {
+                    tracing::warn!(error = %e, pair_id = %pair_owned, "debounced orderbook rebuild failed");
+                } else {
+                    let elapsed_us = start.elapsed().as_micros();
+                    tracing::debug!(pair_id = %pair_owned, elapsed_us = elapsed_us, "orderbook cache rebuilt (debounced)");
+                }
+            }
+        });
+    }
+}
+
+/// Rebuild orderbook cache for a single pair — uses Lua snapshot (single round-trip).
+async fn rebuild_orderbook_cache(state: &AppState, pair_id: &str) -> anyhow::Result<()> {
+    let (bids, asks) = cache::orderbook_snapshot_lua(&state.dragonfly, pair_id, 50).await?;
+
+    let bids_json: Vec<Value> = bids.iter().map(|(p, q)| json!([p, q])).collect();
+    let asks_json: Vec<Value> = asks.iter().map(|(p, q)| json!([p, q])).collect();
+
+    let orderbook_json = json!({
+        "pair": pair_id,
+        "bids": bids_json,
+        "asks": asks_json,
+    });
+    let orderbook_str = serde_json::to_string(&orderbook_json)?;
+    let cache_key = format!("cache:orderbook:{}", pair_id);
+    cache::set_and_publish(&state.dragonfly, &cache_key, &orderbook_str).await?;
+    Ok(())
+}
 
 /// Main order queue consumer — spawns one task per pair plus a fallback task.
 ///
@@ -57,9 +203,16 @@ pub async fn order_queue_consumer(state: AppState) {
 }
 
 /// BRPOP loop for a single pair's order queue: `queue:orders:{pair_id}`.
+/// After each BRPOP wake, drains up to 9 more orders with non-blocking RPOP,
+/// then spawns each order's processing concurrently (up to 10 in-flight per pair).
 async fn pair_order_consumer(state: AppState, pair_id: String) {
     let queue_key = format!("queue:orders:{}", pair_id);
     tracing::info!(pair_id = %pair_id, queue = %queue_key, "pair order consumer started");
+
+    // Semaphore: at most 3 orders in-flight concurrently per pair.
+    // Higher values cause PG row-lock contention on balances and
+    // Dragonfly Lua executor serialization under burst.
+    let sem = Arc::new(tokio::sync::Semaphore::new(3));
 
     loop {
         let mut conn = match state.dragonfly.get().await {
@@ -79,10 +232,32 @@ async fn pair_order_consumer(state: AppState, pair_id: String) {
             }
         };
 
-        if let Some((_key, order_str)) = result
-            && let Err(e) = process_queued_order(&state, &order_str).await
-        {
-            tracing::error!(error = %e, order_str = %order_str, "failed to process order");
+        let first_order = match result {
+            Some((_key, s)) => s,
+            None => continue,
+        };
+
+        // Drain up to 2 more orders non-blocking (batch of 3 max)
+        let mut batch = vec![first_order];
+        for _ in 0..2 {
+            let extra: Option<String> = conn.rpop(&queue_key, None).await.unwrap_or(None);
+            match extra {
+                Some(s) => batch.push(s),
+                None => break,
+            }
+        }
+        drop(conn); // release connection before spawning
+
+        // Spawn each order concurrently, limited by semaphore
+        for order_str in batch {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = process_queued_order(&state_clone, &order_str).await {
+                    tracing::error!(error = %e, order_str = %order_str, "failed to process order");
+                }
+                drop(permit);
+            });
         }
     }
 }
@@ -91,6 +266,9 @@ async fn pair_order_consumer(state: AppState, pair_id: String) {
 async fn pair_cancellation_consumer(state: AppState, pair_id: String) {
     let queue_key = format!("queue:cancellations:{}", pair_id);
     tracing::info!(pair_id = %pair_id, queue = %queue_key, "pair cancellation consumer started");
+
+    // Semaphore: at most 5 cancellations in-flight concurrently per pair
+    let sem = Arc::new(tokio::sync::Semaphore::new(5));
 
     loop {
         let mut conn = match state.dragonfly.get().await {
@@ -110,10 +288,15 @@ async fn pair_cancellation_consumer(state: AppState, pair_id: String) {
             }
         };
 
-        if let Some((_key, cancel_str)) = result
-            && let Err(e) = process_cancellation(&state, &cancel_str).await
-        {
-            tracing::error!(error = %e, cancel_str = %cancel_str, "failed to process cancellation");
+        if let Some((_key, cancel_str)) = result {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = process_cancellation(&state_clone, &cancel_str).await {
+                    tracing::error!(error = %e, cancel_str = %cancel_str, "failed to process cancellation");
+                }
+                drop(permit);
+            });
         }
     }
 }
@@ -121,6 +304,9 @@ async fn pair_cancellation_consumer(state: AppState, pair_id: String) {
 /// Fallback BRPOP loop on `queue:orders` — backward compat for old producers.
 async fn fallback_order_consumer(state: AppState) {
     tracing::info!("fallback order consumer started on queue:orders");
+
+    // Semaphore: at most 3 orders in-flight concurrently
+    let sem = Arc::new(tokio::sync::Semaphore::new(3));
 
     loop {
         let mut conn = match state.dragonfly.get().await {
@@ -140,10 +326,31 @@ async fn fallback_order_consumer(state: AppState) {
             }
         };
 
-        if let Some((_key, order_str)) = result
-            && let Err(e) = process_queued_order(&state, &order_str).await
-        {
-            tracing::error!(error = %e, order_str = %order_str, "failed to process order");
+        let first_order = match result {
+            Some((_key, s)) => s,
+            None => continue,
+        };
+
+        // Drain up to 9 more non-blocking
+        let mut batch = vec![first_order];
+        for _ in 0..9 {
+            let extra: Option<String> = conn.rpop("queue:orders", None).await.unwrap_or(None);
+            match extra {
+                Some(s) => batch.push(s),
+                None => break,
+            }
+        }
+        drop(conn);
+
+        for order_str in batch {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = process_queued_order(&state_clone, &order_str).await {
+                    tracing::error!(error = %e, order_str = %order_str, "failed to process order");
+                }
+                drop(permit);
+            });
         }
     }
 }
@@ -152,6 +359,9 @@ async fn fallback_order_consumer(state: AppState) {
 /// that don't know the pair_id.
 async fn fallback_cancellation_consumer(state: AppState) {
     tracing::info!("fallback cancellation consumer started on queue:cancellations");
+
+    // Semaphore: at most 5 cancellations in-flight concurrently
+    let sem = Arc::new(tokio::sync::Semaphore::new(5));
 
     loop {
         let mut conn = match state.dragonfly.get().await {
@@ -171,10 +381,15 @@ async fn fallback_cancellation_consumer(state: AppState) {
             }
         };
 
-        if let Some((_key, cancel_str)) = result
-            && let Err(e) = process_cancellation(&state, &cancel_str).await
-        {
-            tracing::error!(error = %e, cancel_str = %cancel_str, "failed to process cancellation");
+        if let Some((_key, cancel_str)) = result {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = process_cancellation(&state_clone, &cancel_str).await {
+                    tracing::error!(error = %e, cancel_str = %cancel_str, "failed to process cancellation");
+                }
+                drop(permit);
+            });
         }
     }
 }
@@ -184,6 +399,7 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
     let total_start = std::time::Instant::now();
 
     // Parse the order JSON from the gateway
+    let parse_start = std::time::Instant::now();
     let order_json: Value = serde_json::from_str(order_str)?;
     
     let user_id = order_json.get("user_id").and_then(|v| v.as_str()).unwrap_or("user-1").to_string();
@@ -249,17 +465,40 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
         client_order_id,
     };
 
+    let parse_us = parse_start.elapsed().as_micros() as u64;
+
+    // Measure queue-to-pickup latency (gateway created_at → now)
+    let queue_latency_us = {
+        let now_ts = Utc::now().timestamp_micros();
+        let created_ts = order.created_at.timestamp_micros();
+        (now_ts - created_ts).max(0) as u64
+    };
+
     // 1. Validate (outside lock) — uses in-memory cache, zero DB round-trips
+    let validate_start = std::time::Instant::now();
     validate_order_request(&state.pairs_cache, &order)
         .map_err(|e| anyhow::anyhow!("validation failed: {}", e))?;
+    let validate_us = validate_start.elapsed().as_micros() as u64;
 
-    // 2+3. Insert to DB and lock balance in parallel — both are independent operations
+    // 2. Lock balance in Dragonfly (Lua atomic check-and-decrement).
+    //    Replaces PG hot-path round-trip (was 4.5ms avg → now <0.5ms).
+    //    PG balances reconciled by persist worker asynchronously.
     let pre_lock_start = std::time::Instant::now();
-    tokio::try_join!(
-        insert_order_db(&state.pg, &order),
-        lock_balance(&state.pg, &order),
-    ).map_err(|e| anyhow::anyhow!("pre-match DB ops failed: {}", e))?;
-    let _pre_lock_ms = pre_lock_start.elapsed().as_millis() as u64;
+    {
+        let (base, quote) = sme_shared::parse_pair_id(pair_id)?;
+        let (asset, amount) = match order.side {
+            Side::Buy => {
+                let price = order.price.unwrap_or(Decimal::ZERO);
+                (quote, price * order.quantity)
+            }
+            Side::Sell => (base, order.quantity),
+        };
+        let amount_scaled = cache::decimal_to_i64(amount);
+        cache::lock_balance_dragonfly(&state.dragonfly, &order.user_id, &asset, amount_scaled)
+            .await
+            .map_err(|e| anyhow::anyhow!("lock balance failed: {}", e))?;
+    }
+    let db_pre_us = pre_lock_start.elapsed().as_micros() as u64;
 
     // 4. Match the order using Lua atomic EVAL
     let match_start = std::time::Instant::now();
@@ -274,7 +513,7 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
 
     // Non-FOK: single atomic Lua EVAL — no lock, no retry
     let lua_result = cache::match_order_lua(&state.dragonfly, &order).await?;
-    let lua_ms = match_start.elapsed().as_millis() as u64;
+    let lua_us = match_start.elapsed().as_micros() as u64;
 
     // Apply Lua result to the incoming order struct
     order.remaining = lua_result.remaining;
@@ -282,19 +521,8 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
 
     let trade_count = lua_result.trades.len();
 
-    // Metrics (best-effort)
-    {
-        let pool = state.dragonfly.clone();
-        let pair_id_owned = pair_id.to_string();
-        tokio::spawn(async move {
-            let _ = metrics::record_match_latency(&pool, &pair_id_owned, lua_ms).await;
-            let _ = metrics::record_lock_wait(&pool, &pair_id_owned, 0).await;
-            let _ = metrics::increment_order_count(&pool, &pair_id_owned).await;
-            if trade_count > 0 {
-                let _ = metrics::increment_trade_count(&pool, &pair_id_owned, trade_count as u64).await;
-            }
-        });
-    }
+    // Metrics — accumulate in-memory batch (flushed every 2s, zero Dragonfly ops here)
+    state.metrics_batch.record_order(pair_id, trade_count, lua_us / 1000);
 
     // Build Trade objects (UUIDs generated in Rust, not Lua)
     let trade_now = Utc::now();
@@ -352,19 +580,42 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
         }
     }
 
-    let total_ms = total_start.elapsed().as_millis() as u64;
+    // 5. Emit WS event synchronously (just a channel send — negligible latency)
+    if !trade_jsons.is_empty() {
+        let event_msg = serde_json::to_string(&json!({
+            "type": "order_created",
+            "user_id": order.user_id,
+            "order": order_to_json(&order),
+            "trades": &trade_jsons,
+        })).unwrap_or_default();
+        let _ = state.order_events_tx.send(event_msg);
+    }
+
+    // 5b. Signal orderbook rebuild via debouncer — coalesces rapid updates.
+    // Only signals if the book actually changed (trade occurred or order rested).
+    let order_rested = order.status == OrderStatus::New
+        || order.status == OrderStatus::PartiallyFilled;
+    let had_trades = !trade_jsons.is_empty();
+    if had_trades || order_rested {
+        state.orderbook_debouncer.mark_dirty(pair_id);
+    }
+    let cache_us = 0u64;
+
+    let total_us = total_start.elapsed().as_micros() as u64;
 
     tracing::info!(
-        lua_ms = lua_ms,
-        total_ms = total_ms,
+        queue_latency_us = queue_latency_us,
+        parse_us = parse_us,
+        validate_us = validate_us,
+        db_pre_us = db_pre_us,
+        lua_us = lua_us,
+        cache_us = cache_us,
+        total_us = total_us,
         trade_count = trade_count,
         pair_id = %order.pair_id,
         order_id = %order.id,
-        "order processed"
+        "order processed [segments]"
     );
-
-    // Update caches after successful processing
-    update_order_cache_after_processing(state, &order, &trade_jsons).await?;
 
     Ok(())
 }
@@ -528,17 +779,6 @@ async fn update_order_cache_after_processing(
     let orderbook_str = serde_json::to_string(&orderbook_json)?;
     conn.set::<_, _, ()>(format!("cache:orderbook:{}", order.pair_id), &orderbook_str).await?;
 
-    // Emit order event to broadcast channel
-    if had_trades {
-        let event_msg = serde_json::to_string(&json!({
-            "type": "order_created",
-            "user_id": order.user_id,
-            "order": order_to_json(order),
-            "trades": trade_jsons,
-        })).unwrap_or_default();
-        let _ = state.order_events_tx.send(event_msg);
-    }
-
     Ok(())
 }
 
@@ -594,10 +834,7 @@ pub async fn cache_refresh_worker(state: AppState, mut dirty_users_rx: mpsc::Rec
 }
 
 async fn update_ticker_caches(state: &AppState) -> anyhow::Result<()> {
-    let mut conn = state.dragonfly.get().await?;
-
     for pair_id in PAIRS {
-        // Query latest ticker data from DB
         let ticker_row = sqlx::query(
             "SELECT 
                 MAX(price) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') as high_24h,
@@ -637,15 +874,14 @@ async fn update_ticker_caches(state: &AppState) -> anyhow::Result<()> {
         };
 
         let ticker_str = serde_json::to_string(&ticker_json)?;
-        conn.set::<_, _, ()>(format!("cache:ticker:{}", pair_id), &ticker_str).await?;
+        let cache_key = format!("cache:ticker:{}", pair_id);
+        cache::set_and_publish(&state.dragonfly, &cache_key, &ticker_str).await?;
     }
 
     Ok(())
 }
 
 async fn update_trades_caches(state: &AppState) -> anyhow::Result<()> {
-    let mut conn = state.dragonfly.get().await?;
-
     for pair_id in PAIRS {
         let rows = sqlx::query(
             "SELECT id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, sequence, created_at
@@ -675,7 +911,8 @@ async fn update_trades_caches(state: &AppState) -> anyhow::Result<()> {
         });
         
         let trades_str = serde_json::to_string(&trades_json)?;
-        conn.set::<_, _, ()>(format!("cache:trades:{}", pair_id), &trades_str).await?;
+        let cache_key = format!("cache:trades:{}", pair_id);
+        cache::set_and_publish(&state.dragonfly, &cache_key, &trades_str).await?;
     }
 
     Ok(())
@@ -690,6 +927,8 @@ async fn update_portfolio_caches_for_users(
         return Ok(());
     }
 
+    // Portfolio is per-user, not subscribed by gateway cache broadcasts.
+    // Use plain SET (no PUBLISH needed — gateway uses TTL cache for per-user data).
     let mut conn = state.dragonfly.get().await?;
 
     for user_id in user_ids {

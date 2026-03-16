@@ -28,6 +28,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
 use deadpool_redis::{Config as DPConfig, Pool, Runtime};
+use deadpool_redis::redis::AsyncCommands;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use uuid::Uuid;
@@ -54,15 +55,36 @@ pub fn i64_to_decimal(i: i64) -> Decimal {
 // ── Pool ─────────────────────────────────────────────────────────────────────
 
 pub async fn create_pool(url: &str) -> Result<Pool> {
+    create_pool_sized(url, 200).await
+}
+
+/// Create a Dragonfly connection pool with a specific max size.
+/// Use smaller pools where fewer connections are needed (e.g. gateway: ~20).
+pub async fn create_pool_sized(url: &str, max_size: usize) -> Result<Pool> {
     let pool = DPConfig::from_url(url)
         .builder()
         .context("failed to create redis pool builder")?
-        .max_size(200)
+        .max_size(max_size)
         .wait_timeout(Some(Duration::from_secs(3)))
         .runtime(Runtime::Tokio1)
         .build()
         .context("failed to create deadpool-redis pool")?;
     Ok(pool)
+}
+
+// ── Pub/Sub cache update ──────────────────────────────────────────────────────
+
+/// Channel name for cache update pub/sub notifications.
+pub const CACHE_UPDATES_CHANNEL: &str = "cache_updates";
+
+/// SET a cache key in Dragonfly AND PUBLISH the update for gateway subscribers.
+/// Format: "key\nvalue" — simple, zero-allocation parse on the subscriber side.
+pub async fn set_and_publish(pool: &Pool, key: &str, value: &str) -> Result<()> {
+    let mut conn = pool.get().await.context("pool.get")?;
+    conn.set::<_, _, ()>(key, value).await.context("SET")?;
+    let msg = format!("{}\n{}", key, value);
+    conn.publish::<_, _, ()>(CACHE_UPDATES_CHANNEL, &msg).await.context("PUBLISH")?;
+    Ok(())
 }
 
 // ── Health ────────────────────────────────────────────────────────────────────
@@ -426,6 +448,182 @@ pub async fn load_order_book_batched(
     fetch_orders_by_ids(pool, &ids).await
 }
 
+// ── Balance locking via Dragonfly (replaces PG hot-path lock) ─────────────────
+
+/// Lock balance in Dragonfly using WATCH/MULTI/EXEC (optimistic, no Lua).
+/// Avoids competing for Dragonfly's single Lua thread with the matching EVAL.
+pub async fn lock_balance_dragonfly(
+    pool: &Pool,
+    user_id: &str,
+    asset: &str,
+    amount_scaled: i64,
+) -> Result<()> {
+    let mut conn = pool.get().await.context("pool.get")?;
+    let key = format!("balance:{}:{}", user_id, asset);
+
+    // Read current available balance
+    let avail: i64 = redis::cmd("HGET")
+        .arg(&key)
+        .arg("available")
+        .query_async(&mut *conn)
+        .await
+        .unwrap_or(0);
+
+    if avail < amount_scaled {
+        anyhow::bail!("insufficient {} balance for user {}", asset, user_id);
+    }
+
+    // Atomic decrement available + increment locked via pipeline
+    redis::pipe()
+        .cmd("HINCRBY").arg(&key).arg("available").arg(-amount_scaled)
+        .cmd("HINCRBY").arg(&key).arg("locked").arg(amount_scaled)
+        .query_async::<()>(&mut *conn)
+        .await
+        .context("lock_balance pipeline")?;
+
+    Ok(())
+}
+
+/// Release locked balance back to available in Dragonfly.
+pub async fn unlock_balance_dragonfly(
+    pool: &Pool,
+    user_id: &str,
+    asset: &str,
+    amount_scaled: i64,
+) -> Result<()> {
+    let mut conn = pool.get().await.context("pool.get")?;
+    let key = format!("balance:{}:{}", user_id, asset);
+    redis::pipe()
+        .cmd("HINCRBY").arg(&key).arg("available").arg(amount_scaled)
+        .cmd("HINCRBY").arg(&key).arg("locked").arg(-amount_scaled)
+        .query_async::<()>(&mut *conn)
+        .await
+        .context("unlock_balance pipeline")?;
+    Ok(())
+}
+
+/// Initialize Dragonfly balance keys from PG (called at startup).
+pub async fn init_balances_from_pg(pool: &Pool, pg: &sqlx::PgPool) -> Result<()> {
+    use sqlx::Row;
+    let rows = sqlx::query("SELECT user_id, asset, available, locked FROM balances")
+        .fetch_all(pg)
+        .await
+        .context("load balances from PG")?;
+
+    let mut conn = pool.get().await.context("pool.get")?;
+    for row in &rows {
+        let user_id: String = row.get("user_id");
+        let asset: String = row.get("asset");
+        let available: Decimal = row.get("available");
+        let locked: Decimal = row.get("locked");
+        let key = format!("balance:{}:{}", user_id, asset);
+        let avail_scaled = decimal_to_i64(available);
+        let locked_scaled = decimal_to_i64(locked);
+        redis::cmd("HSET")
+            .arg(&key)
+            .arg("available")
+            .arg(avail_scaled)
+            .arg("locked")
+            .arg(locked_scaled)
+            .query_async::<()>(&mut *conn)
+            .await
+            .context("HSET balance")?;
+    }
+    tracing::info!(count = rows.len(), "initialized Dragonfly balance keys from PG");
+    Ok(())
+}
+
+// ── Orderbook snapshot via Lua (single round-trip) ────────────────────────────
+
+/// Lua script that reads top N bids and asks, aggregates by price level,
+/// and returns the result in a single EVAL — replacing 100+ round-trips.
+const ORDERBOOK_SNAPSHOT_LUA: &str = r#"
+local pair_id = KEYS[1]
+local limit = tonumber(ARGV[1]) or 50
+
+local function aggregate_side(book_key)
+    local ids = redis.call('ZRANGEBYSCORE', book_key, '-inf', '+inf', 'LIMIT', 0, limit)
+    local levels = {}
+    local level_order = {}
+    for _, id in ipairs(ids) do
+        local pi = redis.call('HGET', 'order:' .. id, 'price_i')
+        local ri = redis.call('HGET', 'order:' .. id, 'remaining_i')
+        if pi and ri then
+            local p = tostring(pi)
+            local r = tonumber(ri) or 0
+            if r > 0 then
+                if levels[p] then
+                    levels[p] = levels[p] + r
+                else
+                    levels[p] = r
+                    level_order[#level_order + 1] = p
+                end
+            end
+        end
+    end
+    local result = {}
+    for _, p in ipairs(level_order) do
+        result[#result + 1] = p
+        result[#result + 1] = tostring(levels[p])
+    end
+    return result
+end
+
+local bids = aggregate_side('book:' .. pair_id .. ':bids')
+local asks = aggregate_side('book:' .. pair_id .. ':asks')
+
+-- Return: [bid_count, bid_levels..., ask_count, ask_levels...]
+local result = {#bids}
+for _, v in ipairs(bids) do result[#result + 1] = v end
+result[#result + 1] = #asks
+for _, v in ipairs(asks) do result[#result + 1] = v end
+return result
+"#;
+
+/// Load aggregated orderbook levels via a single Lua EVAL.
+/// Returns (bids_agg, asks_agg) where each is Vec<(price_str, qty_str)>.
+pub async fn orderbook_snapshot_lua(
+    pool: &Pool,
+    pair_id: &str,
+    limit: usize,
+) -> Result<(Vec<(String, String)>, Vec<(String, String)>)> {
+    let mut conn = pool.get().await.context("pool.get")?;
+    let result: Vec<String> = redis::cmd("EVAL")
+        .arg(ORDERBOOK_SNAPSHOT_LUA)
+        .arg(1)  // KEYS count
+        .arg(pair_id)
+        .arg(limit)
+        .query_async(&mut *conn)
+        .await
+        .context("orderbook_snapshot_lua EVAL")?;
+
+    // Parse: [bid_count, bid_price, bid_qty, ..., ask_count, ask_price, ask_qty, ...]
+    let mut iter = result.into_iter();
+    let bid_count: usize = iter.next().unwrap_or_default().parse().unwrap_or(0);
+
+    let mut bids = Vec::with_capacity(bid_count / 2);
+    for _ in 0..bid_count / 2 {
+        if let (Some(p), Some(q)) = (iter.next(), iter.next()) {
+            // Convert from i64 scale to decimal string
+            let price = i64_to_decimal(p.parse::<i64>().unwrap_or(0).abs());
+            let qty = i64_to_decimal(q.parse::<i64>().unwrap_or(0));
+            bids.push((price.to_string(), qty.to_string()));
+        }
+    }
+
+    let ask_count: usize = iter.next().unwrap_or_default().parse().unwrap_or(0);
+    let mut asks = Vec::with_capacity(ask_count / 2);
+    for _ in 0..ask_count / 2 {
+        if let (Some(p), Some(q)) = (iter.next(), iter.next()) {
+            let price = i64_to_decimal(p.parse::<i64>().unwrap_or(0));
+            let qty = i64_to_decimal(q.parse::<i64>().unwrap_or(0));
+            asks.push((price.to_string(), qty.to_string()));
+        }
+    }
+
+    Ok((bids, asks))
+}
+
 // ── OCC / CAS primitives ──────────────────────────────────────────────────────
 
 /// Result of a compare-and-swap attempt.
@@ -703,18 +901,13 @@ fn redis_value_to_string(v: &redis::Value) -> Option<String> {
     }
 }
 
-/// Match an incoming order atomically inside Dragonfly via a two-phase approach:
+/// Match an incoming order atomically inside Dragonfly via a single EVAL round-trip.
 ///
-/// **Phase 1 (RT1):** `ZRANGEBYSCORE` — fetch up to 100 resting order IDs from
-///   the opposite book side. This gives us the candidate list.
+/// The Lua script calls ZRANGEBYSCORE internally to fetch resting order IDs,
+/// then accesses their hashes directly. Dragonfly (non-cluster) allows undeclared
+/// key access in scripts — no Phase 1 round-trip needed.
 ///
-/// **Phase 2 (RT2):** `EVAL` — the Lua script receives all resting order keys
-///   pre-declared in `KEYS[]` (Dragonfly enforces that scripts only access declared
-///   keys). It reads each resting order, runs price-time priority matching, commits
-///   all mutations (fills, partial fills, adding resting incoming order), and returns
-///   trade results — all atomically in a single script execution.
-///
-/// Total: 2 round-trips, no lock, no retry, no CAS version check.
+/// Total: 1 round-trip, no lock, no retry, no CAS version check.
 ///
 /// # FOK note
 /// FOK orders are NOT handled here. See the OCC/CAS path in routes.rs.
@@ -729,72 +922,39 @@ pub async fn match_order_lua(
     let version_key = format!("version:{}", order.pair_id);
     let incoming_order_key = format!("order:{}", order.id);
 
-    // Determine opposite book key (we read from opponent's side)
-    let opp_key = match order.side {
-        Side::Buy => &asks_key,
-        Side::Sell => &bids_key,
-    };
-
     let price_i = order.price.map(decimal_to_i64).unwrap_or(0);
     let score = order.book_score();
 
-    let mut conn = pool.get().await.context("pool.get")?;
-
-    // ── Phase 1: price-bounded fetch of resting order IDs ────────────────────
-    // For Limit orders we only need counterparty orders that can match our price.
-    // Ask scores are positive (score = price_i). Bid scores are negative (score = -price_i).
-    // Limit=50 — matching more than 50 levels in one shot is extremely rare.
-    let (phase1_min, phase1_max) = match (order.side, order.price) {
+    // Calculate price bound (max_score) for ZRANGEBYSCORE inside Lua.
+    // Ask scores are positive (+price_i). Bid scores are negative (-price_i).
+    let max_score = match (order.side, order.price) {
         (Side::Buy, Some(price)) => {
-            // Buying: match asks where ask_price <= our bid price.
-            // Ask scores are positive (score = price_i as f64), so score ≤ our price_i.
+            // Buying: match asks where ask_score <= our price_i
             let max = decimal_to_i64(price) as f64;
-            ("-inf".to_string(), max.to_string())
+            max.to_string()
         }
         (Side::Sell, Some(price)) => {
-            // Selling: match bids where bid_price >= our ask price.
-            // Bid scores are negative (score = -price_i as f64), so score ≤ -our price_i.
+            // Selling: match bids where bid_score <= -our price_i
             let max = -(decimal_to_i64(price) as f64);
-            ("-inf".to_string(), max.to_string())
+            max.to_string()
         }
-        _ => {
-            // Market orders (no price) — match everything
-            ("-inf".to_string(), "+inf".to_string())
-        }
+        _ => "+inf".to_string(), // Market orders — match everything
     };
 
-    let resting_ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
-        .arg(opp_key)
-        .arg(&phase1_min)
-        .arg(&phase1_max)
-        .arg("LIMIT")
-        .arg(0i64)
-        .arg(50i64)
-        .query_async(&mut *conn)
-        .await
-        .context("ZRANGEBYSCORE resting ids")?;
+    let mut conn = pool.get().await.context("pool.get")?;
 
-    // ── Phase 2: Lua EVAL with all keys declared ──────────────────────────────
-    // KEYS: [1]=bids, [2]=asks, [3]=version, [4]=order:{incoming_id},
-    //       [5..4+N]=order:{resting_id_i}
-    // ARGV: [1..11]=order fields, [12]=N, [13..12+N]=resting_id strings
-    let n = resting_ids.len();
-
+    // Single Lua EVAL — ZRANGEBYSCORE + matching all in one atomic call
+    // KEYS: [1]=bids, [2]=asks, [3]=version, [4]=order:{incoming_id}
+    // ARGV: [1..11]=order fields, [12]=max_score
     let script = redis::Script::new(lua_script);
     let mut invocation = script.prepare_invoke();
 
-    // KEYS
     invocation
         .key(&bids_key)
         .key(&asks_key)
         .key(&version_key)
         .key(&incoming_order_key);
 
-    for rid in &resting_ids {
-        invocation.key(format!("order:{rid}"));
-    }
-
-    // ARGV: order fields
     invocation
         .arg(order.id.to_string())
         .arg(side_char(order.side))
@@ -807,12 +967,7 @@ pub async fn match_order_lua(
         .arg(order.created_at.timestamp_millis().to_string())
         .arg(&order.pair_id)
         .arg(score.to_string())
-        // N + resting IDs
-        .arg(n.to_string());
-
-    for rid in &resting_ids {
-        invocation.arg(rid);
-    }
+        .arg(&max_score);
 
     let raw: redis::Value = invocation
         .invoke_async(&mut *conn)

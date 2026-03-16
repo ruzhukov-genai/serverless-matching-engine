@@ -7,9 +7,11 @@ let currentPairConfig = null;
 let currentSide = 'buy';
 let orderbook = { bids: [], asks: [] };
 let tradesList = [];
-let ws = { orderbook: null, trades: null };
+let ws = { orderbook: null, trades: null, stream: null };
 let fallbackPolls = {};
 let feedbackTimer = null;
+// Set true to use single multiplexed WS (fewer TCP connections, lower latency)
+const USE_MUX_WS = true;
 
 // Pagination state
 let ordersPage = 0;
@@ -218,10 +220,109 @@ function prependTrade(trade) {
 
 function connectWebSockets(pairId) {
     const wsBase = API.replace(/^https?/, proto => proto === 'https' ? 'wss' : 'ws');
-    connectOrderbookWS(wsBase, pairId);
-    connectTradesWS(wsBase, pairId);
-    connectOrdersWS(wsBase);
+    if (USE_MUX_WS) {
+        connectMuxWS(wsBase, pairId);
+    } else {
+        connectOrderbookWS(wsBase, pairId);
+        connectTradesWS(wsBase, pairId);
+        connectOrdersWS(wsBase);
+    }
 }
+
+// ── Multiplexed WS — single connection for all data ──────────────────────────
+// Replaces 3 separate WS + REST polling with one connection.
+// Subscribes to: orderbook, trades, ticker, orders, portfolio for current pair.
+
+function connectMuxWS(wsBase, pairId) {
+    // Close previous mux connection
+    if (ws.stream) {
+        ws.stream.onclose = null;
+        try { ws.stream.close(); } catch(_) {}
+    }
+
+    const userId = 'user-1'; // TODO: make configurable
+    try {
+        const sock = new WebSocket(`${wsBase}/ws/stream`);
+        ws.stream = sock;
+        sock.onopen = () => {
+            // Subscribe to all channels for this pair + user
+            sock.send(JSON.stringify({ subscribe: [
+                `orderbook:${pairId}`,
+                `trades:${pairId}`,
+                `ticker:${pairId}`,
+                `orders:${userId}`,
+                `portfolio:${userId}`,
+            ]}));
+            clearFallbackPoll('orderbook');
+            clearFallbackPoll('trades');
+            clearFallbackPoll('orders');
+            clearFallbackPoll('portfolio');
+        };
+        sock.onmessage = e => {
+            try {
+                const envelope = JSON.parse(e.data);
+                const ch = envelope.ch;
+                const data = envelope.data;
+                if (!ch || data === undefined) return;
+
+                if (ch.startsWith('orderbook:')) {
+                    if (data.bids || data.asks) {
+                        orderbook.bids = data.bids || orderbook.bids;
+                        orderbook.asks = data.asks || orderbook.asks;
+                        renderOrderbook();
+                    }
+                } else if (ch.startsWith('trades:')) {
+                    if (data.trades && Array.isArray(data.trades)) {
+                        tradesList = data.trades;
+                        renderTrades();
+                    } else if (data.price != null) {
+                        prependTrade(data);
+                    }
+                } else if (ch.startsWith('ticker:')) {
+                    // Update ticker display if we have one
+                    updateTicker(data);
+                } else if (ch.startsWith('orders:')) {
+                    // Order event — refresh order list
+                    if (data.type === 'order_created' || data.type === 'order_cancelled' || data.type === 'orders_cancelled_all') {
+                        loadOpenOrders();
+                    }
+                } else if (ch.startsWith('portfolio:')) {
+                    // Portfolio pushed from server
+                    if (data.balances) {
+                        renderPortfolio(data.balances);
+                    }
+                }
+            } catch(err) { console.warn('Mux WS parse error:', err); }
+        };
+        sock.onerror = () => {};
+        sock.onclose = () => {
+            // Fall back to REST polling if WS drops
+            if (currentPair === pairId) {
+                startFallbackPoll('orderbook', () => loadOrderbook(pairId), 2500);
+                startFallbackPoll('trades', () => loadTrades(pairId), 2500);
+                startFallbackPoll('orders', () => loadOpenOrders(), 5000);
+                startFallbackPoll('portfolio', () => loadPortfolio(), 5000);
+                // Reconnect after delay
+                setTimeout(() => {
+                    if (currentPair === pairId) connectMuxWS(wsBase, pairId);
+                }, 2000);
+            }
+        };
+    } catch(e) {
+        startFallbackPoll('orderbook', () => loadOrderbook(pairId), 2500);
+        startFallbackPoll('trades', () => loadTrades(pairId), 2500);
+    }
+}
+
+function updateTicker(data) {
+    // Update the last price / ticker info in the UI
+    const lastPriceEl = document.getElementById('last-price');
+    if (lastPriceEl && data.last) {
+        lastPriceEl.textContent = fmtPrice(parseFloat(data.last));
+    }
+}
+
+// ── Legacy WS connections (used when USE_MUX_WS = false) ─────────────────────
 
 function connectOrderbookWS(wsBase, pairId) {
     if (ws.orderbook) {
@@ -300,11 +401,9 @@ function connectOrdersWS(wsBase) {
             try {
                 const msg = JSON.parse(e.data);
                 if (msg.type === 'snapshot') {
-                    // Full order list from server
                     ordersTotal = msg.total || 0;
                     renderOpenOrders(msg.orders || []);
                 } else if (msg.type === 'order_created' || msg.type === 'order_cancelled' || msg.type === 'orders_cancelled_all') {
-                    // Refresh orders on any change
                     loadOpenOrders();
                     loadPortfolio();
                 }
@@ -598,10 +697,13 @@ window.cancelAllOrders = async function() {
 
 function startAutoRefresh() {
     loadPortfolio();
-    // Orders are now pushed via WS — only poll portfolio
-    setInterval(() => {
-        loadPortfolio();
-    }, 5000);
+    if (!USE_MUX_WS) {
+        // Legacy mode: poll portfolio via REST (orders pushed via WS)
+        setInterval(() => {
+            loadPortfolio();
+        }, 5000);
+    }
+    // In mux WS mode, portfolio is pushed over the stream — no polling needed
 }
 
 // ── Feedback Toast ────────────────────────────────────────────────────────────

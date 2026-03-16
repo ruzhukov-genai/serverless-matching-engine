@@ -5,18 +5,31 @@ services:
   dragonfly:
     image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
     container_name: sme-dragonfly
-    ports:
-      - "6379:6379"
+    network_mode: host
     volumes:
       - dragonfly-data:/data
+      - /tmp/dragonfly:/tmp/dragonfly
     command: >
       dragonfly
       --logtostderr
       --cache_mode=true
+      --default_lua_flags=allow-undeclared-keys
+      --proactor_threads=2
+      --maxmemory=2gb
+      --hz=100
+      --bind=127.0.0.1
+      --port=6379
+      --unixsocket=/tmp/dragonfly/dragonfly.sock
+      --unixsocketperm=777
     ulimits:
       memlock: -1
+    deploy:
+      resources:
+        limits:
+          cpus: "1.4"
+          memory: 2500M
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-h", "127.0.0.1", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -24,8 +37,7 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: sme-postgres
-    ports:
-      - "5432:5432"
+    network_mode: host
     environment:
       POSTGRES_DB: matching_engine
       POSTGRES_USER: sme
@@ -34,16 +46,25 @@ services:
       - postgres-data:/var/lib/postgresql/data
     command: >
       postgres
-      -c max_connections=500
-      -c shared_buffers=256MB
-      -c work_mem=8MB
-      -c effective_cache_size=512MB
-      -c maintenance_work_mem=64MB
+      -c max_connections=50
+      -c shared_buffers=512MB
+      -c work_mem=16MB
+      -c effective_cache_size=2GB
+      -c maintenance_work_mem=128MB
       -c checkpoint_completion_target=0.9
       -c wal_buffers=16MB
       -c random_page_cost=1.1
+      -c synchronous_commit=off
+      -c max_wal_senders=0
+      -c wal_level=minimal
+      -c listen_addresses=127.0.0.1
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1000M
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U sme -d matching_engine"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U sme -d matching_engine"]
       interval: 5s
       timeout: 3s
       retries: 5

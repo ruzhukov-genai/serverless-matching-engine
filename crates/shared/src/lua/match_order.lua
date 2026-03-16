@@ -1,17 +1,14 @@
--- match_order.lua
+-- match_order.lua (v2 — single round-trip)
 -- Atomically matches an incoming order against the order book.
 --
--- Dragonfly (and Redis Cluster) require all accessed keys to be declared upfront
--- in KEYS[]. Because we cannot call ZRANGEBYSCORE inside the script and then
--- access the resulting order hashes dynamically, the caller pre-fetches the
--- resting order IDs in a ZRANGEBYSCORE call, then passes the full order:* hash
--- keys in KEYS[5..] for Dragonfly's key-access enforcement.
+-- ZRANGEBYSCORE is called INSIDE the script to fetch resting order IDs,
+-- eliminating Phase 1 from Rust (saves 1 round-trip). Dragonfly in default
+-- mode allows undeclared key access in scripts (no cluster restrictions).
 --
 -- KEYS[1] = book:{pair_id}:bids
 -- KEYS[2] = book:{pair_id}:asks
 -- KEYS[3] = version:{pair_id}
 -- KEYS[4] = order:{incoming_order_id}   (for writing resting incoming order)
--- KEYS[5..5+N-1] = order:{resting_id_i} for each of the N candidates
 --
 -- ARGV[1]  = order_id (string)
 -- ARGV[2]  = side: "B" (buy) or "S" (sell)
@@ -24,8 +21,7 @@
 -- ARGV[9]  = created_at_ms (integer string)
 -- ARGV[10] = pair_id (used when writing resting incoming order hash)
 -- ARGV[11] = score (float string, for placing resting incoming order in sorted set)
--- ARGV[12] = N (number of resting order candidates)
--- ARGV[13..12+N] = resting order ID strings (matched 1-to-1 with KEYS[5..4+N])
+-- ARGV[12] = max_score (price bound for ZRANGEBYSCORE, e.g. "5000000000" or "+inf")
 --
 -- Returns array:
 --   [1] = "OK"
@@ -52,7 +48,7 @@ local stp_mode   = ARGV[8]
 local ts_ms      = ARGV[9]
 local pair_id    = ARGV[10]
 local score      = ARGV[11]
-local n_resting  = tonumber(ARGV[12]) or 0
+local max_score  = ARGV[12]
 
 -- Determine opposite-side and own-side book keys
 local opp_key, own_key
@@ -64,19 +60,20 @@ else
     own_key = KEYS[2]  -- asks
 end
 
+-- Fetch resting order IDs from opposite book (price-bounded, up to 50)
+-- ZRANGEBYSCORE on KEYS[1]/KEYS[2] is fine — these are declared keys.
+local resting_ids = redis.call('ZRANGEBYSCORE', opp_key, '-inf', max_score, 'LIMIT', 0, 50)
+
 local remaining_i = qty_i
 local status = "N"
 local trades = {}
 
--- ── Match loop over pre-fetched resting order candidates ────────────────────
-for i = 1, n_resting do
+-- ── Match loop over resting order candidates ─────────────────────────────────
+for _, rid in ipairs(resting_ids) do
     if remaining_i <= 0 then break end
 
-    -- KEYS[4+i] = order:{resting_id_i}  (pre-declared by caller)
-    -- ARGV[12+i] = resting_id string
-    local rkey = KEYS[4 + i]
-    local rid  = ARGV[12 + i]
-
+    -- Access order hash directly — Dragonfly (non-cluster) allows undeclared keys in scripts
+    local rkey = 'order:' .. rid
     local rfields = redis.call('HMGET', rkey,
         'price_i', 'remaining_i', 'user_id', 'stp', 'status', 'order_type')
 

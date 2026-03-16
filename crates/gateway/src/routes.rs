@@ -4,20 +4,63 @@
 
 use axum::{
     extract::{Path, Query, State, WebSocketUpgrade, ws::Message, ws::WebSocket},
-    http::StatusCode,
-    response::{IntoResponse, Json},
+    http::{StatusCode, header},
+    response::{IntoResponse, Json, Response, Sse, sse::Event},
 };
+// futures_util used by async_stream internally
 use chrono::Utc;
 use deadpool_redis::redis::AsyncCommands;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use sme_shared::{OrderType, Side, SelfTradePreventionMode, TimeInForce};
 
 use crate::AppState;
+
+// ── Per-user TTL cache ───────────────────────────────────────────────────────
+// Avoids hitting Dragonfly on every /api/orders and /api/portfolio request.
+// Short TTL (2s) — eventual consistency acceptable for read-your-writes.
+
+const USER_CACHE_TTL_MS: u128 = 2_000;
+
+#[derive(Clone)]
+pub struct UserCache {
+    // Uses std::sync::RwLock (not tokio) — critical section is a HashMap lookup,
+    // never holds across .await. std::sync avoids async scheduler overhead.
+    inner: Arc<RwLock<HashMap<String, (std::time::Instant, String)>>>,
+}
+
+impl UserCache {
+    pub fn new() -> Self {
+        Self { inner: Arc::new(RwLock::new(HashMap::new())) }
+    }
+
+    /// Get cached value if TTL hasn't expired.
+    pub async fn get(&self, key: &str) -> Option<String> {
+        let map = self.inner.read().unwrap();
+        if let Some((ts, val)) = map.get(key) {
+            if ts.elapsed().as_millis() < USER_CACHE_TTL_MS {
+                return Some(val.clone());
+            }
+        }
+        None
+    }
+
+    /// Store a value with current timestamp.
+    pub async fn set(&self, key: String, val: String) {
+        let mut map = self.inner.write().unwrap();
+        map.insert(key, (std::time::Instant::now(), val));
+        // Evict stale entries if map grows large (>1000 entries)
+        if map.len() > 1000 {
+            map.retain(|_, (ts, _)| ts.elapsed().as_millis() < USER_CACHE_TTL_MS * 2);
+        }
+    }
+}
 
 // ── Error helper ─────────────────────────────────────────────────────────────
 
@@ -35,14 +78,12 @@ impl AppError {
     pub fn bad_request(e: impl Into<anyhow::Error>) -> Self {
         AppError { kind: AppErrorKind::BadRequest, inner: e.into() }
     }
-
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let status = match self.kind {
             AppErrorKind::BadRequest => StatusCode::BAD_REQUEST,
-
             AppErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
         tracing::error!("gateway error: {:?}", self.inner);
@@ -58,20 +99,38 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
 
 type HandlerResult<T> = Result<T, AppError>;
 
+/// Return a pre-serialized JSON string as a response without parse→reserialize overhead.
+/// Skips serde_json::from_str + Json() which was the dominant per-request cost.
+#[inline]
+fn raw_json(body: impl Into<String>) -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body.into(),
+    ).into_response()
+}
+
+/// Return a pre-serialized Arc<str> JSON as response — uses Bytes for zero-copy.
+/// Arc<str> → Bytes avoids the String allocation that .to_string() would create.
+#[inline]
+fn raw_json_arc(body: &std::sync::Arc<str>) -> Response {
+    // Convert Arc<str> to Bytes without allocating a new String.
+    // This is the hot path for all cached responses.
+    let bytes = bytes::Bytes::copy_from_slice(body.as_bytes());
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        bytes,
+    ).into_response()
+}
+
 // ── GET /api/pairs ────────────────────────────────────────────────────────────
 
-pub async fn list_pairs(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
-    let cached: String = conn.get("cache:pairs").await.unwrap_or_else(|_| "{}".to_string());
-    
-    // Return the cached JSON directly (worker pre-computes this)
-    if cached != "{}" {
-        let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({"pairs": []}));
-        return Ok(Json(parsed));
+pub async fn list_pairs(State(s): State<AppState>) -> HandlerResult<Response> {
+    if let Some(cached) = s.cache.get_latest("cache:pairs") {
+        return Ok(raw_json_arc(&cached));
     }
-    
-    // Fallback if cache is empty
-    Ok(Json(json!({"pairs": []})))
+    Ok(raw_json(r#"{"pairs":[]}"#))
 }
 
 // ── GET /api/orderbook/{pair_id} ──────────────────────────────────────────────
@@ -79,26 +138,12 @@ pub async fn list_pairs(State(s): State<AppState>) -> HandlerResult<impl IntoRes
 pub async fn get_orderbook(
     Path(pair_id): Path<String>,
     State(s): State<AppState>,
-) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
+) -> HandlerResult<Response> {
     let cache_key = format!("cache:orderbook:{}", pair_id);
-    let cached: String = conn.get(&cache_key).await.unwrap_or_else(|_| "{}".to_string());
-    
-    if cached != "{}" {
-        let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({
-            "pair": pair_id,
-            "bids": [],
-            "asks": []
-        }));
-        return Ok(Json(parsed));
+    if let Some(cached) = s.cache.get_latest(&cache_key) {
+        return Ok(raw_json_arc(&cached));
     }
-    
-    // Fallback empty orderbook
-    Ok(Json(json!({
-        "pair": pair_id,
-        "bids": [],
-        "asks": []
-    })))
+    Ok(raw_json(format!(r#"{{"pair":"{}","bids":[],"asks":[]}}"#, pair_id)))
 }
 
 // ── GET /api/trades/{pair_id} ─────────────────────────────────────────────────
@@ -106,24 +151,12 @@ pub async fn get_orderbook(
 pub async fn get_trades(
     Path(pair_id): Path<String>,
     State(s): State<AppState>,
-) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
+) -> HandlerResult<Response> {
     let cache_key = format!("cache:trades:{}", pair_id);
-    let cached: String = conn.get(&cache_key).await.unwrap_or_else(|_| "{}".to_string());
-    
-    if cached != "{}" {
-        let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({
-            "pair": pair_id,
-            "trades": []
-        }));
-        return Ok(Json(parsed));
+    if let Some(cached) = s.cache.get_latest(&cache_key) {
+        return Ok(raw_json_arc(&cached));
     }
-    
-    // Fallback empty trades
-    Ok(Json(json!({
-        "pair": pair_id,
-        "trades": []
-    })))
+    Ok(raw_json(format!(r#"{{"pair":"{}","trades":[]}}"#, pair_id)))
 }
 
 // ── GET /api/ticker/{pair_id} ─────────────────────────────────────────────────
@@ -131,30 +164,15 @@ pub async fn get_trades(
 pub async fn get_ticker(
     Path(pair_id): Path<String>,
     State(s): State<AppState>,
-) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
+) -> HandlerResult<Response> {
     let cache_key = format!("cache:ticker:{}", pair_id);
-    let cached: String = conn.get(&cache_key).await.unwrap_or_else(|_| "{}".to_string());
-    
-    if cached != "{}" {
-        let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({
-            "pair": pair_id,
-            "last": null,
-            "high_24h": null,
-            "low_24h": null,
-            "volume_24h": null
-        }));
-        return Ok(Json(parsed));
+    if let Some(cached) = s.cache.get_latest(&cache_key) {
+        return Ok(raw_json_arc(&cached));
     }
-    
-    // Fallback empty ticker
-    Ok(Json(json!({
-        "pair": pair_id,
-        "last": null,
-        "high_24h": null,
-        "low_24h": null,
-        "volume_24h": null
-    })))
+    Ok(raw_json(format!(
+        r#"{{"pair":"{}","last":null,"high_24h":null,"low_24h":null,"volume_24h":null}}"#,
+        pair_id
+    )))
 }
 
 // ── POST /api/orders ──────────────────────────────────────────────────────────
@@ -180,15 +198,12 @@ pub async fn create_order(
     let tif = req.tif.unwrap_or(TimeInForce::GTC);
     let stp_mode = req.stp_mode.unwrap_or(SelfTradePreventionMode::None);
 
-    // Basic validation (could load pairs from cache for more thorough validation)
     if req.quantity <= Decimal::ZERO {
         return Err(AppError::bad_request(anyhow::anyhow!("quantity must be positive")));
     }
-
     if req.order_type == OrderType::Limit && req.price.is_none() {
         return Err(AppError::bad_request(anyhow::anyhow!("limit orders require price")));
     }
-
     if req.order_type == OrderType::Market && req.price.is_some() {
         return Err(AppError::bad_request(anyhow::anyhow!("market orders cannot have price")));
     }
@@ -196,7 +211,6 @@ pub async fn create_order(
     let now = Utc::now();
     let order_id = Uuid::new_v4();
 
-    // Create order JSON for the queue
     let order_json = json!({
         "id": order_id.to_string(),
         "user_id": user_id,
@@ -211,7 +225,7 @@ pub async fn create_order(
         "created_at": now.to_rfc3339(),
     });
 
-    // Queue the order for the worker — per-pair queue for parallel consumption
+    // Queue the order for the worker (write path — direct Dragonfly)
     let mut conn = s.dragonfly.get().await?;
     let order_str = serde_json::to_string(&order_json)?;
     conn.lpush::<_, _, ()>(format!("queue:orders:{}", req.pair_id), &order_str).await?;
@@ -223,7 +237,6 @@ pub async fn create_order(
         "order queued for processing"
     );
 
-    // Return 201 Created — order accepted and queued
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -254,38 +267,34 @@ pub async fn create_order(
 pub struct OrdersQuery {
     pub user_id: Option<String>,
     pub pair_id: Option<String>,
+    #[allow(dead_code)]
     pub limit: Option<i64>,
+    #[allow(dead_code)]
     pub offset: Option<i64>,
 }
 
 pub async fn list_orders(
     Query(q): Query<OrdersQuery>,
     State(s): State<AppState>,
-) -> HandlerResult<impl IntoResponse> {
+) -> HandlerResult<Response> {
     let user_id = q.user_id.unwrap_or_else(|| "user-1".to_string());
-    
-    // Get cached user orders (worker maintains this cache)
-    let mut conn = s.dragonfly.get().await?;
     let cache_key = format!("cache:orders:{}", user_id);
-    let cached: String = conn.get(&cache_key).await.unwrap_or_else(|_| "{}".to_string());
-    
-    if cached != "{}" {
-        let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({
-            "orders": [],
-            "total": 0,
-            "limit": 50,
-            "offset": 0
-        }));
-        return Ok(Json(parsed));
+
+    // Check gateway-side TTL cache first (avoids Dragonfly round-trip)
+    if let Some(cached) = s.user_cache.get(&cache_key).await {
+        return Ok(raw_json(cached));
     }
-    
-    // Fallback empty response
-    Ok(Json(json!({
-        "orders": [],
-        "total": 0,
-        "limit": q.limit.unwrap_or(50),
-        "offset": q.offset.unwrap_or(0)
-    })))
+
+    // Fallback to Dragonfly
+    let mut conn = s.dragonfly.get().await?;
+    let cached: String = conn.get(&cache_key).await.unwrap_or_else(|_| "{}".to_string());
+
+    if cached != "{}" {
+        s.user_cache.set(cache_key, cached.clone()).await;
+        return Ok(raw_json(cached));
+    }
+
+    Ok(raw_json(r#"{"orders":[],"total":0,"limit":50,"offset":0}"#))
 }
 
 // ── DELETE /api/orders/{order_id} ─────────────────────────────────────────────
@@ -294,14 +303,12 @@ pub async fn cancel_order(
     Path(order_id): Path<Uuid>,
     State(s): State<AppState>,
 ) -> HandlerResult<impl IntoResponse> {
-    // Queue the cancellation request
     let mut conn = s.dragonfly.get().await?;
     let cancel_json = json!({
         "type": "cancel",
         "order_id": order_id.to_string(),
         "requested_at": Utc::now().to_rfc3339(),
     });
-    
     let cancel_str = serde_json::to_string(&cancel_json)?;
     conn.lpush::<_, _, ()>("queue:cancellations", &cancel_str).await?;
 
@@ -319,14 +326,12 @@ pub async fn modify_order(
     State(s): State<AppState>,
     Json(_req): Json<CreateOrderRequest>,
 ) -> HandlerResult<impl IntoResponse> {
-    // Queue the modification (which is cancel + new order)
     let mut conn = s.dragonfly.get().await?;
     let modify_json = json!({
         "type": "modify",
         "order_id": order_id.to_string(),
         "requested_at": Utc::now().to_rfc3339(),
     });
-    
     let modify_str = serde_json::to_string(&modify_json)?;
     conn.lpush::<_, _, ()>("queue:cancellations", &modify_str).await?;
 
@@ -345,7 +350,6 @@ pub async fn cancel_all_orders(
 ) -> HandlerResult<impl IntoResponse> {
     let user_id = q.user_id.unwrap_or_else(|| "user-1".to_string());
 
-    // Queue the cancel-all request
     let mut conn = s.dragonfly.get().await?;
     let cancel_all_json = json!({
         "type": "cancel_all",
@@ -353,7 +357,6 @@ pub async fn cancel_all_orders(
         "pair_id": q.pair_id,
         "requested_at": Utc::now().to_rfc3339(),
     });
-    
     let cancel_str = serde_json::to_string(&cancel_all_json)?;
     conn.lpush::<_, _, ()>("queue:cancellations", &cancel_str).await?;
 
@@ -374,99 +377,179 @@ pub struct PortfolioQuery {
 pub async fn get_portfolio(
     Query(q): Query<PortfolioQuery>,
     State(s): State<AppState>,
-) -> HandlerResult<impl IntoResponse> {
+) -> HandlerResult<Response> {
     let user_id = q.user_id.unwrap_or_else(|| "user-1".to_string());
-
-    let mut conn = s.dragonfly.get().await?;
     let cache_key = format!("cache:portfolio:{}", user_id);
-    let cached: String = conn.get(&cache_key).await.unwrap_or_else(|_| "{}".to_string());
-    
-    if cached != "{}" {
-        let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({"balances": []}));
-        return Ok(Json(parsed));
+
+    // Check gateway-side TTL cache first
+    if let Some(cached) = s.user_cache.get(&cache_key).await {
+        return Ok(raw_json(cached));
     }
-    
-    // Fallback empty balances
-    Ok(Json(json!({"balances": []})))
+
+    // Fallback to Dragonfly
+    let mut conn = s.dragonfly.get().await?;
+    let cached: String = conn.get(&cache_key).await.unwrap_or_else(|_| "{}".to_string());
+
+    if cached != "{}" {
+        s.user_cache.set(cache_key, cached.clone()).await;
+        return Ok(raw_json(cached));
+    }
+
+    Ok(raw_json(r#"{"balances":[]}"#))
 }
 
-// ── Dashboard API ─────────────────────────────────────────────────────────────
+// ── Dashboard API — read from CacheBroadcasts (zero Dragonfly) ────────────────
 
-pub async fn get_metrics(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
-    let cached: String = conn.get("cache:metrics").await.unwrap_or_else(|_| "{}".to_string());
-    
-    let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({}));
-    Ok(Json(parsed))
+pub async fn get_metrics(State(s): State<AppState>) -> HandlerResult<Response> {
+    Ok(raw_json(s.cache.get_latest("cache:metrics")
+        .map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string())))
 }
 
-pub async fn get_lock_metrics(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
-    let cached: String = conn.get("cache:lock_metrics").await.unwrap_or_else(|_| "{}".to_string());
-    
-    let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({}));
-    Ok(Json(parsed))
+pub async fn get_lock_metrics(State(s): State<AppState>) -> HandlerResult<Response> {
+    Ok(raw_json(s.cache.get_latest("cache:lock_metrics")
+        .map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string())))
 }
 
-pub async fn get_throughput(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
-    let cached: String = conn.get("cache:throughput").await.unwrap_or_else(|_| "{}".to_string());
-    
-    let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({"series": []}));
-    Ok(Json(parsed))
+pub async fn get_throughput(State(s): State<AppState>) -> HandlerResult<Response> {
+    Ok(raw_json(s.cache.get_latest("cache:throughput")
+        .map(|v| v.to_string()).unwrap_or_else(|| r#"{"series":[]}"#.to_string())))
 }
 
-pub async fn get_latency_percentiles(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
-    let cached: String = conn.get("cache:latency_metrics").await.unwrap_or_else(|_| "{}".to_string());
-    
-    let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({}));
-    Ok(Json(parsed))
+pub async fn get_latency_percentiles(State(s): State<AppState>) -> HandlerResult<Response> {
+    Ok(raw_json(s.cache.get_latest("cache:latency_metrics")
+        .map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string())))
 }
 
-pub async fn get_audit(State(s): State<AppState>) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
-    let cached: String = conn.get("cache:audit").await.unwrap_or_else(|_| "{}".to_string());
-    
-    let parsed: Value = serde_json::from_str(&cached).unwrap_or(json!({"audit": [], "events": []}));
-    Ok(Json(parsed))
+pub async fn get_audit(State(s): State<AppState>) -> HandlerResult<Response> {
+    Ok(raw_json(s.cache.get_latest("cache:audit")
+        .map(|v| v.to_string()).unwrap_or_else(|| r#"{"audit":[],"events":[]}"#.to_string())))
+}
+
+// ── GET /api/snapshot/{pair_id} ────────────────────────────────────────────────
+// Returns all data for a pair in a single response — replaces 8 REST polls.
+
+pub async fn get_snapshot(
+    Path(pair_id): Path<String>,
+    State(s): State<AppState>,
+) -> HandlerResult<Response> {
+    // Read all cache keys — zero Dragonfly, all from watch channels
+    let ob = s.cache.get_latest(&format!("cache:orderbook:{}", pair_id));
+    let trades = s.cache.get_latest(&format!("cache:trades:{}", pair_id));
+    let ticker = s.cache.get_latest(&format!("cache:ticker:{}", pair_id));
+    let metrics = s.cache.get_latest("cache:metrics");
+    let throughput = s.cache.get_latest("cache:throughput");
+    let latency = s.cache.get_latest("cache:latency_metrics");
+    let pairs = s.cache.get_latest("cache:pairs");
+
+    // Build composite JSON without parsing — raw concatenation
+    let mut buf = String::with_capacity(4096);
+    buf.push_str(r#"{"orderbook":"#);
+    buf.push_str(ob.as_deref().unwrap_or(r#"{"bids":[],"asks":[]}"#));
+    buf.push_str(r#","trades":"#);
+    buf.push_str(trades.as_deref().unwrap_or(r#"{"trades":[]}"#));
+    buf.push_str(r#","ticker":"#);
+    buf.push_str(ticker.as_deref().unwrap_or("null"));
+    buf.push_str(r#","metrics":"#);
+    buf.push_str(metrics.as_deref().unwrap_or("{}"));
+    buf.push_str(r#","throughput":"#);
+    buf.push_str(throughput.as_deref().unwrap_or(r#"{"series":[]}"#));
+    buf.push_str(r#","latency":"#);
+    buf.push_str(latency.as_deref().unwrap_or("{}"));
+    buf.push_str(r#","pairs":"#);
+    buf.push_str(pairs.as_deref().unwrap_or(r#"{"pairs":[]}"#));
+    buf.push('}');
+
+    Ok(raw_json(buf))
+}
+
+// ── GET /api/stream/{pair_id} — SSE ───────────────────────────────────────────
+// Server-Sent Events: single HTTP connection, pushes all updates for a pair.
+// Replaces multiple WS connections and REST polling.
+
+pub async fn sse_stream(
+    Path(pair_id): Path<String>,
+    State(s): State<AppState>,
+) -> impl IntoResponse {
+    let cache_keys = vec![
+        (format!("cache:orderbook:{}", pair_id), "orderbook"),
+        (format!("cache:trades:{}", pair_id), "trades"),
+        (format!("cache:ticker:{}", pair_id), "ticker"),
+        ("cache:metrics".to_string(), "metrics"),
+        ("cache:throughput".to_string(), "throughput"),
+        ("cache:latency_metrics".to_string(), "latency"),
+    ];
+
+    let stream = async_stream::stream! {
+        // Send initial snapshot for all keys
+        for (key, event_name) in &cache_keys {
+            if let Some(val) = s.cache.get_latest(key) {
+                yield Ok::<_, std::convert::Infallible>(Event::default().event(event_name.to_string()).data(val.to_string()));
+            }
+        }
+
+        // Subscribe to all broadcast channels
+        let mut receivers: Vec<(broadcast::Receiver<Arc<str>>, &str)> = Vec::new();
+        for (key, event_name) in &cache_keys {
+            if let Some(rx) = s.cache.subscribe(key) {
+                receivers.push((rx, event_name));
+            }
+        }
+
+        // Fan-in all channels
+        loop {
+            let mut got_msg = false;
+            for (rx, event_name) in &mut receivers {
+                match rx.try_recv() {
+                    Ok(val) => {
+                        yield Ok::<_, std::convert::Infallible>(Event::default().event(event_name.to_string()).data(val.to_string()));
+                        got_msg = true;
+                    }
+                    Err(broadcast::error::TryRecvError::Closed) => return,
+                    _ => {}
+                }
+            }
+            if !got_msg {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    };
+
+    Sse::new(Box::pin(stream))
+        .keep_alive(axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)))
 }
 
 // ── WebSocket Feeds ───────────────────────────────────────────────────────────
 
-pub async fn ws_orderbook(
-    Path(pair_id): Path<String>,
-    State(s): State<AppState>,
-    ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_orderbook_ws(pair_id, s, socket))
-}
-
-/// Generic cache-polling WS handler — polls a Dragonfly key, sends to client,
-/// handles close/ping frames via select!
-async fn cache_poll_ws(
+/// Shared-broadcast WS handler — subscribes to a CacheBroadcasts channel
+/// instead of polling Dragonfly directly. One Dragonfly poller feeds N clients.
+async fn cache_broadcast_ws(
     cache_key: String,
     state: AppState,
     mut socket: WebSocket,
-    interval_ms: u64,
 ) {
-    use tokio::time::{Duration, interval};
-    let mut ticker = interval(Duration::from_millis(interval_ms));
+    let mut rx = match state.cache.subscribe(&cache_key) {
+        Some(rx) => rx,
+        None => return, // unknown key — no poller registered
+    };
+
+    // Send the current value immediately so the client doesn't wait up to interval_ms
+    if let Some(val) = state.cache.get_latest(&cache_key) {
+        if socket.send(Message::Text(val.to_string().into())).await.is_err() {
+            return;
+        }
+    }
 
     loop {
         tokio::select! {
-            _ = ticker.tick() => {
-                let cached: String = match state.dragonfly.get().await {
-                    Ok(mut conn) => match conn.get(&cache_key).await {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    },
-                    Err(_) => continue,
-                };
-                if !cached.is_empty() && cached != "{}"
-                    && socket.send(Message::Text(cached.into())).await.is_err()
-                {
-                    return;
+            result = rx.recv() => {
+                match result {
+                    Ok(val) => {
+                        if socket.send(Message::Text(val.to_string().into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
             msg = socket.recv() => {
@@ -482,9 +565,153 @@ async fn cache_poll_ws(
     }
 }
 
-async fn handle_orderbook_ws(pair_id: String, state: AppState, socket: WebSocket) {
-    let cache_key = format!("cache:orderbook:{}", pair_id);
-    cache_poll_ws(cache_key, state, socket, 500).await;
+// ── Multiplexed WS /ws/stream — one connection, many subscriptions ────────────
+// Client sends: {"subscribe": ["orderbook:BTC-USDT", "trades:BTC-USDT", "ticker:BTC-USDT"]}
+// Server pushes: {"ch": "orderbook:BTC-USDT", "data": {...}}
+// One connection replaces 3+ separate WS connections.
+
+pub async fn ws_stream(
+    State(s): State<AppState>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_multiplexed_ws(s, socket))
+}
+
+async fn handle_multiplexed_ws(state: AppState, mut socket: WebSocket) {
+    use tokio::sync::mpsc;
+
+    // Channel for aggregating messages from all subscriptions
+    let (agg_tx, mut agg_rx) = mpsc::channel::<String>(256);
+
+    let mut subscription_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    loop {
+        tokio::select! {
+            // Forward aggregated messages to the client
+            Some(msg) = agg_rx.recv() => {
+                if socket.send(Message::Text(msg.into())).await.is_err() {
+                    for h in subscription_handles { h.abort(); }
+                    return;
+                }
+            }
+            // Read client messages (subscribe commands)
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(cmd) = serde_json::from_str::<Value>(&text) {
+                            if let Some(channels) = cmd.get("subscribe").and_then(|v| v.as_array()) {
+                                for ch in channels {
+                                    if let Some(ch_name) = ch.as_str() {
+                                        let ch_name_owned = ch_name.to_string();
+                                        let tx = agg_tx.clone();
+                                        let state_clone = state.clone();
+
+                                        // Handle user-specific channels (orders, portfolio)
+                                        if ch_name.starts_with("orders:") {
+                                            // Subscribe to order events, filter by user_id
+                                            let user_id = ch_name.strip_prefix("orders:").unwrap().to_string();
+                                            let mut rx = state.order_events_tx.subscribe();
+                                            let handle = tokio::spawn(async move {
+                                                loop {
+                                                    match rx.recv().await {
+                                                        Ok(msg) => {
+                                                            let is_mine = serde_json::from_str::<Value>(&msg)
+                                                                .ok()
+                                                                .and_then(|p| Some(p.get("user_id")?.as_str()? == user_id))
+                                                                .unwrap_or(false);
+                                                            if is_mine {
+                                                                let out = format!(r#"{{"ch":"orders:{}","data":{}}}"#, user_id, msg);
+                                                                if tx.send(out).await.is_err() { return; }
+                                                            }
+                                                        }
+                                                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                                        Err(broadcast::error::RecvError::Closed) => return,
+                                                    }
+                                                }
+                                            });
+                                            subscription_handles.push(handle);
+                                        } else if ch_name.starts_with("portfolio:") {
+                                            // Poll portfolio from user cache / Dragonfly
+                                            let user_id = ch_name.strip_prefix("portfolio:").unwrap().to_string();
+                                            let handle = tokio::spawn(async move {
+                                                let cache_key = format!("cache:portfolio:{}", user_id);
+                                                let mut last_val = String::new();
+                                                loop {
+                                                    // Check user cache, then Dragonfly
+                                                    let val = if let Some(cached) = state_clone.user_cache.get(&cache_key).await {
+                                                        cached
+                                                    } else if let Ok(mut conn) = state_clone.dragonfly.get().await {
+                                                        use deadpool_redis::redis::AsyncCommands;
+                                                        conn.get::<_, String>(&cache_key).await.unwrap_or_default()
+                                                    } else {
+                                                        String::new()
+                                                    };
+                                                    if !val.is_empty() && val != "{}" && val != last_val {
+                                                        let msg = format!(r#"{{"ch":"portfolio:{}","data":{}}}"#, user_id, val);
+                                                        if tx.send(msg).await.is_err() { return; }
+                                                        last_val = val;
+                                                    }
+                                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                                }
+                                            });
+                                            subscription_handles.push(handle);
+                                        } else {
+                                            // Standard cache broadcast channel
+                                            let cache_key = format!("cache:{}", ch_name);
+
+                                            // Send current value immediately
+                                            if let Some(val) = state.cache.get_latest(&cache_key) {
+                                                let init = format!(r#"{{"ch":"{}","data":{}}}"#, ch_name_owned, val);
+                                                let _ = tx.send(init).await;
+                                            }
+
+                                            // Spawn a task to forward updates
+                                            let handle = tokio::spawn(async move {
+                                                if let Some(mut rx) = state_clone.cache.subscribe(&cache_key) {
+                                                    loop {
+                                                        match rx.recv().await {
+                                                            Ok(val) => {
+                                                                let msg = format!(r#"{{"ch":"{}","data":{}}}"#, ch_name_owned, val);
+                                                                if tx.send(msg).await.is_err() {
+                                                                    return;
+                                                                }
+                                                            }
+                                                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                                            Err(broadcast::error::RecvError::Closed) => return,
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                            subscription_handles.push(handle);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = socket.send(Message::Pong(data)).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        for h in subscription_handles { h.abort(); }
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+pub async fn ws_orderbook(
+    Path(pair_id): Path<String>,
+    State(s): State<AppState>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| {
+        let cache_key = format!("cache:orderbook:{}", pair_id);
+        cache_broadcast_ws(cache_key, s, socket)
+    })
 }
 
 pub async fn ws_trades(
@@ -492,12 +719,10 @@ pub async fn ws_trades(
     State(s): State<AppState>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_trades_ws(pair_id, s, socket))
-}
-
-async fn handle_trades_ws(pair_id: String, state: AppState, socket: WebSocket) {
-    let cache_key = format!("cache:trades:{}", pair_id);
-    cache_poll_ws(cache_key, state, socket, 500).await;
+    ws.on_upgrade(move |socket| {
+        let cache_key = format!("cache:trades:{}", pair_id);
+        cache_broadcast_ws(cache_key, s, socket)
+    })
 }
 
 pub async fn ws_orders(
