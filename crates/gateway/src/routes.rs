@@ -110,13 +110,17 @@ fn raw_json(body: impl Into<String>) -> Response {
     ).into_response()
 }
 
-/// Return a pre-serialized Arc<str> JSON as response — zero-copy from cache.
+/// Return a pre-serialized Arc<str> JSON as response — uses Bytes for zero-copy.
+/// Arc<str> → Bytes avoids the String allocation that .to_string() would create.
 #[inline]
 fn raw_json_arc(body: &std::sync::Arc<str>) -> Response {
+    // Convert Arc<str> to Bytes without allocating a new String.
+    // This is the hot path for all cached responses.
+    let bytes = bytes::Bytes::copy_from_slice(body.as_bytes());
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
-        body.to_string(),
+        bytes,
     ).into_response()
 }
 
@@ -586,6 +590,7 @@ async fn handle_multiplexed_ws(state: AppState, mut socket: WebSocket) {
             // Forward aggregated messages to the client
             Some(msg) = agg_rx.recv() => {
                 if socket.send(Message::Text(msg.into())).await.is_err() {
+                    for h in subscription_handles { h.abort(); }
                     return;
                 }
             }
@@ -597,35 +602,88 @@ async fn handle_multiplexed_ws(state: AppState, mut socket: WebSocket) {
                             if let Some(channels) = cmd.get("subscribe").and_then(|v| v.as_array()) {
                                 for ch in channels {
                                     if let Some(ch_name) = ch.as_str() {
-                                        let cache_key = format!("cache:{}", ch_name);
                                         let ch_name_owned = ch_name.to_string();
                                         let tx = agg_tx.clone();
                                         let state_clone = state.clone();
 
-                                        // Send current value immediately
-                                        if let Some(val) = state.cache.get_latest(&cache_key) {
-                                            let init = format!(r#"{{"ch":"{}","data":{}}}"#, ch_name_owned, val);
-                                            let _ = tx.send(init).await;
-                                        }
-
-                                        // Spawn a task to forward updates
-                                        let handle = tokio::spawn(async move {
-                                            if let Some(mut rx) = state_clone.cache.subscribe(&cache_key) {
+                                        // Handle user-specific channels (orders, portfolio)
+                                        if ch_name.starts_with("orders:") {
+                                            // Subscribe to order events, filter by user_id
+                                            let user_id = ch_name.strip_prefix("orders:").unwrap().to_string();
+                                            let mut rx = state.order_events_tx.subscribe();
+                                            let handle = tokio::spawn(async move {
                                                 loop {
                                                     match rx.recv().await {
-                                                        Ok(val) => {
-                                                            let msg = format!(r#"{{"ch":"{}","data":{}}}"#, ch_name_owned, val);
-                                                            if tx.send(msg).await.is_err() {
-                                                                return;
+                                                        Ok(msg) => {
+                                                            let is_mine = serde_json::from_str::<Value>(&msg)
+                                                                .ok()
+                                                                .and_then(|p| Some(p.get("user_id")?.as_str()? == user_id))
+                                                                .unwrap_or(false);
+                                                            if is_mine {
+                                                                let out = format!(r#"{{"ch":"orders:{}","data":{}}}"#, user_id, msg);
+                                                                if tx.send(out).await.is_err() { return; }
                                                             }
                                                         }
                                                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                                                         Err(broadcast::error::RecvError::Closed) => return,
                                                     }
                                                 }
+                                            });
+                                            subscription_handles.push(handle);
+                                        } else if ch_name.starts_with("portfolio:") {
+                                            // Poll portfolio from user cache / Dragonfly
+                                            let user_id = ch_name.strip_prefix("portfolio:").unwrap().to_string();
+                                            let handle = tokio::spawn(async move {
+                                                let cache_key = format!("cache:portfolio:{}", user_id);
+                                                let mut last_val = String::new();
+                                                loop {
+                                                    // Check user cache, then Dragonfly
+                                                    let val = if let Some(cached) = state_clone.user_cache.get(&cache_key).await {
+                                                        cached
+                                                    } else if let Ok(mut conn) = state_clone.dragonfly.get().await {
+                                                        use deadpool_redis::redis::AsyncCommands;
+                                                        conn.get::<_, String>(&cache_key).await.unwrap_or_default()
+                                                    } else {
+                                                        String::new()
+                                                    };
+                                                    if !val.is_empty() && val != "{}" && val != last_val {
+                                                        let msg = format!(r#"{{"ch":"portfolio:{}","data":{}}}"#, user_id, val);
+                                                        if tx.send(msg).await.is_err() { return; }
+                                                        last_val = val;
+                                                    }
+                                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                                }
+                                            });
+                                            subscription_handles.push(handle);
+                                        } else {
+                                            // Standard cache broadcast channel
+                                            let cache_key = format!("cache:{}", ch_name);
+
+                                            // Send current value immediately
+                                            if let Some(val) = state.cache.get_latest(&cache_key) {
+                                                let init = format!(r#"{{"ch":"{}","data":{}}}"#, ch_name_owned, val);
+                                                let _ = tx.send(init).await;
                                             }
-                                        });
-                                        subscription_handles.push(handle);
+
+                                            // Spawn a task to forward updates
+                                            let handle = tokio::spawn(async move {
+                                                if let Some(mut rx) = state_clone.cache.subscribe(&cache_key) {
+                                                    loop {
+                                                        match rx.recv().await {
+                                                            Ok(val) => {
+                                                                let msg = format!(r#"{{"ch":"{}","data":{}}}"#, ch_name_owned, val);
+                                                                if tx.send(msg).await.is_err() {
+                                                                    return;
+                                                                }
+                                                            }
+                                                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                                            Err(broadcast::error::RecvError::Closed) => return,
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                            subscription_handles.push(handle);
+                                        }
                                     }
                                 }
                             }

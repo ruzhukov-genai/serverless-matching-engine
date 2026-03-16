@@ -326,13 +326,14 @@ async fn main() -> Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
     let addr = format!("0.0.0.0:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("listening on http://{} (h2c enabled)", addr);
+    tracing::info!("listening on http://{} (h2c + TCP_NODELAY)", addr);
 
     // Use hyper directly for HTTP/1.1 + h2c (cleartext HTTP/2) auto-detection.
-    // This allows clients to multiplex many requests over fewer TCP connections,
-    // reducing the 1006-connection overhead at 100 concurrent UI clients.
     loop {
         let (stream, _remote) = listener.accept().await?;
+        // TCP_NODELAY: disable Nagle's algorithm — send small frames immediately.
+        // Critical for low-latency JSON responses (typically <4KB).
+        let _ = stream.set_nodelay(true);
         let app = app.clone();
         tokio::spawn(async move {
             let hyper_svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
