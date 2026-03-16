@@ -5,8 +5,9 @@
 use axum::{
     extract::{Path, Query, State, WebSocketUpgrade, ws::Message, ws::WebSocket},
     http::{StatusCode, header},
-    response::{IntoResponse, Json, Response},
+    response::{IntoResponse, Json, Response, Sse, sse::Event},
 };
+// futures_util used by async_stream internally
 use chrono::Utc;
 use deadpool_redis::redis::AsyncCommands;
 use rust_decimal::Decimal;
@@ -420,6 +421,99 @@ pub async fn get_audit(State(s): State<AppState>) -> HandlerResult<Response> {
         .map(|v| v.to_string()).unwrap_or_else(|| r#"{"audit":[],"events":[]}"#.to_string())))
 }
 
+// ── GET /api/snapshot/{pair_id} ────────────────────────────────────────────────
+// Returns all data for a pair in a single response — replaces 8 REST polls.
+
+pub async fn get_snapshot(
+    Path(pair_id): Path<String>,
+    State(s): State<AppState>,
+) -> HandlerResult<Response> {
+    // Read all cache keys — zero Dragonfly, all from watch channels
+    let ob = s.cache.get_latest(&format!("cache:orderbook:{}", pair_id));
+    let trades = s.cache.get_latest(&format!("cache:trades:{}", pair_id));
+    let ticker = s.cache.get_latest(&format!("cache:ticker:{}", pair_id));
+    let metrics = s.cache.get_latest("cache:metrics");
+    let throughput = s.cache.get_latest("cache:throughput");
+    let latency = s.cache.get_latest("cache:latency_metrics");
+    let pairs = s.cache.get_latest("cache:pairs");
+
+    // Build composite JSON without parsing — raw concatenation
+    let mut buf = String::with_capacity(4096);
+    buf.push_str(r#"{"orderbook":"#);
+    buf.push_str(ob.as_deref().unwrap_or(r#"{"bids":[],"asks":[]}"#));
+    buf.push_str(r#","trades":"#);
+    buf.push_str(trades.as_deref().unwrap_or(r#"{"trades":[]}"#));
+    buf.push_str(r#","ticker":"#);
+    buf.push_str(ticker.as_deref().unwrap_or("null"));
+    buf.push_str(r#","metrics":"#);
+    buf.push_str(metrics.as_deref().unwrap_or("{}"));
+    buf.push_str(r#","throughput":"#);
+    buf.push_str(throughput.as_deref().unwrap_or(r#"{"series":[]}"#));
+    buf.push_str(r#","latency":"#);
+    buf.push_str(latency.as_deref().unwrap_or("{}"));
+    buf.push_str(r#","pairs":"#);
+    buf.push_str(pairs.as_deref().unwrap_or(r#"{"pairs":[]}"#));
+    buf.push('}');
+
+    Ok(raw_json(buf))
+}
+
+// ── GET /api/stream/{pair_id} — SSE ───────────────────────────────────────────
+// Server-Sent Events: single HTTP connection, pushes all updates for a pair.
+// Replaces multiple WS connections and REST polling.
+
+pub async fn sse_stream(
+    Path(pair_id): Path<String>,
+    State(s): State<AppState>,
+) -> impl IntoResponse {
+    let cache_keys = vec![
+        (format!("cache:orderbook:{}", pair_id), "orderbook"),
+        (format!("cache:trades:{}", pair_id), "trades"),
+        (format!("cache:ticker:{}", pair_id), "ticker"),
+        ("cache:metrics".to_string(), "metrics"),
+        ("cache:throughput".to_string(), "throughput"),
+        ("cache:latency_metrics".to_string(), "latency"),
+    ];
+
+    let stream = async_stream::stream! {
+        // Send initial snapshot for all keys
+        for (key, event_name) in &cache_keys {
+            if let Some(val) = s.cache.get_latest(key) {
+                yield Ok::<_, std::convert::Infallible>(Event::default().event(event_name.to_string()).data(val.to_string()));
+            }
+        }
+
+        // Subscribe to all broadcast channels
+        let mut receivers: Vec<(broadcast::Receiver<Arc<str>>, &str)> = Vec::new();
+        for (key, event_name) in &cache_keys {
+            if let Some(rx) = s.cache.subscribe(key) {
+                receivers.push((rx, event_name));
+            }
+        }
+
+        // Fan-in all channels
+        loop {
+            let mut got_msg = false;
+            for (rx, event_name) in &mut receivers {
+                match rx.try_recv() {
+                    Ok(val) => {
+                        yield Ok::<_, std::convert::Infallible>(Event::default().event(event_name.to_string()).data(val.to_string()));
+                        got_msg = true;
+                    }
+                    Err(broadcast::error::TryRecvError::Closed) => return,
+                    _ => {}
+                }
+            }
+            if !got_msg {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    };
+
+    Sse::new(Box::pin(stream))
+        .keep_alive(axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+}
+
 // ── WebSocket Feeds ───────────────────────────────────────────────────────────
 
 /// Shared-broadcast WS handler — subscribes to a CacheBroadcasts channel
@@ -461,6 +555,90 @@ async fn cache_broadcast_ws(
                         let _ = socket.send(Message::Pong(data)).await;
                     }
                     _ => {} // ignore text/binary from client
+                }
+            }
+        }
+    }
+}
+
+// ── Multiplexed WS /ws/stream — one connection, many subscriptions ────────────
+// Client sends: {"subscribe": ["orderbook:BTC-USDT", "trades:BTC-USDT", "ticker:BTC-USDT"]}
+// Server pushes: {"ch": "orderbook:BTC-USDT", "data": {...}}
+// One connection replaces 3+ separate WS connections.
+
+pub async fn ws_stream(
+    State(s): State<AppState>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_multiplexed_ws(s, socket))
+}
+
+async fn handle_multiplexed_ws(state: AppState, mut socket: WebSocket) {
+    use tokio::sync::mpsc;
+
+    // Channel for aggregating messages from all subscriptions
+    let (agg_tx, mut agg_rx) = mpsc::channel::<String>(256);
+
+    let mut subscription_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    loop {
+        tokio::select! {
+            // Forward aggregated messages to the client
+            Some(msg) = agg_rx.recv() => {
+                if socket.send(Message::Text(msg.into())).await.is_err() {
+                    return;
+                }
+            }
+            // Read client messages (subscribe commands)
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(cmd) = serde_json::from_str::<Value>(&text) {
+                            if let Some(channels) = cmd.get("subscribe").and_then(|v| v.as_array()) {
+                                for ch in channels {
+                                    if let Some(ch_name) = ch.as_str() {
+                                        let cache_key = format!("cache:{}", ch_name);
+                                        let ch_name_owned = ch_name.to_string();
+                                        let tx = agg_tx.clone();
+                                        let state_clone = state.clone();
+
+                                        // Send current value immediately
+                                        if let Some(val) = state.cache.get_latest(&cache_key) {
+                                            let init = format!(r#"{{"ch":"{}","data":{}}}"#, ch_name_owned, val);
+                                            let _ = tx.send(init).await;
+                                        }
+
+                                        // Spawn a task to forward updates
+                                        let handle = tokio::spawn(async move {
+                                            if let Some(mut rx) = state_clone.cache.subscribe(&cache_key) {
+                                                loop {
+                                                    match rx.recv().await {
+                                                        Ok(val) => {
+                                                            let msg = format!(r#"{{"ch":"{}","data":{}}}"#, ch_name_owned, val);
+                                                            if tx.send(msg).await.is_err() {
+                                                                return;
+                                                            }
+                                                        }
+                                                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                                        Err(broadcast::error::RecvError::Closed) => return,
+                                                    }
+                                                }
+                                            }
+                                        });
+                                        subscription_handles.push(handle);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = socket.send(Message::Pong(data)).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        for h in subscription_handles { h.abort(); }
+                        return;
+                    }
+                    _ => {}
                 }
             }
         }

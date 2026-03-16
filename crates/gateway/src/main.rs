@@ -271,7 +271,12 @@ async fn main() -> Result<()> {
             axum::routing::delete(routes::cancel_order).put(routes::modify_order),
         )
         .route("/api/portfolio", get(routes::get_portfolio))
+        // Batch API — one request replaces 8 REST polls
+        .route("/api/snapshot/{pair_id}", get(routes::get_snapshot))
+        // SSE — single connection pushes all updates
+        .route("/api/stream/{pair_id}", get(routes::sse_stream))
         // WebSocket feeds
+        .route("/ws/stream", get(routes::ws_stream))
         .route("/ws/orderbook/{pair_id}", get(routes::ws_orderbook))
         .route("/ws/trades/{pair_id}", get(routes::ws_trades))
         .route("/ws/orders/{user_id}", get(routes::ws_orders))
