@@ -18,7 +18,41 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use sme_shared::{OrderType, Side, SelfTradePreventionMode, TimeInForce};
+use sme_shared::{OrderStatus, OrderType, Side, SelfTradePreventionMode, TimeInForce};
+
+// ── Static string helpers (no format!("{:?}") allocations) ───────────────────
+
+fn side_str(s: Side) -> &'static str {
+    match s { Side::Buy => "Buy", Side::Sell => "Sell" }
+}
+
+fn order_type_str(ot: OrderType) -> &'static str {
+    match ot { OrderType::Limit => "Limit", OrderType::Market => "Market" }
+}
+
+fn tif_str(tif: TimeInForce) -> &'static str {
+    match tif { TimeInForce::GTC => "GTC", TimeInForce::IOC => "IOC", TimeInForce::FOK => "FOK" }
+}
+
+#[allow(dead_code)]
+fn status_str(s: OrderStatus) -> &'static str {
+    match s {
+        OrderStatus::New             => "New",
+        OrderStatus::PartiallyFilled => "PartiallyFilled",
+        OrderStatus::Filled          => "Filled",
+        OrderStatus::Cancelled       => "Cancelled",
+        OrderStatus::Rejected        => "Rejected",
+    }
+}
+
+fn stp_str(s: SelfTradePreventionMode) -> &'static str {
+    match s {
+        SelfTradePreventionMode::None        => "None",
+        SelfTradePreventionMode::CancelMaker => "CancelMaker",
+        SelfTradePreventionMode::CancelTaker => "CancelTaker",
+        SelfTradePreventionMode::CancelBoth  => "CancelBoth",
+    }
+}
 
 use crate::AppState;
 
@@ -215,12 +249,12 @@ pub async fn create_order(
         "id": order_id.to_string(),
         "user_id": user_id,
         "pair_id": req.pair_id,
-        "side": format!("{:?}", req.side),
-        "order_type": format!("{:?}", req.order_type),
-        "tif": format!("{:?}", tif),
+        "side": side_str(req.side),
+        "order_type": order_type_str(req.order_type),
+        "tif": tif_str(tif),
         "price": req.price.map(|v| v.to_string()),
         "quantity": req.quantity.to_string(),
-        "stp_mode": format!("{:?}", stp_mode),
+        "stp_mode": stp_str(stp_mode),
         "client_order_id": req.client_order_id,
         "created_at": now.to_rfc3339(),
     });
@@ -245,14 +279,14 @@ pub async fn create_order(
                 "status": "Pending",
                 "user_id": user_id,
                 "pair_id": req.pair_id,
-                "side": format!("{:?}", req.side),
-                "order_type": format!("{:?}", req.order_type),
-                "tif": format!("{:?}", tif),
+                "side": side_str(req.side),
+                "order_type": order_type_str(req.order_type),
+                "tif": tif_str(tif),
                 "price": req.price.map(|v| v.to_string()),
                 "quantity": req.quantity.to_string(),
                 "remaining": req.quantity.to_string(),
                 "status": "Queued",
-                "stp_mode": format!("{:?}", stp_mode),
+                "stp_mode": stp_str(stp_mode),
                 "client_order_id": req.client_order_id,
                 "created_at": now.to_rfc3339(),
             },

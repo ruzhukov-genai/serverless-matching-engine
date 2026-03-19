@@ -14,9 +14,10 @@ services:
       --logtostderr
       --cache_mode=true
       --default_lua_flags=allow-undeclared-keys
-      --proactor_threads=2
-      --maxmemory=2gb
-      --hz=100
+      --proactor_threads=1
+      --maxmemory=3gb
+      --hz=500
+      --tcp_nodelay=true
       --bind=127.0.0.1
       --port=6379
       --unixsocket=/tmp/dragonfly/dragonfly.sock
@@ -26,8 +27,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1.4"
-          memory: 2500M
+          cpus: "1.6"
+          memory: 4000M
     healthcheck:
       test: ["CMD", "redis-cli", "-h", "127.0.0.1", "ping"]
       interval: 5s
@@ -47,22 +48,24 @@ services:
     command: >
       postgres
       -c max_connections=50
-      -c shared_buffers=512MB
-      -c work_mem=16MB
-      -c effective_cache_size=2GB
-      -c maintenance_work_mem=128MB
+      -c shared_buffers=1GB
+      -c work_mem=32MB
+      -c effective_cache_size=3GB
+      -c maintenance_work_mem=256MB
       -c checkpoint_completion_target=0.9
-      -c wal_buffers=16MB
+      -c wal_buffers=64MB
       -c random_page_cost=1.1
       -c synchronous_commit=off
       -c max_wal_senders=0
       -c wal_level=minimal
       -c listen_addresses=127.0.0.1
+      -c checkpoint_timeout=15min
+      -c max_wal_size=2GB
     deploy:
       resources:
         limits:
-          cpus: "0.5"
-          memory: 1000M
+          cpus: "0.8"
+          memory: 2000M
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U sme -d matching_engine"]
       interval: 5s

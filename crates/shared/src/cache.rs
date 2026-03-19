@@ -23,6 +23,7 @@
 //!
 //! Scale factor: 100_000_000 (10^8) for 8-decimal precision.
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -450,8 +451,8 @@ pub async fn load_order_book_batched(
 
 // ── Balance locking via Dragonfly (replaces PG hot-path lock) ─────────────────
 
-/// Lock balance in Dragonfly using WATCH/MULTI/EXEC (optimistic, no Lua).
-/// Avoids competing for Dragonfly's single Lua thread with the matching EVAL.
+/// Lock balance in Dragonfly atomically via Lua EVAL.
+/// Eliminates the TOCTOU race in the previous HGET + pipeline approach.
 pub async fn lock_balance_dragonfly(
     pool: &Pool,
     user_id: &str,
@@ -461,27 +462,23 @@ pub async fn lock_balance_dragonfly(
     let mut conn = pool.get().await.context("pool.get")?;
     let key = format!("balance:{}:{}", user_id, asset);
 
-    // Read current available balance
-    let avail: i64 = redis::cmd("HGET")
-        .arg(&key)
-        .arg("available")
-        .query_async(&mut *conn)
-        .await
-        .unwrap_or(0);
+    let result: redis::RedisResult<String> = LOCK_BALANCE_SCRIPT
+        .prepare_invoke()
+        .key(&key)
+        .arg(amount_scaled.to_string())
+        .invoke_async(&mut *conn)
+        .await;
 
-    if avail < amount_scaled {
-        anyhow::bail!("insufficient {} balance for user {}", asset, user_id);
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("INSUFFICIENT_BALANCE") {
+                anyhow::bail!("insufficient {} balance for user {}", asset, user_id);
+            }
+            Err(anyhow::anyhow!("lock_balance Lua error: {e}"))
+        }
     }
-
-    // Atomic decrement available + increment locked via pipeline
-    redis::pipe()
-        .cmd("HINCRBY").arg(&key).arg("available").arg(-amount_scaled)
-        .cmd("HINCRBY").arg(&key).arg("locked").arg(amount_scaled)
-        .query_async::<()>(&mut *conn)
-        .await
-        .context("lock_balance pipeline")?;
-
-    Ok(())
 }
 
 /// Release locked balance back to available in Dragonfly.
@@ -580,6 +577,34 @@ for _, v in ipairs(asks) do result[#result + 1] = v end
 return result
 "#;
 
+// ── Cached Lua Script objects (SHA1 computed once at startup) ─────────────────
+
+static MATCH_SCRIPT: LazyLock<redis::Script> =
+    LazyLock::new(|| redis::Script::new(include_str!("lua/match_order.lua")));
+
+static CAS_LUA_SCRIPT: LazyLock<redis::Script> =
+    LazyLock::new(|| redis::Script::new(CAS_SCRIPT));
+
+static SNAPSHOT_LUA_SCRIPT: LazyLock<redis::Script> =
+    LazyLock::new(|| redis::Script::new(ORDERBOOK_SNAPSHOT_LUA));
+
+// ── Atomic balance lock via Lua ───────────────────────────────────────────────
+
+const LOCK_BALANCE_LUA: &str = r#"
+local key = KEYS[1]
+local amount = tonumber(ARGV[1])
+local avail = tonumber(redis.call('HGET', key, 'available') or '0')
+if avail == nil or avail < amount then
+    return redis.error_reply('INSUFFICIENT_BALANCE')
+end
+redis.call('HINCRBY', key, 'available', -amount)
+redis.call('HINCRBY', key, 'locked', amount)
+return 'OK'
+"#;
+
+static LOCK_BALANCE_SCRIPT: LazyLock<redis::Script> =
+    LazyLock::new(|| redis::Script::new(LOCK_BALANCE_LUA));
+
 /// Load aggregated orderbook levels via a single Lua EVAL.
 /// Returns (bids_agg, asks_agg) where each is Vec<(price_str, qty_str)>.
 pub async fn orderbook_snapshot_lua(
@@ -588,12 +613,10 @@ pub async fn orderbook_snapshot_lua(
     limit: usize,
 ) -> Result<(Vec<(String, String)>, Vec<(String, String)>)> {
     let mut conn = pool.get().await.context("pool.get")?;
-    let result: Vec<String> = redis::cmd("EVAL")
-        .arg(ORDERBOOK_SNAPSHOT_LUA)
-        .arg(1)  // KEYS count
-        .arg(pair_id)
+    let result: Vec<String> = SNAPSHOT_LUA_SCRIPT.prepare_invoke()
+        .key(pair_id)
         .arg(limit)
-        .query_async(&mut *conn)
+        .invoke_async(&mut *conn)
         .await
         .context("orderbook_snapshot_lua EVAL")?;
 
@@ -839,8 +862,7 @@ pub async fn apply_book_mutations_cas(
 
     // Phase 2: Lua CAS — version check + ZADD/ZREM + INCR
     let n = mutations.len();
-    let script = redis::Script::new(CAS_SCRIPT);
-    let mut invocation = script.prepare_invoke();
+    let mut invocation = CAS_LUA_SCRIPT.prepare_invoke();
     invocation
         .key(&version_key)
         .key(&bids_key)
@@ -915,8 +937,6 @@ pub async fn match_order_lua(
     pool: &Pool,
     order: &Order,
 ) -> Result<LuaMatchResult> {
-    let lua_script = include_str!("lua/match_order.lua");
-
     let bids_key = format!("book:{}:bids", order.pair_id);
     let asks_key = format!("book:{}:asks", order.pair_id);
     let version_key = format!("version:{}", order.pair_id);
@@ -946,8 +966,7 @@ pub async fn match_order_lua(
     // Single Lua EVAL — ZRANGEBYSCORE + matching all in one atomic call
     // KEYS: [1]=bids, [2]=asks, [3]=version, [4]=order:{incoming_id}
     // ARGV: [1..11]=order fields, [12]=max_score
-    let script = redis::Script::new(lua_script);
-    let mut invocation = script.prepare_invoke();
+    let mut invocation = MATCH_SCRIPT.prepare_invoke();
 
     invocation
         .key(&bids_key)

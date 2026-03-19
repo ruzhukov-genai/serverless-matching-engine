@@ -57,11 +57,11 @@ async fn main() -> Result<()> {
     tracing::info!("sme-api (worker) starting");
 
     let config = sme_shared::Config::from_env();
-    let dragonfly = sme_shared::cache::create_pool(&config.dragonfly_url).await?;
+    let dragonfly = sme_shared::cache::create_pool_sized(&config.dragonfly_url, 30).await?;
 
     // Hot path pool: low latency, fast order inserts + balance locks.
     let pg_hot = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(60)
+        .max_connections(20)
         .min_connections(2)
         .acquire_timeout(Duration::from_secs(5))
         .idle_timeout(Duration::from_secs(120))
@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
 
     // Background pool: async persist + read-only queries (portfolio, orders, pairs).
     let pg_bg = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(40)
+        .max_connections(15)
         .min_connections(3)
         .acquire_timeout(Duration::from_secs(10))
         .idle_timeout(Duration::from_secs(120))

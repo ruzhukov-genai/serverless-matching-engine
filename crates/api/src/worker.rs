@@ -237,9 +237,9 @@ async fn pair_order_consumer(state: AppState, pair_id: String) {
             None => continue,
         };
 
-        // Drain up to 2 more orders non-blocking (batch of 3 max)
+        // Drain up to 9 more orders non-blocking (batch of 10 max)
         let mut batch = vec![first_order];
-        for _ in 0..2 {
+        for _ in 0..9 {
             let extra: Option<String> = conn.rpop(&queue_key, None).await.unwrap_or(None);
             match extra {
                 Some(s) => batch.push(s),
@@ -394,53 +394,71 @@ async fn fallback_cancellation_consumer(state: AppState) {
     }
 }
 
+// ── QueuedOrderMsg — typed deserialization replacing manual Value extraction ──
+
+#[derive(serde::Deserialize)]
+struct QueuedOrderMsg {
+    id: String,
+    #[serde(default = "default_user_id")]
+    user_id: String,
+    pair_id: String,
+    side: String,        // "Buy" or "Sell"
+    order_type: String,  // "Limit" or "Market"
+    #[serde(default = "default_gtc")]
+    tif: String,         // "GTC", "IOC", "FOK"
+    price: Option<String>,
+    quantity: String,
+    #[serde(default)]
+    stp_mode: Option<String>,
+    #[serde(default)]
+    client_order_id: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+fn default_gtc() -> String { "GTC".to_string() }
+fn default_user_id() -> String { "user-1".to_string() }
+
 /// Process a single order from the queue.
 async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Result<()> {
     let total_start = std::time::Instant::now();
 
-    // Parse the order JSON from the gateway
+    // Parse the order JSON from the gateway into typed struct
     let parse_start = std::time::Instant::now();
-    let order_json: Value = serde_json::from_str(order_str)?;
-    
-    let user_id = order_json.get("user_id").and_then(|v| v.as_str()).unwrap_or("user-1").to_string();
-    let pair_id = order_json.get("pair_id").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("missing pair_id"))?;
-    let side: Side = order_json.get("side").and_then(|v| v.as_str()).and_then(|s| match s {
-        "Buy" => Some(Side::Buy),
-        "Sell" => Some(Side::Sell),
-        _ => None,
-    }).ok_or_else(|| anyhow::anyhow!("invalid side"))?;
-    
-    let order_type: OrderType = order_json.get("order_type").and_then(|v| v.as_str()).and_then(|s| match s {
-        "Market" => Some(OrderType::Market),
-        "Limit" => Some(OrderType::Limit),
-        _ => None,
-    }).ok_or_else(|| anyhow::anyhow!("invalid order_type"))?;
-    
-    let tif: TimeInForce = order_json.get("tif").and_then(|v| v.as_str()).and_then(|s| match s {
-        "IOC" => Some(TimeInForce::IOC),
-        "FOK" => Some(TimeInForce::FOK),
-        "GTC" => Some(TimeInForce::GTC),
-        _ => None,
-    }).unwrap_or(TimeInForce::GTC);
-    
-    let stp_mode: SelfTradePreventionMode = order_json.get("stp_mode").and_then(|v| v.as_str()).and_then(|s| match s {
-        "CancelTaker" => Some(SelfTradePreventionMode::CancelTaker),
-        "CancelMaker" => Some(SelfTradePreventionMode::CancelMaker),
-        "CancelBoth" => Some(SelfTradePreventionMode::CancelBoth),
-        "None" => Some(SelfTradePreventionMode::None),
-        _ => None,
-    }).unwrap_or(SelfTradePreventionMode::None);
+    let msg: QueuedOrderMsg = serde_json::from_str(order_str)?;
 
-    let price = order_json.get("price").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok());
-    let quantity = order_json.get("quantity").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok())
-        .ok_or_else(|| anyhow::anyhow!("invalid quantity"))?;
+    let order_id = Uuid::parse_str(&msg.id)?;
+    let user_id = msg.user_id;
+    let pair_id = msg.pair_id;
 
-    let order_id_str = order_json.get("id").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("missing order id"))?;
-    let order_id = Uuid::parse_str(order_id_str)?;
+    let side: Side = match msg.side.as_str() {
+        "Buy"  => Side::Buy,
+        "Sell" => Side::Sell,
+        s => anyhow::bail!("invalid side: {s}"),
+    };
+    let order_type: OrderType = match msg.order_type.as_str() {
+        "Limit"  => OrderType::Limit,
+        "Market" => OrderType::Market,
+        s => anyhow::bail!("invalid order_type: {s}"),
+    };
+    let tif: TimeInForce = match msg.tif.as_str() {
+        "GTC" => TimeInForce::GTC,
+        "IOC" => TimeInForce::IOC,
+        "FOK" => TimeInForce::FOK,
+        _ => TimeInForce::GTC,
+    };
+    let stp_mode: SelfTradePreventionMode = match msg.stp_mode.as_deref().unwrap_or("None") {
+        "CancelMaker" => SelfTradePreventionMode::CancelMaker,
+        "CancelTaker" => SelfTradePreventionMode::CancelTaker,
+        "CancelBoth"  => SelfTradePreventionMode::CancelBoth,
+        _             => SelfTradePreventionMode::None,
+    };
 
-    let client_order_id = order_json.get("client_order_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let price = msg.price.as_deref().and_then(|s| Decimal::from_str(s).ok());
+    let quantity = Decimal::from_str(&msg.quantity)
+        .map_err(|_| anyhow::anyhow!("invalid quantity: {}", msg.quantity))?;
 
-    let created_at = order_json.get("created_at").and_then(|v| v.as_str())
+    let created_at = msg.created_at.as_deref()
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .unwrap_or_else(Utc::now);
@@ -449,7 +467,7 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
     let mut order = Order {
         id: order_id,
         user_id: user_id.clone(),
-        pair_id: pair_id.to_string(),
+        pair_id: pair_id.clone(),
         side,
         order_type,
         tif,
@@ -462,7 +480,7 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
         sequence: 0,
         created_at,
         updated_at: now,
-        client_order_id,
+        client_order_id: msg.client_order_id,
     };
 
     let parse_us = parse_start.elapsed().as_micros() as u64;
@@ -485,7 +503,7 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
     //    PG balances reconciled by persist worker asynchronously.
     let pre_lock_start = std::time::Instant::now();
     {
-        let (base, quote) = sme_shared::parse_pair_id(pair_id)?;
+        let (base, quote) = sme_shared::parse_pair_id(&pair_id)?;
         let (asset, amount) = match order.side {
             Side::Buy => {
                 let price = order.price.unwrap_or(Decimal::ZERO);
@@ -522,7 +540,7 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
     let trade_count = lua_result.trades.len();
 
     // Metrics — accumulate in-memory batch (flushed every 2s, zero Dragonfly ops here)
-    state.metrics_batch.record_order(pair_id, trade_count, lua_us / 1000);
+    state.metrics_batch.record_order(&pair_id, trade_count, lua_us / 1000);
 
     // Build Trade objects (UUIDs generated in Rust, not Lua)
     let trade_now = Utc::now();
@@ -597,7 +615,7 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
         || order.status == OrderStatus::PartiallyFilled;
     let had_trades = !trade_jsons.is_empty();
     if had_trades || order_rested {
-        state.orderbook_debouncer.mark_dirty(pair_id);
+        state.orderbook_debouncer.mark_dirty(&pair_id);
     }
     let cache_us = 0u64;
 

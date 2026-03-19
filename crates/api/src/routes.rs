@@ -29,15 +29,25 @@ pub struct PersistJob {
     pub lua_trades: Vec<cache::LuaTrade>,
 }
 
-/// Spawn a background worker that drains `rx` and persists each job to PostgreSQL.
+/// Spawn a background worker that drains `rx`, batches up to 50 jobs, and
+/// persists them all in a single PostgreSQL transaction.
 pub fn spawn_persist_worker(
     pg: sqlx::PgPool,
     mut rx: mpsc::Receiver<PersistJob>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(job) = rx.recv().await {
-            if let Err(e) = process_persist_job(&pg, job).await {
-                tracing::error!(error = %e, "async persist failed");
+        while let Some(first_job) = rx.recv().await {
+            let mut batch = vec![first_job];
+            // Drain more without blocking (up to 50 total)
+            while batch.len() < 50 {
+                match rx.try_recv() {
+                    Ok(job) => batch.push(job),
+                    Err(_) => break,
+                }
+            }
+            let count = batch.len();
+            if let Err(e) = process_persist_batch(&pg, batch).await {
+                tracing::error!(error = %e, batch_size = count, "batch persist failed");
             }
         }
     })
@@ -58,8 +68,8 @@ pub async fn process_persist_job(pg: &sqlx::PgPool, job: PersistJob) -> anyhow::
         &json!({
             "order_id": job.order.id.to_string(),
             "user_id": job.order.user_id,
-            "side": format!("{:?}", job.order.side),
-            "order_type": format!("{:?}", job.order.order_type),
+            "side": side_str(job.order.side),
+            "order_type": order_type_str(job.order.order_type),
             "price": job.order.price.map(|v| v.to_string()),
             "quantity": job.order.quantity.to_string(),
         }),
@@ -92,6 +102,203 @@ pub async fn process_persist_job(pg: &sqlx::PgPool, job: PersistJob) -> anyhow::
     Ok(())
 }
 
+
+/// Execute all DB writes for a batch of matched orders in ONE transaction.
+/// Called by the batching persist worker; keeps `process_persist_job` intact
+/// for the fallback direct-spawn path.
+async fn process_persist_batch(pg: &sqlx::PgPool, batch: Vec<PersistJob>) -> anyhow::Result<()> {
+    let persist_start = std::time::Instant::now();
+    let batch_size = batch.len();
+
+    let mut tx = pg.begin().await?;
+
+    // 1. INSERT all orders
+    for job in &batch {
+        sqlx::query(
+            "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, created_at, updated_at, client_order_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(job.order.id)
+        .bind(&job.order.user_id)
+        .bind(&job.order.pair_id)
+        .bind(side_str(job.order.side))
+        .bind(order_type_str(job.order.order_type))
+        .bind(tif_str(job.order.tif))
+        .bind(job.order.price)
+        .bind(job.order.quantity)
+        .bind(job.order.remaining)
+        .bind(status_str(job.order.status))
+        .bind(stp_str(job.order.stp_mode))
+        .bind(job.order.version)
+        .bind(job.order.created_at)
+        .bind(job.order.updated_at)
+        .bind(&job.order.client_order_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // 2. INSERT all trades + aggregate balance deltas across ALL jobs
+    let mut balance_deltas: HashMap<(String, String), (Decimal, Decimal)> = HashMap::new();
+
+    for job in &batch {
+        for trade in &job.trades {
+            sqlx::query(
+                "INSERT INTO trades (id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, created_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING",
+            )
+            .bind(trade.id)
+            .bind(&trade.pair_id)
+            .bind(trade.buy_order_id)
+            .bind(trade.sell_order_id)
+            .bind(&trade.buyer_id)
+            .bind(&trade.seller_id)
+            .bind(trade.price)
+            .bind(trade.quantity)
+            .bind(trade.created_at)
+            .execute(&mut *tx)
+            .await?;
+
+            let (base, quote) = sme_shared::parse_pair_id(&trade.pair_id)?;
+            let cost = trade.price * trade.quantity;
+
+            // buyer: locked -= cost, available += qty (base)
+            balance_deltas.entry((trade.buyer_id.clone(), quote.clone()))
+                .or_insert((Decimal::ZERO, Decimal::ZERO)).0 += cost;
+            balance_deltas.entry((trade.buyer_id.clone(), base.clone()))
+                .or_insert((Decimal::ZERO, Decimal::ZERO)).1 += trade.quantity;
+
+            // seller: locked -= qty (base), available += cost
+            balance_deltas.entry((trade.seller_id.clone(), base.clone()))
+                .or_insert((Decimal::ZERO, Decimal::ZERO)).0 += trade.quantity;
+            balance_deltas.entry((trade.seller_id.clone(), quote.clone()))
+                .or_insert((Decimal::ZERO, Decimal::ZERO)).1 += cost;
+        }
+    }
+
+    // 3. Apply one UPDATE per (user_id, asset) — sorted to prevent deadlocks
+    let mut sorted_deltas: Vec<_> = balance_deltas.iter().collect();
+    sorted_deltas.sort_by_key(|((uid, asset), _)| (uid.as_str(), asset.as_str()));
+
+    for ((user_id, asset), (locked_decrease, available_increase)) in &sorted_deltas {
+        sqlx::query(
+            "INSERT INTO balances (user_id, asset, available, locked) VALUES ($3, $4, $2, 0)
+             ON CONFLICT (user_id, asset) DO UPDATE
+               SET locked    = GREATEST(balances.locked    - $1, 0),
+                   available = balances.available + $2",
+        )
+        .bind(locked_decrease)
+        .bind(available_increase)
+        .bind(user_id)
+        .bind(asset)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // 4. UPDATE resting orders
+    let now = Utc::now();
+    for job in &batch {
+        for lt in &job.lua_trades {
+            sqlx::query(
+                "UPDATE orders
+                 SET remaining   = GREATEST(remaining - $1, 0),
+                     status      = CASE WHEN GREATEST(remaining - $1, 0) = 0
+                                        THEN 'Filled' ELSE 'PartiallyFilled' END,
+                     version     = version + 1,
+                     updated_at  = $2
+                 WHERE id = $3
+                   AND status IN ('New', 'PartiallyFilled')",
+            )
+            .bind(lt.quantity)
+            .bind(now)
+            .bind(lt.resting_order_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
+    // 5. UPDATE incoming orders (remaining + status)
+    for job in &batch {
+        sqlx::query(
+            "UPDATE orders SET remaining = $1, status = $2, version = version + 1, updated_at = $3 WHERE id = $4",
+        )
+        .bind(job.order.remaining)
+        .bind(status_str(job.order.status))
+        .bind(now)
+        .bind(job.order.id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // 6. Release remaining locked for fully-resolved orders
+    for job in &batch {
+        if (job.order.status == OrderStatus::Cancelled || job.order.status == OrderStatus::Filled)
+            && job.order.remaining != Decimal::ZERO
+        {
+            let (base, quote) = sme_shared::parse_pair_id(&job.order.pair_id)?;
+            let (asset, amount) = match job.order.side {
+                Side::Buy  => {
+                    let price = job.order.price.unwrap_or(Decimal::ZERO);
+                    (quote, price * job.order.remaining)
+                }
+                Side::Sell => (base, job.order.remaining),
+            };
+            sqlx::query(
+                "UPDATE balances SET available = available + $1, locked = GREATEST(locked - $1, 0) WHERE user_id = $2 AND asset = $3",
+            )
+            .bind(amount)
+            .bind(&job.order.user_id)
+            .bind(&asset)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
+    tx.commit().await?;
+
+    // 7. Audit events — fire-and-forget outside main transaction
+    for job in &batch {
+        sqlx::query("INSERT INTO audit_log (pair_id, event_type, payload) VALUES ($1, $2, $3)")
+            .bind(&job.order.pair_id)
+            .bind("ORDER_CREATED")
+            .bind(json!({
+                "order_id": job.order.id.to_string(),
+                "user_id": job.order.user_id,
+                "side": side_str(job.order.side),
+                "order_type": order_type_str(job.order.order_type),
+                "price": job.order.price.map(|v| v.to_string()),
+                "quantity": job.order.quantity.to_string(),
+            }))
+            .execute(pg)
+            .await
+            .ok();
+
+        for trade in &job.trades {
+            sqlx::query("INSERT INTO audit_log (pair_id, event_type, payload) VALUES ($1, $2, $3)")
+                .bind(&trade.pair_id)
+                .bind("TRADE_EXECUTED")
+                .bind(json!({
+                    "trade_id": trade.id.to_string(),
+                    "buy_order_id": trade.buy_order_id.to_string(),
+                    "sell_order_id": trade.sell_order_id.to_string(),
+                    "price": trade.price.to_string(),
+                    "quantity": trade.quantity.to_string(),
+                }))
+                .execute(pg)
+                .await
+                .ok();
+        }
+    }
+
+    let persist_ms = persist_start.elapsed().as_millis() as u64;
+    tracing::info!(
+        persist_ms = persist_ms,
+        batch_size = batch_size,
+        "batch persist complete"
+    );
+
+    Ok(())
+}
 
 pub async fn insert_audit_event(
     pg: &sqlx::PgPool,
@@ -148,14 +355,14 @@ pub async fn insert_order_db(pg: &sqlx::PgPool, order: &Order) -> anyhow::Result
     .bind(order.id)
     .bind(&order.user_id)
     .bind(&order.pair_id)
-    .bind(format!("{:?}", order.side))
-    .bind(format!("{:?}", order.order_type))
-    .bind(format!("{:?}", order.tif))
+    .bind(side_str(order.side))
+    .bind(order_type_str(order.order_type))
+    .bind(tif_str(order.tif))
     .bind(order.price)
     .bind(order.quantity)
     .bind(order.remaining)
-    .bind(format!("{:?}", order.status))
-    .bind(format!("{:?}", order.stp_mode))
+    .bind(status_str(order.status))
+    .bind(stp_str(order.stp_mode))
     .bind(order.version)
     .bind(order.created_at)
     .bind(order.updated_at)
@@ -170,7 +377,7 @@ async fn update_order_db(pg: &sqlx::PgPool, order: &Order) -> anyhow::Result<()>
         "UPDATE orders SET remaining = $1, status = $2, version = version + 1, updated_at = $3 WHERE id = $4",
     )
     .bind(order.remaining)
-    .bind(format!("{:?}", order.status))
+    .bind(status_str(order.status))
     .bind(Utc::now())
     .bind(order.id)
     .execute(pg)
@@ -278,19 +485,52 @@ fn _row_to_order_json(r: &sqlx::postgres::PgRow) -> Value {
     order_to_json(&order)
 }
 
+// ── Static string helpers for enum → &str (avoid format!("{:?}") allocations) ─
+
+pub fn side_str(s: Side) -> &'static str {
+    match s { Side::Buy => "Buy", Side::Sell => "Sell" }
+}
+
+pub fn order_type_str(ot: OrderType) -> &'static str {
+    match ot { OrderType::Limit => "Limit", OrderType::Market => "Market" }
+}
+
+pub fn tif_str(tif: TimeInForce) -> &'static str {
+    match tif { TimeInForce::GTC => "GTC", TimeInForce::IOC => "IOC", TimeInForce::FOK => "FOK" }
+}
+
+pub fn status_str(s: OrderStatus) -> &'static str {
+    match s {
+        OrderStatus::New             => "New",
+        OrderStatus::PartiallyFilled => "PartiallyFilled",
+        OrderStatus::Filled          => "Filled",
+        OrderStatus::Cancelled       => "Cancelled",
+        OrderStatus::Rejected        => "Rejected",
+    }
+}
+
+pub fn stp_str(s: SelfTradePreventionMode) -> &'static str {
+    match s {
+        SelfTradePreventionMode::None         => "None",
+        SelfTradePreventionMode::CancelMaker  => "CancelMaker",
+        SelfTradePreventionMode::CancelTaker  => "CancelTaker",
+        SelfTradePreventionMode::CancelBoth   => "CancelBoth",
+    }
+}
+
 pub fn order_to_json(o: &Order) -> Value {
     let mut j = json!({
         "id": o.id.to_string(),
         "user_id": o.user_id,
         "pair_id": o.pair_id,
-        "side": format!("{:?}", o.side),
-        "order_type": format!("{:?}", o.order_type),
-        "tif": format!("{:?}", o.tif),
+        "side": side_str(o.side),
+        "order_type": order_type_str(o.order_type),
+        "tif": tif_str(o.tif),
         "price": o.price.map(|v| v.to_string()),
         "quantity": o.quantity.to_string(),
         "remaining": o.remaining.to_string(),
-        "status": format!("{:?}", o.status),
-        "stp_mode": format!("{:?}", o.stp_mode),
+        "status": status_str(o.status),
+        "stp_mode": stp_str(o.stp_mode),
         "version": o.version,
         "created_at": o.created_at.to_rfc3339(),
         "updated_at": o.updated_at.to_rfc3339(),
