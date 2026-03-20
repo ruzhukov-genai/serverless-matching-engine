@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tracing_subscriber::EnvFilter;
 use serde_json::{json, Value};
+use sme_shared::cache::PairKeys;
 
 mod routes;
 mod worker;
@@ -29,12 +30,16 @@ pub struct PairConfig {
 #[derive(Clone)]
 pub struct AppState {
     pub dragonfly: RedisPool,
+    /// Dragonfly connection URL — used to create dedicated BRPOP connections (Opt 2).
+    pub dragonfly_url: String,
     /// Hot path pool — used by order writes.
     pub pg: PgPool,
     /// Background pool — async persist + read-only queries.
     pub pg_bg: PgPool,
     /// In-memory pairs cache: pair_id → PairConfig
     pub pairs_cache: Arc<HashMap<String, PairConfig>>,
+    /// Pre-computed per-pair Dragonfly key strings — avoids format! on hot path (Opt 3).
+    pub pair_keys: Arc<HashMap<String, PairKeys>>,
     /// Channel to the background persistence worker
     pub persist_tx: mpsc::Sender<routes::PersistJob>,
     /// Order events broadcast — all order state changes pushed here
@@ -93,6 +98,12 @@ async fn main() -> Result<()> {
     let pairs_cache = Arc::new(load_pairs_cache(&pg_hot).await?);
     tracing::info!(count = pairs_cache.len(), "pairs cache loaded");
 
+    // Pre-compute per-pair Dragonfly key strings — avoids format! calls on hot path (Opt 3)
+    let pair_keys: HashMap<String, PairKeys> = pairs_cache.keys()
+        .map(|p| (p.clone(), PairKeys::new(p)))
+        .collect();
+    let pair_keys = Arc::new(pair_keys);
+
     // Initialize cache keys in Dragonfly
     tracing::info!("initializing cache keys");
     initialize_cache_keys(&dragonfly, &pg_hot, &pairs_cache).await?;
@@ -112,7 +123,9 @@ async fn main() -> Result<()> {
     let orderbook_debouncer = Arc::new(worker::OrderbookDebouncer::new());
 
     let state = AppState {
-        dragonfly: dragonfly.clone(), pg: pg_hot, pg_bg: pg_bg.clone(), pairs_cache,
+        dragonfly: dragonfly.clone(),
+        dragonfly_url: config.dragonfly_url.clone(),
+        pg: pg_hot, pg_bg: pg_bg.clone(), pairs_cache, pair_keys,
         persist_tx, order_events_tx, dirty_users_tx,
         metrics_batch: metrics_batch.clone(), orderbook_debouncer: orderbook_debouncer.clone(),
     };

@@ -11,6 +11,8 @@ use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
 
+use std::sync::Arc;
+
 use sme_shared::{
     cache, metrics, Order, OrderStatus, OrderType, Side,
     SelfTradePreventionMode, TimeInForce, Trade,
@@ -23,8 +25,9 @@ const PAIRS: &[&str] = &["BTC-USDT", "ETH-USDT", "SOL-USDT"];
 // ── Async persistence ─────────────────────────────────────────────────────────
 
 /// Job sent to the background persistence worker after a Lua match completes.
+/// order is wrapped in Arc to avoid a deep clone on the hot path (Opt 6).
 pub struct PersistJob {
-    pub order: Order,
+    pub order: Arc<Order>,
     pub trades: Vec<Trade>,
     pub lua_trades: Vec<cache::LuaTrade>,
 }

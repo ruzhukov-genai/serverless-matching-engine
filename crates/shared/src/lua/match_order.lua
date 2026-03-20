@@ -22,6 +22,8 @@
 -- ARGV[10] = pair_id (used when writing resting incoming order hash)
 -- ARGV[11] = score (float string, for placing resting incoming order in sorted set)
 -- ARGV[12] = max_score (price bound for ZRANGEBYSCORE, e.g. "5000000000" or "+inf")
+-- ARGV[13] = lock_asset (asset to lock balance for, e.g. "USDT" or "BTC")
+-- ARGV[14] = lock_amount_scaled (amount * 10^8 as i64 string; "0" means no lock)
 --
 -- Returns array:
 --   [1] = "OK"
@@ -49,6 +51,21 @@ local ts_ms      = ARGV[9]
 local pair_id    = ARGV[10]
 local score      = ARGV[11]
 local max_score  = ARGV[12]
+
+-- ── Balance lock (merged from lock_balance_dragonfly — saves 1 round-trip) ───
+-- ARGV[13]/ARGV[14]: lock_asset / lock_amount_scaled
+-- Skip if lock_amount is 0 or absent (e.g. market buy with unknown price).
+local lock_asset  = ARGV[13]
+local lock_amount = tonumber(ARGV[14])
+if lock_asset and lock_asset ~= '' and lock_amount and lock_amount > 0 then
+    local bal_key = 'balance:' .. user_id .. ':' .. lock_asset
+    local avail   = tonumber(redis.call('HGET', bal_key, 'available') or '0')
+    if avail < lock_amount then
+        return {'INSUFFICIENT_BALANCE'}
+    end
+    redis.call('HINCRBY', bal_key, 'available', -lock_amount)
+    redis.call('HINCRBY', bal_key, 'locked',    lock_amount)
+end
 
 -- Determine opposite-side and own-side book keys
 local opp_key, own_key

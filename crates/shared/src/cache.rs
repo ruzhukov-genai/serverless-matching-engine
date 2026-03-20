@@ -102,6 +102,28 @@ pub async fn health_check(pool: &Pool) -> Result<()> {
     Ok(())
 }
 
+// ── Pre-computed per-pair key strings ────────────────────────────────────────
+
+/// Holds the three static Dragonfly key strings for one trading pair.
+/// Computed once at startup and stored in AppState — avoids 3 format! calls
+/// on every order on the hot path.
+#[derive(Clone, Debug)]
+pub struct PairKeys {
+    pub bids_key: String,
+    pub asks_key: String,
+    pub version_key: String,
+}
+
+impl PairKeys {
+    pub fn new(pair_id: &str) -> Self {
+        Self {
+            bids_key:    format!("book:{pair_id}:bids"),
+            asks_key:    format!("book:{pair_id}:asks"),
+            version_key: format!("version:{pair_id}"),
+        }
+    }
+}
+
 // ── Key helpers ───────────────────────────────────────────────────────────────
 
 fn book_key(pair_id: &str, side: Side) -> String {
@@ -929,17 +951,26 @@ fn redis_value_to_string(v: &redis::Value) -> Option<String> {
 /// then accesses their hashes directly. Dragonfly (non-cluster) allows undeclared
 /// key access in scripts — no Phase 1 round-trip needed.
 ///
-/// Total: 1 round-trip, no lock, no retry, no CAS version check.
+/// The balance lock is now merged into this EVAL (Opt 1) — saves 1 round-trip.
+/// Pass `lock_asset` and `lock_amount_scaled` for the asset to lock; pass
+/// `lock_amount_scaled = 0` to skip locking (e.g. market buy with unknown price).
+///
+/// `pair_keys` should come from AppState — pre-computed at startup (Opt 3).
+///
+/// Total: 1 round-trip (was 2), no lock, no retry, no CAS version check.
 ///
 /// # FOK note
 /// FOK orders are NOT handled here. See the OCC/CAS path in routes.rs.
 pub async fn match_order_lua(
     pool: &Pool,
     order: &Order,
+    pair_keys: &PairKeys,
+    lock_asset: &str,
+    lock_amount_scaled: i64,
 ) -> Result<LuaMatchResult> {
-    let bids_key = format!("book:{}:bids", order.pair_id);
-    let asks_key = format!("book:{}:asks", order.pair_id);
-    let version_key = format!("version:{}", order.pair_id);
+    let bids_key = &pair_keys.bids_key;
+    let asks_key = &pair_keys.asks_key;
+    let version_key = &pair_keys.version_key;
     let incoming_order_key = format!("order:{}", order.id);
 
     let price_i = order.price.map(decimal_to_i64).unwrap_or(0);
@@ -963,15 +994,15 @@ pub async fn match_order_lua(
 
     let mut conn = pool.get().await.context("pool.get")?;
 
-    // Single Lua EVAL — ZRANGEBYSCORE + matching all in one atomic call
+    // Single Lua EVAL — balance lock + ZRANGEBYSCORE + matching all in one atomic call
     // KEYS: [1]=bids, [2]=asks, [3]=version, [4]=order:{incoming_id}
-    // ARGV: [1..11]=order fields, [12]=max_score
+    // ARGV: [1..12]=order fields + max_score, [13]=lock_asset, [14]=lock_amount_scaled
     let mut invocation = MATCH_SCRIPT.prepare_invoke();
 
     invocation
-        .key(&bids_key)
-        .key(&asks_key)
-        .key(&version_key)
+        .key(bids_key.as_str())
+        .key(asks_key.as_str())
+        .key(version_key.as_str())
         .key(&incoming_order_key);
 
     invocation
@@ -986,7 +1017,9 @@ pub async fn match_order_lua(
         .arg(order.created_at.timestamp_millis().to_string())
         .arg(&order.pair_id)
         .arg(score.to_string())
-        .arg(&max_score);
+        .arg(&max_score)
+        .arg(lock_asset)
+        .arg(lock_amount_scaled.to_string());
 
     let raw: redis::Value = invocation
         .invoke_async(&mut *conn)
@@ -994,7 +1027,7 @@ pub async fn match_order_lua(
         .context("Lua match_order EVAL")?;
 
     // Parse the returned bulk array:
-    //   [0] = "OK"
+    //   [0] = "OK"  (or "INSUFFICIENT_BALANCE" for balance lock failure)
     //   [1] = remaining_i
     //   [2] = status
     //   [3] = trade_count
@@ -1003,6 +1036,13 @@ pub async fn match_order_lua(
         redis::Value::Array(v) => v,
         other => anyhow::bail!("unexpected Lua return type: {:?}", other),
     };
+
+    // Check for INSUFFICIENT_BALANCE first (single-element array returned by Lua)
+    if let Some(first) = items.first() {
+        if redis_value_to_string(first).as_deref() == Some("INSUFFICIENT_BALANCE") {
+            anyhow::bail!("INSUFFICIENT_BALANCE: insufficient {} for user {}", lock_asset, order.user_id);
+        }
+    }
 
     if items.len() < 4 {
         anyhow::bail!("Lua script returned too few fields: {}", items.len());

@@ -11,6 +11,10 @@ use uuid::Uuid;
 use sqlx::Row;
 use tokio::sync::mpsc;
 
+/// Global per-order counter for sampled info logging (Opt 5).
+/// Incremented atomically on every processed order; info log emitted every 100th.
+static ORDER_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 use sme_shared::{
     cache, metrics, Order, OrderStatus, OrderType, Side,
     SelfTradePreventionMode, TimeInForce, Trade,
@@ -205,6 +209,9 @@ pub async fn order_queue_consumer(state: AppState) {
 /// BRPOP loop for a single pair's order queue: `queue:orders:{pair_id}`.
 /// After each BRPOP wake, drains up to 9 more orders with non-blocking RPOP,
 /// then spawns each order's processing concurrently (up to 10 in-flight per pair).
+///
+/// Opt 2: uses a persistent dedicated connection for BRPOP — avoids a pool
+/// checkout (and its mutex contention) on every iteration.
 async fn pair_order_consumer(state: AppState, pair_id: String) {
     let queue_key = format!("queue:orders:{}", pair_id);
     tracing::info!(pair_id = %pair_id, queue = %queue_key, "pair order consumer started");
@@ -214,50 +221,61 @@ async fn pair_order_consumer(state: AppState, pair_id: String) {
     // Dragonfly Lua executor serialization under burst.
     let sem = Arc::new(tokio::sync::Semaphore::new(3));
 
-    loop {
-        let mut conn = match state.dragonfly.get().await {
+    // Opt 2: create Redis client once for dedicated BRPOP connection (no pool checkout per iteration)
+    let client = match deadpool_redis::redis::Client::open(state.dragonfly_url.as_str()) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, pair_id = %pair_id, "failed to create redis client for BRPOP");
+            return;
+        }
+    };
+
+    'reconnect: loop {
+        // Establish a dedicated connection — reconnect on any error
+        let mut conn = match client.get_async_connection().await {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!(error = %e, pair_id = %pair_id, "failed to get dragonfly connection");
+                tracing::error!(error = %e, pair_id = %pair_id, "failed to connect for BRPOP, retrying in 1s");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
+                continue 'reconnect;
             }
         };
 
-        let result: Option<(String, String)> = match conn.brpop(&queue_key, 1.0).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!(error = %e, "BRPOP timeout or error");
-                None
-            }
-        };
-
-        let first_order = match result {
-            Some((_key, s)) => s,
-            None => continue,
-        };
-
-        // Drain up to 9 more orders non-blocking (batch of 10 max)
-        let mut batch = vec![first_order];
-        for _ in 0..9 {
-            let extra: Option<String> = conn.rpop(&queue_key, None).await.unwrap_or(None);
-            match extra {
-                Some(s) => batch.push(s),
-                None => break,
-            }
-        }
-        drop(conn); // release connection before spawning
-
-        // Spawn each order concurrently, limited by semaphore
-        for order_str in batch {
-            let permit = sem.clone().acquire_owned().await.unwrap();
-            let state_clone = state.clone();
-            tokio::spawn(async move {
-                if let Err(e) = process_queued_order(&state_clone, &order_str).await {
-                    tracing::error!(error = %e, order_str = %order_str, "failed to process order");
+        loop {
+            let result: Option<(String, String)> = match conn.brpop(&queue_key, 1.0).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(error = %e, pair_id = %pair_id, "BRPOP error, reconnecting");
+                    continue 'reconnect;
                 }
-                drop(permit);
-            });
+            };
+
+            let first_order = match result {
+                Some((_key, s)) => s,
+                None => continue,
+            };
+
+            // Drain up to 9 more orders non-blocking (batch of 10 max)
+            let mut batch = vec![first_order];
+            for _ in 0..9 {
+                let extra: Option<String> = conn.rpop(&queue_key, None).await.unwrap_or(None);
+                match extra {
+                    Some(s) => batch.push(s),
+                    None => break,
+                }
+            }
+
+            // Spawn each order concurrently, limited by semaphore
+            for order_str in batch {
+                let permit = sem.clone().acquire_owned().await.unwrap();
+                let state_clone = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = process_queued_order(&state_clone, &order_str).await {
+                        tracing::error!(error = %e, order_str = %order_str, "failed to process order");
+                    }
+                    drop(permit);
+                });
+            }
         }
     }
 }
@@ -498,27 +516,24 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
         .map_err(|e| anyhow::anyhow!("validation failed: {}", e))?;
     let validate_us = validate_start.elapsed().as_micros() as u64;
 
-    // 2. Lock balance in Dragonfly (Lua atomic check-and-decrement).
-    //    Replaces PG hot-path round-trip (was 4.5ms avg → now <0.5ms).
-    //    PG balances reconciled by persist worker asynchronously.
+    // 2+4. Lock balance AND match in a single Lua EVAL (Opt 1 — merged round-trips).
+    //   Previously: 2 separate EVALs (lock_balance_dragonfly + match_order_lua).
+    //   Now: 1 EVAL that does the atomic balance check+lock THEN matches.
+    //   PG balances reconciled by persist worker asynchronously.
     let pre_lock_start = std::time::Instant::now();
-    {
+    let (lock_asset, lock_amount_scaled) = {
         let (base, quote) = sme_shared::parse_pair_id(&pair_id)?;
-        let (asset, amount) = match order.side {
+        match order.side {
             Side::Buy => {
                 let price = order.price.unwrap_or(Decimal::ZERO);
-                (quote, price * order.quantity)
+                (quote, cache::decimal_to_i64(price * order.quantity))
             }
-            Side::Sell => (base, order.quantity),
-        };
-        let amount_scaled = cache::decimal_to_i64(amount);
-        cache::lock_balance_dragonfly(&state.dragonfly, &order.user_id, &asset, amount_scaled)
-            .await
-            .map_err(|e| anyhow::anyhow!("lock balance failed: {}", e))?;
-    }
+            Side::Sell => (base, cache::decimal_to_i64(order.quantity)),
+        }
+    };
     let db_pre_us = pre_lock_start.elapsed().as_micros() as u64;
 
-    // 4. Match the order using Lua atomic EVAL
+    // Match the order using Lua atomic EVAL (balance lock merged inside)
     let match_start = std::time::Instant::now();
 
     // For FOK orders, use the OCC retry loop like the original implementation
@@ -529,8 +544,18 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
         return Ok(());
     }
 
-    // Non-FOK: single atomic Lua EVAL — no lock, no retry
-    let lua_result = cache::match_order_lua(&state.dragonfly, &order).await?;
+    // Look up pre-computed pair key strings (Opt 3)
+    let pair_keys = state.pair_keys.get(&pair_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown pair_id: {}", pair_id))?;
+
+    // Non-FOK: single atomic Lua EVAL — balance lock + matching, no extra round-trip
+    let lua_result = cache::match_order_lua(
+        &state.dragonfly,
+        &order,
+        pair_keys,
+        &lock_asset,
+        lock_amount_scaled,
+    ).await?;
     let lua_us = match_start.elapsed().as_micros() as u64;
 
     // Apply Lua result to the incoming order struct
@@ -563,9 +588,6 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
         }
     }).collect();
 
-    // Build trade JSON synchronously from Trade structs — no DB round-trip needed
-    let trade_jsons: Vec<Value> = trades.iter().map(trade_to_json).collect();
-
     // Notify dirty-user channel: order owner + counterparties need portfolio refresh
     let _ = state.dirty_users_tx.try_send(user_id.clone());
     for lt in &lua_result.trades {
@@ -577,9 +599,23 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
         }
     }
 
+    // Opt 4: skip WS event serialization when no subscribers — build trade_jsons only if needed.
+    // trade_to_json + serde_json::to_string are skipped entirely when receiver_count == 0.
+    // Must be built here, before `trades` is moved into PersistJob.
+    let had_trades = trade_count > 0;
+    let trade_jsons: Option<Vec<Value>> = if had_trades && state.order_events_tx.receiver_count() > 0 {
+        Some(trades.iter().map(trade_to_json).collect())
+    } else {
+        None
+    };
+
+    // Opt 6: wrap order in Arc before PersistJob — avoids Order::clone() (deep copy of Strings).
+    // Arc clone is cheap (single atomic increment) vs. cloning all String fields.
+    let order = Arc::new(order);
+
     // Send persist job to background worker (non-blocking)
     let job = PersistJob {
-        order: order.clone(),
+        order: order.clone(), // Arc clone — O(1)
         trades,
         lua_trades: lua_result.trades,
     };
@@ -598,22 +634,21 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
         }
     }
 
-    // 5. Emit WS event synchronously (just a channel send — negligible latency)
-    if !trade_jsons.is_empty() {
+    // WS event — only if we have subscribers (serialization already gated above)
+    if let Some(ref trade_jsons) = trade_jsons {
         let event_msg = serde_json::to_string(&json!({
             "type": "order_created",
             "user_id": order.user_id,
-            "order": order_to_json(&order),
-            "trades": &trade_jsons,
+            "order": order_to_json(&*order),
+            "trades": trade_jsons,
         })).unwrap_or_default();
         let _ = state.order_events_tx.send(event_msg);
     }
 
-    // 5b. Signal orderbook rebuild via debouncer — coalesces rapid updates.
+    // Signal orderbook rebuild via debouncer — coalesces rapid updates.
     // Only signals if the book actually changed (trade occurred or order rested).
     let order_rested = order.status == OrderStatus::New
         || order.status == OrderStatus::PartiallyFilled;
-    let had_trades = !trade_jsons.is_empty();
     if had_trades || order_rested {
         state.orderbook_debouncer.mark_dirty(&pair_id);
     }
@@ -621,7 +656,9 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
 
     let total_us = total_start.elapsed().as_micros() as u64;
 
-    tracing::info!(
+    // Opt 5: per-order debug log + sampled info log every 100th order.
+    // Reduces tracing overhead on high-throughput hot path.
+    tracing::debug!(
         queue_latency_us = queue_latency_us,
         parse_us = parse_us,
         validate_us = validate_us,
@@ -634,6 +671,17 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
         order_id = %order.id,
         "order processed [segments]"
     );
+    let n = ORDER_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if n % 100 == 0 {
+        tracing::info!(
+            total_us = total_us,
+            lua_us = lua_us,
+            trade_count = trade_count,
+            pair_id = %order.pair_id,
+            order_n = n,
+            "order processed [sampled 1/100]"
+        );
+    }
 
     Ok(())
 }
