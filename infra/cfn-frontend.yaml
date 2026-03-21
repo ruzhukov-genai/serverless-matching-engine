@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Serverless Matching Engine — Frontend Stack
+  Serverless Matching Engine - Frontend Stack
   S3 (private) + CloudFront (OAC) with /api/* forwarded to API Gateway.
   PriceClass_100 (US + EU) for cheapest CDN.
 
@@ -46,13 +46,13 @@ Conditions:
 Resources:
 
   # =========================================================================
-  # S3 Bucket — Static Frontend Files
+  # S3 Bucket - Static Frontend Files
   # =========================================================================
   FrontendBucket:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub '${ProjectName}-frontend-${AWS::AccountId}'
-      # Fully private — CloudFront OAC handles access
+      # Fully private - CloudFront OAC handles access
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -71,7 +71,7 @@ Resources:
           Value: !Ref ProjectName
 
   # =========================================================================
-  # CloudFront Origin Access Control (OAC) — modern replacement for OAI
+  # CloudFront Origin Access Control (OAC) - modern replacement for OAI
   # =========================================================================
   CloudFrontOAC:
     Type: AWS::CloudFront::OriginAccessControl
@@ -84,7 +84,7 @@ Resources:
         SigningProtocol: sigv4
 
   # =========================================================================
-  # S3 Bucket Policy — allow CloudFront OAC only
+  # S3 Bucket Policy - allow CloudFront OAC only
   # =========================================================================
   FrontendBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -136,7 +136,7 @@ Resources:
           - Id: S3Origin
             DomainName: !GetAtt FrontendBucket.RegionalDomainName
             S3OriginConfig:
-              OriginAccessIdentity: ''   # Empty — we use OAC not OAI
+              OriginAccessIdentity: ''   # Empty - we use OAC not OAI
             OriginAccessControlId: !Ref CloudFrontOAC
 
           # Origin 2: API Gateway (API requests)
@@ -151,7 +151,7 @@ Resources:
                 - TLSv1.2
 
         # ---- Cache Behaviors ---------------------------------------------
-        # /api/* → API Gateway, no caching
+        # /api/* -> API Gateway, no caching
         CacheBehaviors:
           - PathPattern: '/api/*'
             TargetOriginId: ApiGatewayOrigin
@@ -164,7 +164,7 @@ Resources:
             OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
             Compress: true
 
-          # /ws/* → API Gateway, no caching (WebSocket future path)
+          # /ws/* -> API Gateway, no caching (WebSocket future path)
           - PathPattern: '/ws/*'
             TargetOriginId: ApiGatewayOrigin
             ViewerProtocolPolicy: redirect-to-https

@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Serverless Matching Engine — Backend Stack
+  Serverless Matching Engine - Backend Stack
   EC2 t4g.micro (Dragonfly + PostgreSQL + sme-api) + Lambda (sme-gateway) + API Gateway HTTP API
   Cheapest possible: EC2 in public subnet, Lambda in private subnets, NO NAT Gateway.
 
@@ -50,7 +50,7 @@ Parameters:
     Description: CORS allowed origin for API Gateway. Use your CloudFront URL in production.
 
 # ---------------------------------------------------------------------------
-# Mappings — Amazon Linux 2023 ARM64 AMIs per region
+# Mappings - Amazon Linux 2023 ARM64 AMIs per region
 # ---------------------------------------------------------------------------
 Mappings:
   AmazonLinux2023ArmAmi:
@@ -133,7 +133,7 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
 
-  # ---- Private Subnets (Lambda lives here — no internet egress needed) ----
+  # ---- Private Subnets (Lambda lives here - no internet egress needed) ----
   PrivateSubnetA:
     Type: AWS::EC2::Subnet
     Properties:
@@ -191,7 +191,7 @@ Resources:
       SubnetId: !Ref PublicSubnetB
       RouteTableId: !Ref PublicRouteTable
 
-  # Private subnets use the default (local-only) route table — no internet egress.
+  # Private subnets use the default (local-only) route table - no internet egress.
   # Lambda only needs to reach EC2 inside the VPC.
   PrivateRouteTable:
     Type: AWS::EC2::RouteTable
@@ -223,7 +223,7 @@ Resources:
   LambdaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Lambda sme-gateway — allows outbound to EC2 only
+      GroupDescription: Lambda sme-gateway - allows outbound to EC2 only
       VpcId: !Ref VPC
       # No ingress rules needed (Lambda is invoked by API Gateway, not via network)
       SecurityGroupEgress:
@@ -247,7 +247,7 @@ Resources:
   EC2SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: EC2 sme backend — Dragonfly + PostgreSQL + SSH
+      GroupDescription: EC2 sme backend - Dragonfly PostgreSQL SSH
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -265,7 +265,7 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
 
-  # Allow Lambda → Dragonfly (6379)
+  # Allow Lambda -> Dragonfly (6379)
   EC2IngressDragonfly:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
@@ -276,7 +276,7 @@ Resources:
       SourceSecurityGroupId: !Ref LambdaSecurityGroup
       Description: Dragonfly from Lambda
 
-  # Allow Lambda → PostgreSQL (5432) — not strictly needed for gateway but useful
+  # Allow Lambda -> PostgreSQL (5432) - not strictly needed for gateway but useful
   EC2IngressPostgres:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
@@ -317,7 +317,7 @@ Resources:
           Value: !Ref ProjectName
 
   # =========================================================================
-  # IAM — EC2 Instance Profile
+  # IAM - EC2 Instance Profile
   # =========================================================================
   EC2Role:
     Type: AWS::IAM::Role
@@ -374,7 +374,7 @@ Resources:
         - !Ref EC2Role
 
   # =========================================================================
-  # IAM — Lambda Execution Role
+  # IAM - Lambda Execution Role
   # =========================================================================
   LambdaRole:
     Type: AWS::IAM::Role
@@ -441,7 +441,7 @@ Resources:
           # aws s3 cp s3://your-bucket/ec2-userdata.sh /tmp/ec2-userdata.sh
           # bash /tmp/ec2-userdata.sh
 
-          # Inline bootstrap (abbreviated — see infra/ec2-userdata.sh for full version)
+          # Inline bootstrap (abbreviated - see infra/ec2-userdata.sh for full version)
           dnf update -y
           dnf install -y postgresql16 postgresql16-server wget curl tar unzip
 
@@ -557,7 +557,7 @@ Resources:
             aws s3 cp "${SmeApiBinaryS3Uri}" /usr/local/bin/sme-api
             chmod +x /usr/local/bin/sme-api
           else
-            echo "WARNING: SmeApiBinaryS3Uri not set — sme-api will not start automatically."
+            echo "WARNING: SmeApiBinaryS3Uri not set - sme-api will not start automatically."
             echo "SSH in and deploy manually: scp sme-api ec2-user@<ip>:/usr/local/bin/"
             # Create placeholder so service file doesn't fail
             echo '#!/bin/bash' > /usr/local/bin/sme-api
@@ -615,7 +615,7 @@ Resources:
       RetentionInDays: 14
 
   # =========================================================================
-  # Lambda Function — sme-gateway via AWS Lambda Web Adapter
+  # Lambda Function - sme-gateway via AWS Lambda Web Adapter
   # =========================================================================
   GatewayLambda:
     Type: AWS::Lambda::Function
@@ -661,7 +661,7 @@ Resources:
       SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
 
   # =========================================================================
-  # API Gateway HTTP API (v2 — cheapest: $1/million requests)
+  # API Gateway HTTP API (v2 - cheapest: $1/million requests)
   # =========================================================================
   HttpApi:
     Type: AWS::ApiGatewayV2::Api
