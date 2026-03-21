@@ -13,11 +13,16 @@ import statistics
 from dataclasses import dataclass, field
 from typing import Dict, List
 
+import argparse
+
 BASE_URL = "http://localhost:3001"
 WS_BASE = "ws://127.0.0.1:3001"
 PAIR = "BTC-USDT"
 TEST_DURATION = 20  # seconds per phase
 CLIENT_COUNTS = [1, 5, 10, 25, 50, 100]
+
+# Connection mode: "rest" = legacy (8 REST polls + 3 WS), "ws" = mux WS + snapshot
+CONN_MODE = "rest"
 
 @dataclass
 class LatencyBucket:
@@ -175,6 +180,55 @@ async def ws_client(session, stats, path, deadline):
             await asyncio.wait_for(ws.close(), timeout=1)
     except: stats.ws_connect.record_error()
 
+async def mux_ws_client(session, stats, pair_id, user_id, deadline):
+    """Single multiplexed WS connection — replaces 3 separate WS + 8 REST polls."""
+    import websockets
+    t0 = time.monotonic()
+    try:
+        ws = await asyncio.wait_for(
+            websockets.connect(f"{WS_BASE}/ws/stream"),
+            timeout=5
+        )
+        ms = (time.monotonic() - t0) * 1000
+        stats.ws_connect.record(ms)
+        try:
+            # Subscribe to all channels
+            await ws.send(json.dumps({"subscribe": [
+                f"orderbook:{pair_id}",
+                f"trades:{pair_id}",
+                f"ticker:{pair_id}",
+                f"orders:{user_id}",
+                f"portfolio:{user_id}",
+            ]}))
+            while time.monotonic() < deadline:
+                try:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                    if isinstance(msg, str):
+                        stats.ws_messages += 1
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    break
+        finally:
+            await asyncio.wait_for(ws.close(), timeout=1)
+    except:
+        stats.ws_connect.record_error()
+
+async def fetch_snapshot(session, stats, pair_id):
+    """Fetch initial state via single snapshot endpoint (replaces 8 REST calls)."""
+    ep = f"/api/snapshot/{pair_id}"
+    t0 = time.monotonic()
+    try:
+        async with session.get(f"{BASE_URL}{ep}") as resp:
+            await resp.read()
+            ms = (time.monotonic() - t0) * 1000
+            if resp.status == 200:
+                stats.rest(ep).record(ms)
+            else:
+                stats.rest(ep).record_error()
+    except:
+        stats.rest(ep).record_error()
+
 async def place_orders(session, stats, client_id, deadline):
     seq = 0
     while time.monotonic() < deadline:
@@ -203,23 +257,35 @@ async def run_client(client_id, deadline):
     async with aiohttp.ClientSession(connector=connector) as session:
         await fetch_static(session, stats)
         user_id = f"user-{(client_id % 10) + 1}"
-        tasks = [
-            asyncio.create_task(poll_rest(session, stats, deadline)),
-            asyncio.create_task(ws_client(session, stats, f"/ws/orderbook/{PAIR}", deadline)),
-            asyncio.create_task(ws_client(session, stats, f"/ws/trades/{PAIR}", deadline)),
-            asyncio.create_task(ws_client(session, stats, f"/ws/orders/{user_id}", deadline)),
-            asyncio.create_task(place_orders(session, stats, client_id, deadline)),
-        ]
+
+        if CONN_MODE == "ws":
+            # WS-only mode: 1 snapshot + 1 mux WS + orders
+            await fetch_snapshot(session, stats, PAIR)
+            tasks = [
+                asyncio.create_task(mux_ws_client(session, stats, PAIR, user_id, deadline)),
+                asyncio.create_task(place_orders(session, stats, client_id, deadline)),
+            ]
+        else:
+            # Legacy mode: 8 REST polls + 3 separate WS + orders
+            tasks = [
+                asyncio.create_task(poll_rest(session, stats, deadline)),
+                asyncio.create_task(ws_client(session, stats, f"/ws/orderbook/{PAIR}", deadline)),
+                asyncio.create_task(ws_client(session, stats, f"/ws/trades/{PAIR}", deadline)),
+                asyncio.create_task(ws_client(session, stats, f"/ws/orders/{user_id}", deadline)),
+                asyncio.create_task(place_orders(session, stats, client_id, deadline)),
+            ]
         await asyncio.gather(*tasks, return_exceptions=True)
     return stats
 
 # ── Main runner ───────────────────────────────────────────────────────────────
 
 async def run_benchmark():
+    mode_label = "WS-only (snapshot + mux WS)" if CONN_MODE == "ws" else "REST+WS (8 polls + 3 WS)"
     print("╔════════════════════════════════════════════════════════════════════╗")
     print("║          SME Comprehensive Benchmark — Server + Client           ║")
     print("╠════════════════════════════════════════════════════════════════════╣")
     print(f"║  Server:   {BASE_URL:<55}║")
+    print(f"║  Mode:     {mode_label:<55}║")
     print(f"║  Duration: {TEST_DURATION}s per level, clients: {CLIENT_COUNTS!s:<27}║")
     print("╚════════════════════════════════════════════════════════════════════╝")
 
@@ -368,4 +434,17 @@ async def run_benchmark():
     print(f"\n✅ Benchmark complete.")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="SME Benchmark")
+    parser.add_argument("--ws", action="store_true", help="WS-only mode: snapshot + mux WS (fewer TCP connections)")
+    parser.add_argument("--duration", type=int, default=TEST_DURATION, help="Seconds per client level")
+    parser.add_argument("--clients", type=str, default=None, help="Comma-separated client counts (e.g. '1,10,50,100')")
+    args = parser.parse_args()
+
+    if args.ws:
+        CONN_MODE = "ws"
+    if args.duration:
+        TEST_DURATION = args.duration
+    if args.clients:
+        CLIENT_COUNTS = [int(x.strip()) for x in args.clients.split(",")]
+
     asyncio.run(run_benchmark())
