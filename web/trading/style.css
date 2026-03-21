@@ -56,6 +56,20 @@ header {
     white-space: nowrap;
 }
 
+/* ── P2 — Connection Status ────────────────────────────────────────────── */
+.conn-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--red);
+    margin-left: 8px;
+    transition: background 0.3s;
+}
+.conn-dot.connected { background: var(--green); }
+.conn-dot.fallback { background: var(--yellow); }
+.conn-dot.disconnected { background: var(--red); }
+
 .pairs-bar {
     display: flex;
     gap: 4px;
@@ -110,6 +124,12 @@ section {
     overflow: hidden;
     display: flex;
     flex-direction: column;
+}
+
+/* ── P2 — Loading States ──────────────────────────────────────────────── */
+section.loading { 
+    opacity: 0.5; 
+    pointer-events: none; 
 }
 
 .section-title {

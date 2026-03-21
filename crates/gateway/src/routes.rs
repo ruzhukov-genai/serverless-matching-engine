@@ -169,12 +169,43 @@ pub async fn list_pairs(State(s): State<AppState>) -> HandlerResult<Response> {
 
 // ── GET /api/orderbook/{pair_id} ──────────────────────────────────────────────
 
+#[derive(Deserialize)]
+pub struct OrderbookQuery {
+    pub depth: Option<i32>,
+}
+
+/// Truncate an orderbook JSON to at most `depth` bids + asks.
+/// Returns the original string if depth is None, out of range, or parsing fails.
+fn truncate_orderbook_depth(ob_json: Option<&str>, depth: Option<i32>) -> String {
+    let raw = ob_json.unwrap_or(r#"{"bids":[],"asks":[]}"#);
+    let depth = match depth {
+        Some(d) if d > 0 && d < 500 => d as usize,
+        _ => return raw.to_string(),
+    };
+    let Ok(mut data) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return raw.to_string();
+    };
+    if let Some(obj) = data.as_object_mut() {
+        if let Some(bids) = obj.get_mut("bids").and_then(|v| v.as_array_mut()) {
+            bids.truncate(depth);
+        }
+        if let Some(asks) = obj.get_mut("asks").and_then(|v| v.as_array_mut()) {
+            asks.truncate(depth);
+        }
+    }
+    serde_json::to_string(&data).unwrap_or_else(|_| raw.to_string())
+}
+
 pub async fn get_orderbook(
     Path(pair_id): Path<String>,
+    Query(q): Query<OrderbookQuery>,
     State(s): State<AppState>,
 ) -> HandlerResult<Response> {
     let cache_key = format!("cache:orderbook:{}", pair_id);
     if let Some(cached) = s.cache.get_latest(&cache_key) {
+        if q.depth.is_some() {
+            return Ok(raw_json(truncate_orderbook_depth(Some(&cached), q.depth)));
+        }
         return Ok(raw_json_arc(&cached));
     }
     Ok(raw_json(format!(r#"{{"pair":"{}","bids":[],"asks":[]}}"#, pair_id)))
@@ -464,6 +495,7 @@ pub async fn get_audit(State(s): State<AppState>) -> HandlerResult<Response> {
 
 pub async fn get_snapshot(
     Path(pair_id): Path<String>,
+    Query(q): Query<OrderbookQuery>,
     State(s): State<AppState>,
 ) -> HandlerResult<Response> {
     // Read all cache keys — zero Dragonfly, all from watch channels
@@ -475,10 +507,13 @@ pub async fn get_snapshot(
     let latency = s.cache.get_latest("cache:latency_metrics");
     let pairs = s.cache.get_latest("cache:pairs");
 
-    // Build composite JSON without parsing — raw concatenation
+    // P1 — Apply depth limiting to orderbook if requested
+    let orderbook_json = truncate_orderbook_depth(ob.as_deref(), q.depth);
+
+    // Build composite JSON — raw concatenation (except depth-limited orderbook)
     let mut buf = String::with_capacity(4096);
     buf.push_str(r#"{"orderbook":"#);
-    buf.push_str(ob.as_deref().unwrap_or(r#"{"bids":[],"asks":[]}"#));
+    buf.push_str(&orderbook_json);
     buf.push_str(r#","trades":"#);
     buf.push_str(trades.as_deref().unwrap_or(r#"{"trades":[]}"#));
     buf.push_str(r#","ticker":"#);

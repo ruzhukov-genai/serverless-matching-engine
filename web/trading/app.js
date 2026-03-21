@@ -13,6 +13,29 @@ let feedbackTimer = null;
 // Set true to use single multiplexed WS (fewer TCP connections, lower latency)
 const USE_MUX_WS = true;
 
+// ── P0 — requestAnimationFrame batching ─────────────────────────────────────
+let obRafId = 0;   // separate rAF IDs so orderbook + trades don't clobber each other
+let trRafId = 0;
+let tradesChanged = false;
+
+// DOM element caches for diff-based updates
+let asksDomMap = new Map(); // price -> DOM element
+let bidsDomMap = new Map(); // price -> DOM element
+
+// ── P3 — Cached Intl.NumberFormat instead of toLocaleString ────────────────
+const fmtPrice2 = new Intl.NumberFormat('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+const fmtPrice4 = new Intl.NumberFormat('en-US', {minimumFractionDigits:4, maximumFractionDigits:4});
+const fmtPrice6 = new Intl.NumberFormat('en-US', {minimumFractionDigits:6, maximumFractionDigits:6});
+const fmtQty2 = new Intl.NumberFormat('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+const fmtQty4 = new Intl.NumberFormat('en-US', {minimumFractionDigits:4, maximumFractionDigits:4});
+const fmtQty5 = new Intl.NumberFormat('en-US', {minimumFractionDigits:5, maximumFractionDigits:5});
+
+// ── P2 — Connection status and exponential backoff ─────────────────────────
+let connStatus = 'disconnected'; // 'connected', 'fallback', 'disconnected'
+let reconnectDelay = 1000; // Start at 1s
+const MAX_RECONNECT_DELAY = 30000; // Max 30s
+let reconnectTimeout = null;
+
 // Pagination state
 let ordersPage = 0;
 const ORDERS_PER_PAGE = 20;
@@ -23,6 +46,7 @@ let ordersTotal = 0;
 async function init() {
     setupTabs();
     setupOrderForm();
+    updateConnectionStatus('disconnected');
     await loadPairs();
     startAutoRefresh();
 }
@@ -66,8 +90,14 @@ function selectPair(pair) {
         b.classList.toggle('active', b.dataset.pair === pair.id)
     );
 
-    orderbook = { bids: [], asks: [] };
-    tradesList = [];
+    // ── P2 — Show loading states instead of clearing data ──────────────────
+    document.getElementById('orderbook').classList.add('loading');
+    document.getElementById('trades').classList.add('loading');
+    
+    // Clear DOM maps for new pair
+    asksDomMap.clear();
+    bidsDomMap.clear();
+    lastTradesListLength = 0;
     ordersPage = 0;
 
     clearFallbackPoll('orderbook');
@@ -83,17 +113,30 @@ function selectPair(pair) {
 
 async function loadOrderbook(pairId) {
     try {
-        const res = await fetch(`${API}/api/orderbook/${pairId}`);
+        // P1 — Request with default depth limit of 25
+        const res = await fetch(`${API}/api/orderbook/${pairId}?depth=25`);
         const data = await res.json();
         orderbook.bids = data.bids || [];
         orderbook.asks = data.asks || [];
         renderOrderbook();
     } catch (e) {
         console.error('Failed to load orderbook:', e);
+        document.getElementById('orderbook').classList.remove('loading');
     }
 }
 
 function renderOrderbook() {
+    // ── P0 — Coalesce into one rAF per frame; cancel stale frame if data arrives again
+    if (obRafId) cancelAnimationFrame(obRafId);
+    obRafId = requestAnimationFrame(doRenderOrderbook);
+}
+
+function doRenderOrderbook() {
+    obRafId = 0;
+    
+    // Remove loading state
+    document.getElementById('orderbook').classList.remove('loading');
+    
     const asksEl = document.getElementById('asks');
     const bidsEl = document.getElementById('bids');
     const spreadEl = document.getElementById('spread-value');
@@ -123,15 +166,11 @@ function renderOrderbook() {
     // Asks: reverse so highest price is at top, lowest (best) near spread
     const asksReversed = [...asksCum].reverse();
 
-    asksEl.innerHTML = asksReversed.map(l =>
-        renderLevel(l, 'ask', maxCum)
-    ).join('');
+    // ── P0 — Diff-based updates for asks ──────────────────────────────────
+    updateOrderbookSide(asksEl, asksReversed, 'ask', maxCum, asksDomMap);
+    updateOrderbookSide(bidsEl, bidsCum, 'bid', maxCum, bidsDomMap);
 
-    bidsEl.innerHTML = bidsCum.map(l =>
-        renderLevel(l, 'bid', maxCum)
-    ).join('');
-
-    // Spread
+    // Spread calculation
     if (sortedAsks.length > 0 && sortedBids.length > 0) {
         const bestAsk = parseFloat(sortedAsks[0].price);
         const bestBid = parseFloat(sortedBids[0].price);
@@ -151,6 +190,86 @@ function renderOrderbook() {
     asksEl.scrollTop = asksEl.scrollHeight;
 }
 
+function updateOrderbookSide(container, levels, side, maxCum, domMap) {
+    // Create a set of current prices for quick lookup
+    const currentPrices = new Set(levels.map(l => parseFloat(l.price)));
+    
+    // Remove elements for prices no longer in the book
+    for (const [price, element] of domMap) {
+        if (!currentPrices.has(price)) {
+            element.remove();
+            domMap.delete(price);
+        }
+    }
+    
+    // Update or create elements for each level
+    const fragment = document.createDocumentFragment();
+    let needsReorder = false;
+    
+    levels.forEach((level, index) => {
+        const price = parseFloat(level.price);
+        let element = domMap.get(price);
+        
+        if (!element) {
+            // Create new element
+            element = document.createElement('div');
+            element.className = `level ${side}`;
+            element.onclick = () => fillPrice(price);
+            domMap.set(price, element);
+            needsReorder = true;
+        }
+        
+        // Update element content
+        updateLevelElement(element, level, side, maxCum);
+        
+        // Add to fragment if it's a new element
+        if (!element.parentNode) {
+            fragment.appendChild(element);
+        }
+    });
+    
+    // Add any new elements
+    if (fragment.children.length > 0) {
+        container.appendChild(fragment);
+        needsReorder = true;
+    }
+    
+    // Reorder if needed (only when elements were added/removed)
+    if (needsReorder) {
+        const sortedElements = levels.map(l => domMap.get(parseFloat(l.price)));
+        sortedElements.forEach(element => {
+            if (element) container.appendChild(element);
+        });
+    }
+}
+
+function updateLevelElement(element, level, side, maxCum) {
+    const price = parseFloat(level.price);
+    const qty = parseFloat(level.quantity);
+    const cum = level.cum || 0;
+    const depthPct = Math.min(100, (cum / maxCum) * 100).toFixed(1);
+    const color = side === 'ask' ? 'rgba(248,81,73,0.25)' : 'rgba(63,185,80,0.25)';
+
+    element.style.background = `linear-gradient(to left, ${color} ${depthPct}%, transparent ${depthPct}%)`;
+
+    // Update text content of existing spans (avoids innerHTML reparse)
+    const spans = element.children;
+    if (spans.length === 3) {
+        const newPrice = fmtPrice(price);
+        const newQty   = fmtQty(qty);
+        const newCum   = fmtQty(cum);
+        if (spans[0].textContent !== newPrice) spans[0].textContent = newPrice;
+        if (spans[1].textContent !== newQty)   spans[1].textContent = newQty;
+        if (spans[2].textContent !== newCum)   spans[2].textContent = newCum;
+    } else {
+        // First render — create spans
+        element.innerHTML =
+            `<span class="level-price">${fmtPrice(price)}</span>` +
+            `<span class="level-qty">${fmtQty(qty)}</span>` +
+            `<span class="level-cum">${fmtQty(cum)}</span>`;
+    }
+}
+
 function computeCumulative(levels) {
     let cum = 0;
     return levels.map(l => {
@@ -160,6 +279,7 @@ function computeCumulative(levels) {
     });
 }
 
+// Legacy renderLevel function - kept for compatibility but not used in diff updates
 function renderLevel(level, side, maxCum) {
     const price = parseFloat(level.price);
     const qty   = parseFloat(level.quantity);
@@ -191,10 +311,25 @@ async function loadTrades(pairId) {
         renderTrades();
     } catch (e) {
         console.error('Failed to load trades:', e);
+        document.getElementById('trades').classList.remove('loading');
     }
 }
 
 function renderTrades() {
+    // ── P0 — Batch trades renders; skip if nothing changed ────────────────
+    tradesChanged = true;
+    if (trRafId) cancelAnimationFrame(trRafId);
+    trRafId = requestAnimationFrame(doRenderTrades);
+}
+
+function doRenderTrades() {
+    trRafId = 0;
+    if (!tradesChanged) return;
+    tradesChanged = false;
+    
+    // Remove loading state
+    document.getElementById('trades').classList.remove('loading');
+    
     const el = document.getElementById('trades-list');
     if (tradesList.length === 0) {
         el.innerHTML = '<div class="empty-state">No recent trades</div>';
@@ -239,12 +374,23 @@ function connectMuxWS(wsBase, pairId) {
         ws.stream.onclose = null;
         try { ws.stream.close(); } catch(_) {}
     }
+    
+    // Clear any pending reconnect
+    if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+        reconnectTimeout = null;
+    }
 
     const userId = 'user-1'; // TODO: make configurable
     try {
         const sock = new WebSocket(`${wsBase}/ws/stream`);
         ws.stream = sock;
         sock.onopen = () => {
+            // ── P2 — Update connection status ─────────────────────────────────
+            updateConnectionStatus('connected');
+            // Reset backoff on successful connection
+            reconnectDelay = 1000;
+            
             // Subscribe to all channels for this pair + user
             sock.send(JSON.stringify({ subscribe: [
                 `orderbook:${pairId}`,
@@ -279,13 +425,10 @@ function connectMuxWS(wsBase, pairId) {
                         prependTrade(data);
                     }
                 } else if (ch.startsWith('ticker:')) {
-                    // Update ticker display if we have one
                     updateTicker(data);
                 } else if (ch.startsWith('orders:')) {
-                    // Order event — refresh order list
-                    if (data.type === 'order_created' || data.type === 'order_cancelled' || data.type === 'orders_cancelled_all') {
-                        loadOpenOrders();
-                    }
+                    // ── P1 — Update orders from WS events directly ─────────────
+                    handleOrdersMessage(data);
                 } else if (ch.startsWith('portfolio:')) {
                     // Portfolio pushed from server
                     if (data.balances) {
@@ -294,21 +437,28 @@ function connectMuxWS(wsBase, pairId) {
                 }
             } catch(err) { console.warn('Mux WS parse error:', err); }
         };
-        sock.onerror = () => {};
+        sock.onerror = () => {
+            updateConnectionStatus('disconnected');
+        };
         sock.onclose = () => {
+            updateConnectionStatus('fallback');
             // Fall back to REST polling if WS drops
             if (currentPair === pairId) {
                 startFallbackPoll('orderbook', () => loadOrderbook(pairId), 2500);
                 startFallbackPoll('trades', () => loadTrades(pairId), 2500);
                 startFallbackPoll('orders', () => loadOpenOrders(), 5000);
                 startFallbackPoll('portfolio', () => loadPortfolio(), 5000);
-                // Reconnect after delay
-                setTimeout(() => {
+                
+                // ── P2 — Exponential backoff reconnect ─────────────────────
+                const delay = reconnectDelay * (0.5 + Math.random() * 0.5); // Add jitter
+                reconnectTimeout = setTimeout(() => {
+                    reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
                     if (currentPair === pairId) connectMuxWS(wsBase, pairId);
-                }, 2000);
+                }, delay);
             }
         };
     } catch(e) {
+        updateConnectionStatus('disconnected');
         startFallbackPoll('orderbook', () => loadOrderbook(pairId), 2500);
         startFallbackPoll('trades', () => loadTrades(pairId), 2500);
     }
@@ -319,6 +469,54 @@ function updateTicker(data) {
     const lastPriceEl = document.getElementById('last-price');
     if (lastPriceEl && data.last) {
         lastPriceEl.textContent = fmtPrice(parseFloat(data.last));
+    }
+}
+
+// ── P2 — Connection status indicator ────────────────────────────────────────
+function updateConnectionStatus(status) {
+    connStatus = status;
+    const statusEl = document.getElementById('conn-status');
+    if (statusEl) {
+        statusEl.className = `conn-dot ${status}`;
+        const tooltips = {
+            connected: 'WebSocket connected',
+            fallback: 'REST polling fallback',
+            disconnected: 'Disconnected'
+        };
+        statusEl.title = tooltips[status] || status;
+    }
+}
+
+// ── P1 — Handle orders WS messages directly ─────────────────────────────────
+let localOrdersList = [];
+let lastFullOrdersRefresh = 0;
+
+function handleOrdersMessage(data) {
+    if (data.orders && Array.isArray(data.orders)) {
+        // Full order list from server
+        localOrdersList = data.orders.filter(o => o.pair_id === currentPair || !currentPair);
+        renderOpenOrders(localOrdersList);
+        lastFullOrdersRefresh = Date.now();
+    } else if (data.type) {
+        // Order event - update local state
+        if (data.type === 'order_created' && data.order) {
+            const order = data.order;
+            if (order.pair_id === currentPair) {
+                localOrdersList.unshift(order);
+                renderOpenOrders(localOrdersList);
+            }
+        } else if (data.type === 'order_cancelled' && data.order_id) {
+            localOrdersList = localOrdersList.filter(o => o.id !== data.order_id);
+            renderOpenOrders(localOrdersList);
+        } else if (data.type === 'orders_cancelled_all') {
+            localOrdersList = [];
+            renderOpenOrders(localOrdersList);
+        } else {
+            // For other events, do a full refresh if it's been >30s since last one
+            if (Date.now() - lastFullOrdersRefresh > 30000) {
+                loadOpenOrders();
+            }
+        }
     }
 }
 
@@ -723,18 +921,19 @@ function showFeedback(message, type = 'info') {
 
 // ── Formatters ────────────────────────────────────────────────────────────────
 
+// ── P3 — Use cached formatters instead of toLocaleString ──────────────────
 function fmtPrice(n) {
     if (n == null || isNaN(n)) return '—';
-    if (n >= 1000) return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    if (n >= 1)    return n.toFixed(4);
-    return n.toFixed(6);
+    if (n >= 1000) return fmtPrice2.format(n);
+    if (n >= 1)    return fmtPrice4.format(n);
+    return fmtPrice6.format(n);
 }
 
 function fmtQty(n) {
     if (n == null || isNaN(n)) return '—';
-    if (n >= 1000) return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    if (n >= 1)    return n.toFixed(4);
-    return n.toFixed(5);
+    if (n >= 1000) return fmtQty2.format(n);
+    if (n >= 1)    return fmtQty4.format(n);
+    return fmtQty5.format(n);
 }
 
 function fmtTime(ts) {
