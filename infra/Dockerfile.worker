@@ -11,7 +11,7 @@
 # ============================================================================
 # Stage 1: Build — cross-compile sme-worker-lambda for aarch64 Linux
 # ============================================================================
-FROM --platform=linux/amd64 rust:1.88-bookworm AS builder
+FROM --platform=linux/amd64 rust:1.91-bookworm AS builder
 
 WORKDIR /build
 
