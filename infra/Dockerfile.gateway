@@ -11,7 +11,7 @@
 # ============================================================================
 # Stage 1: Build — cross-compile sme-gateway for aarch64 Linux
 # ============================================================================
-FROM rust:1.86-bookworm AS builder
+FROM --platform=linux/amd64 rust:1.86-bookworm AS builder
 
 WORKDIR /build
 
