@@ -11,7 +11,7 @@
 # ============================================================================
 # Stage 1: Build — cross-compile sme-gateway for aarch64 Linux
 # ============================================================================
-FROM --platform=linux/amd64 rust:1.86-bookworm AS builder
+FROM --platform=linux/amd64 rust:1.88-bookworm AS builder
 
 WORKDIR /build
 
@@ -41,6 +41,9 @@ COPY crates/gateway/Cargo.toml ./crates/gateway/
 COPY crates/api/Cargo.toml ./crates/api/
 COPY crates/shared/Cargo.toml ./crates/shared/
 
+# Stub out loadtest (not needed for Lambda, just needs to exist)
+RUN mkdir -p tools/loadtest/src && echo 'fn main() {}' > tools/loadtest/src/main.rs
+
 # Create stub src files to cache dependency compilation
 RUN mkdir -p crates/gateway/src crates/api/src crates/shared/src && \
     echo 'fn main() {}' > crates/gateway/src/main.rs && \
@@ -57,6 +60,7 @@ RUN cargo build --release --target aarch64-unknown-linux-gnu --package sme-gatew
 # Copy real source
 COPY crates/ ./crates/
 COPY web/ ./web/
+COPY tools/loadtest ./tools/loadtest/
 
 # Build sme-gateway for ARM
 RUN cargo build --release --target aarch64-unknown-linux-gnu --package sme-gateway
