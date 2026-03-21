@@ -64,6 +64,15 @@ impl CacheBroadcasts {
     }
 }
 
+/// Order dispatch mode — controls how gateway forwards orders to the worker.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DispatchMode {
+    /// LPUSH to Dragonfly queue (local dev / EC2 worker)
+    Queue,
+    /// Async Lambda invoke (AWS production)
+    Lambda,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub dragonfly: RedisPool,
@@ -73,6 +82,12 @@ pub struct AppState {
     pub cache: CacheBroadcasts,
     /// Per-user TTL cache — avoids Dragonfly round-trips for orders/portfolio
     pub user_cache: routes::UserCache,
+    /// Order dispatch mode: "queue" (default) or "lambda"
+    pub dispatch_mode: DispatchMode,
+    /// AWS Lambda client — used when dispatch_mode == Lambda
+    pub lambda_client: Option<aws_sdk_lambda::Client>,
+    /// Worker Lambda ARN — from WORKER_LAMBDA_ARN env var
+    pub worker_lambda_arn: String,
 }
 
 /// Subscribe to Dragonfly pub/sub channel for cache updates.
@@ -252,11 +267,35 @@ async fn main() -> Result<()> {
         all_keys,
     ));
 
+    // Order dispatch mode — queue (local dev) or lambda (AWS production)
+    let dispatch_mode = match std::env::var("ORDER_DISPATCH_MODE").as_deref() {
+        Ok("lambda") => {
+            tracing::info!("order dispatch mode: lambda");
+            DispatchMode::Lambda
+        }
+        _ => {
+            tracing::info!("order dispatch mode: queue (default)");
+            DispatchMode::Queue
+        }
+    };
+
+    let worker_lambda_arn = std::env::var("WORKER_LAMBDA_ARN").unwrap_or_default();
+
+    let lambda_client = if dispatch_mode == DispatchMode::Lambda {
+        let aws_cfg = aws_config::load_from_env().await;
+        Some(aws_sdk_lambda::Client::new(&aws_cfg))
+    } else {
+        None
+    };
+
     let state = AppState {
         dragonfly: dragonfly.clone(),
         order_events_tx,
         cache: cache.clone(),
         user_cache: routes::UserCache::new(),
+        dispatch_mode,
+        lambda_client,
+        worker_lambda_arn,
     };
 
     let app = Router::new()

@@ -26,6 +26,8 @@ futures-util = "0.3"
 bytes = "1"
 async-stream = "0.3"
 socket2 = { version = "0.5", features = ["all"] }
+aws-config = "1"
+aws-sdk-lambda = "1"
 
 [[bin]]
 name = "sme-gateway"

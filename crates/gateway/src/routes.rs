@@ -290,17 +290,43 @@ pub async fn create_order(
         "created_at": now.to_rfc3339(),
     });
 
-    // Queue the order for the worker (write path — direct Dragonfly)
-    let mut conn = s.dragonfly.get().await?;
     let order_str = serde_json::to_string(&order_json)?;
-    conn.lpush::<_, _, ()>(format!("queue:orders:{}", req.pair_id), &order_str).await?;
 
-    tracing::info!(
-        order_id = %order_id,
-        pair_id = %req.pair_id,
-        user_id = %user_id,
-        "order queued for processing"
-    );
+    // Dispatch order to worker — mode selected by ORDER_DISPATCH_MODE env var
+    match s.dispatch_mode {
+        crate::DispatchMode::Lambda => {
+            // Async Lambda invoke (fire-and-forget) — returns immediately
+            if let Some(ref lambda_client) = s.lambda_client {
+                let payload = aws_sdk_lambda::primitives::Blob::new(order_str.into_bytes());
+                let _ = lambda_client.invoke()
+                    .function_name(&s.worker_lambda_arn)
+                    .invocation_type(aws_sdk_lambda::types::InvocationType::Event)
+                    .payload(payload)
+                    .send()
+                    .await;
+                tracing::info!(
+                    order_id = %order_id,
+                    pair_id = %req.pair_id,
+                    user_id = %user_id,
+                    arn = %s.worker_lambda_arn,
+                    "order dispatched to Worker Lambda"
+                );
+            } else {
+                tracing::error!("dispatch_mode=lambda but lambda_client is None");
+            }
+        }
+        crate::DispatchMode::Queue => {
+            // LPUSH to Dragonfly queue (local dev / EC2 worker)
+            let mut conn = s.dragonfly.get().await?;
+            conn.lpush::<_, _, ()>(format!("queue:orders:{}", req.pair_id), &order_str).await?;
+            tracing::info!(
+                order_id = %order_id,
+                pair_id = %req.pair_id,
+                user_id = %user_id,
+                "order queued for processing"
+            );
+        }
+    }
 
     Ok((
         StatusCode::CREATED,
