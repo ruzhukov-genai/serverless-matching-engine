@@ -55,7 +55,7 @@ Parameters:
 Mappings:
   AmazonLinux2023ArmAmi:
     us-east-1:
-      AMI: ami-0d7ae6a161c5c4239   # AL2023 arm64 us-east-1 (update as needed)
+      AMI: ami-0a9eef82780017c25   # AL2023 arm64 us-east-1
     us-east-2:
       AMI: ami-09b7b6f76e4b19aca   # AL2023 arm64 us-east-2
     us-west-1:
