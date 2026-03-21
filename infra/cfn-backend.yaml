@@ -288,35 +288,6 @@ Resources:
       Description: PostgreSQL from Lambda
 
   # =========================================================================
-  # ECR Repository
-  # =========================================================================
-  ECRRepository:
-    Type: AWS::ECR::Repository
-    Properties:
-      RepositoryName: !Sub '${ProjectName}/sme-gateway'
-      ImageScanningConfiguration:
-        ScanOnPush: true
-      LifecyclePolicy:
-        LifecyclePolicyText: |
-          {
-            "rules": [
-              {
-                "rulePriority": 1,
-                "description": "Keep last 5 images",
-                "selection": {
-                  "tagStatus": "any",
-                  "countType": "imageCountMoreThan",
-                  "countNumber": 5
-                },
-                "action": { "type": "expire" }
-              }
-            ]
-          }
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-
-  # =========================================================================
   # IAM - EC2 Instance Profile
   # =========================================================================
   EC2Role:
@@ -736,12 +707,6 @@ Outputs:
     Value: !GetAtt EC2Instance.PrivateIp
     Export:
       Name: !Sub '${ProjectName}-ec2-private-ip'
-
-  ECRRepositoryUri:
-    Description: ECR repository URI for sme-gateway image
-    Value: !GetAtt ECRRepository.RepositoryUri
-    Export:
-      Name: !Sub '${ProjectName}-ecr-uri'
 
   VpcId:
     Description: VPC ID
