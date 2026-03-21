@@ -97,7 +97,7 @@ function selectPair(pair) {
     // Clear DOM maps for new pair
     asksDomMap.clear();
     bidsDomMap.clear();
-    lastTradesListLength = 0;
+    tradesRenderedCount = 0;
     ordersPage = 0;
 
     clearFallbackPoll('orderbook');
@@ -111,13 +111,30 @@ function selectPair(pair) {
 
 // ── Order Book ────────────────────────────────────────────────────────────────
 
+// Normalize orderbook levels: server sends [price, qty] arrays OR {price, quantity} objects.
+// Convert to {price: number, quantity: number} for all downstream code.
+function normalizeLevels(levels) {
+    if (!Array.isArray(levels) || levels.length === 0) return [];
+    // Detect format from first element
+    const first = levels[0];
+    if (Array.isArray(first)) {
+        // [price, qty] tuples → objects with pre-parsed numbers
+        return levels.map(l => ({ price: +l[0], quantity: +l[1] }));
+    }
+    if (typeof first === 'object' && first !== null) {
+        // Already {price, quantity} — pre-parse numbers
+        return levels.map(l => ({ price: +(l.price), quantity: +(l.quantity) }));
+    }
+    return levels;
+}
+
 async function loadOrderbook(pairId) {
     try {
         // P1 — Request with default depth limit of 25
         const res = await fetch(`${API}/api/orderbook/${pairId}?depth=25`);
         const data = await res.json();
-        orderbook.bids = data.bids || [];
-        orderbook.asks = data.asks || [];
+        orderbook.bids = normalizeLevels(data.bids);
+        orderbook.asks = normalizeLevels(data.asks);
         renderOrderbook();
     } catch (e) {
         console.error('Failed to load orderbook:', e);
@@ -143,13 +160,14 @@ function doRenderOrderbook() {
     const lastPriceEl = document.getElementById('last-price');
 
     // Sort asks low→high (best ask at bottom, near spread)
+    // Data is already pre-parsed to numbers by normalizeLevels()
     const sortedAsks = [...orderbook.asks]
-        .sort((a, b) => parseFloat(a.price) - parseFloat(b.price))
+        .sort((a, b) => a.price - b.price)
         .slice(0, 25);
 
     // Sort bids high→low (best bid at top, near spread)
     const sortedBids = [...orderbook.bids]
-        .sort((a, b) => parseFloat(b.price) - parseFloat(a.price))
+        .sort((a, b) => b.price - a.price)
         .slice(0, 25);
 
     // Compute cumulative totals
@@ -172,8 +190,8 @@ function doRenderOrderbook() {
 
     // Spread calculation
     if (sortedAsks.length > 0 && sortedBids.length > 0) {
-        const bestAsk = parseFloat(sortedAsks[0].price);
-        const bestBid = parseFloat(sortedBids[0].price);
+        const bestAsk = sortedAsks[0].price;
+        const bestBid = sortedBids[0].price;
         const spread = bestAsk - bestBid;
         const pct = bestBid > 0 ? ((spread / bestBid) * 100).toFixed(2) : '0.00';
         spreadEl.textContent = `Spread: ${fmtPrice(spread)} (${pct}%)`;
@@ -186,13 +204,18 @@ function doRenderOrderbook() {
         spreadEl.textContent = '—';
     }
 
-    // Auto-scroll asks to bottom (near spread)
-    asksEl.scrollTop = asksEl.scrollHeight;
+    // Auto-scroll asks to bottom (near spread) — only if height changed
+    // Setting scrollTop triggers synchronous layout reflow, skip when unnecessary
+    const sh = asksEl.scrollHeight;
+    if (asksEl._prevScrollHeight !== sh) {
+        asksEl.scrollTop = sh;
+        asksEl._prevScrollHeight = sh;
+    }
 }
 
 function updateOrderbookSide(container, levels, side, maxCum, domMap) {
-    // Create a set of current prices for quick lookup
-    const currentPrices = new Set(levels.map(l => parseFloat(l.price)));
+    // Create a set of current prices for quick lookup (prices are already numbers)
+    const currentPrices = new Set(levels.map(l => l.price));
     
     // Remove elements for prices no longer in the book
     for (const [price, element] of domMap) {
@@ -206,12 +229,12 @@ function updateOrderbookSide(container, levels, side, maxCum, domMap) {
     const fragment = document.createDocumentFragment();
     let needsReorder = false;
     
-    levels.forEach((level, index) => {
-        const price = parseFloat(level.price);
+    for (let i = 0; i < levels.length; i++) {
+        const level = levels[i];
+        const price = level.price;
         let element = domMap.get(price);
         
         if (!element) {
-            // Create new element
             element = document.createElement('div');
             element.className = `level ${side}`;
             element.onclick = () => fillPrice(price);
@@ -219,14 +242,12 @@ function updateOrderbookSide(container, levels, side, maxCum, domMap) {
             needsReorder = true;
         }
         
-        // Update element content
         updateLevelElement(element, level, side, maxCum);
         
-        // Add to fragment if it's a new element
         if (!element.parentNode) {
             fragment.appendChild(element);
         }
-    });
+    }
     
     // Add any new elements
     if (fragment.children.length > 0) {
@@ -236,16 +257,16 @@ function updateOrderbookSide(container, levels, side, maxCum, domMap) {
     
     // Reorder if needed (only when elements were added/removed)
     if (needsReorder) {
-        const sortedElements = levels.map(l => domMap.get(parseFloat(l.price)));
-        sortedElements.forEach(element => {
-            if (element) container.appendChild(element);
-        });
+        for (let i = 0; i < levels.length; i++) {
+            const el = domMap.get(levels[i].price);
+            if (el) container.appendChild(el);
+        }
     }
 }
 
 function updateLevelElement(element, level, side, maxCum) {
-    const price = parseFloat(level.price);
-    const qty = parseFloat(level.quantity);
+    const price = level.price;
+    const qty = level.quantity;
     const cum = level.cum || 0;
     const depthPct = Math.min(100, (cum / maxCum) * 100).toFixed(1);
     const color = side === 'ask' ? 'rgba(248,81,73,0.25)' : 'rgba(63,185,80,0.25)';
@@ -273,16 +294,15 @@ function updateLevelElement(element, level, side, maxCum) {
 function computeCumulative(levels) {
     let cum = 0;
     return levels.map(l => {
-        const qty = parseFloat(l.quantity) || 0;
-        cum += qty;
+        cum += l.quantity;
         return { ...l, cum };
     });
 }
 
 // Legacy renderLevel function - kept for compatibility but not used in diff updates
 function renderLevel(level, side, maxCum) {
-    const price = parseFloat(level.price);
-    const qty   = parseFloat(level.quantity);
+    const price = level.price;
+    const qty   = level.quantity;
     const cum   = level.cum || 0;
     const depthPct = Math.min(100, (cum / maxCum) * 100).toFixed(1);
     const color = side === 'ask' ? 'rgba(248,81,73,0.25)' : 'rgba(63,185,80,0.25)';
@@ -322,6 +342,9 @@ function renderTrades() {
     trRafId = requestAnimationFrame(doRenderTrades);
 }
 
+let tradesRenderedCount = 0;  // how many trade DOM nodes currently in the list
+const MAX_VISIBLE_TRADES = 50;
+
 function doRenderTrades() {
     trRafId = 0;
     if (!tradesChanged) return;
@@ -333,16 +356,50 @@ function doRenderTrades() {
     const el = document.getElementById('trades-list');
     if (tradesList.length === 0) {
         el.innerHTML = '<div class="empty-state">No recent trades</div>';
+        tradesRenderedCount = 0;
         return;
     }
-    el.innerHTML = tradesList.slice(0, 50).map(t => {
-        const side = (t.side || 'buy').toLowerCase();
-        return `<div class="trade-row ${side}">` +
-            `<span class="trade-price">${fmtPrice(parseFloat(t.price))}</span>` +
-            `<span class="trade-qty">${fmtQty(parseFloat(t.quantity))}</span>` +
-            `<span class="trade-time">${fmtTime(t.created_at)}</span>` +
-            `</div>`;
-    }).join('');
+
+    // If the trade list was fully replaced (e.g. pair switch or initial load),
+    // do a full rebuild. Otherwise, prepend new trades only.
+    const newCount = tradesList.length;
+    const addCount = newCount - tradesRenderedCount;
+
+    if (addCount < 0 || addCount > MAX_VISIBLE_TRADES || tradesRenderedCount === 0) {
+        // Full rebuild (pair switch, initial load, or list shrunk)
+        el.innerHTML = '';
+        const frag = document.createDocumentFragment();
+        const limit = Math.min(newCount, MAX_VISIBLE_TRADES);
+        for (let i = 0; i < limit; i++) {
+            frag.appendChild(createTradeRow(tradesList[i]));
+        }
+        el.appendChild(frag);
+        tradesRenderedCount = limit;
+    } else if (addCount > 0) {
+        // Prepend only the new trades
+        const frag = document.createDocumentFragment();
+        for (let i = addCount - 1; i >= 0; i--) {
+            frag.appendChild(createTradeRow(tradesList[i]));
+        }
+        el.insertBefore(frag, el.firstChild);
+        tradesRenderedCount += addCount;
+        // Trim excess nodes from the end
+        while (el.children.length > MAX_VISIBLE_TRADES) {
+            el.removeChild(el.lastChild);
+            tradesRenderedCount--;
+        }
+    }
+}
+
+function createTradeRow(t) {
+    const side = (t.side || 'buy').toLowerCase();
+    const row = document.createElement('div');
+    row.className = `trade-row ${side}`;
+    row.innerHTML =
+        `<span class="trade-price">${fmtPrice(parseFloat(t.price))}</span>` +
+        `<span class="trade-qty">${fmtQty(parseFloat(t.quantity))}</span>` +
+        `<span class="trade-time">${fmtTime(t.created_at)}</span>`;
+    return row;
 }
 
 function prependTrade(trade) {
@@ -413,8 +470,8 @@ function connectMuxWS(wsBase, pairId) {
 
                 if (ch.startsWith('orderbook:')) {
                     if (data.bids || data.asks) {
-                        orderbook.bids = data.bids || orderbook.bids;
-                        orderbook.asks = data.asks || orderbook.asks;
+                        orderbook.bids = data.bids ? normalizeLevels(data.bids) : orderbook.bids;
+                        orderbook.asks = data.asks ? normalizeLevels(data.asks) : orderbook.asks;
                         renderOrderbook();
                     }
                 } else if (ch.startsWith('trades:')) {
@@ -535,13 +592,13 @@ function connectOrderbookWS(wsBase, pairId) {
             try {
                 const msg = JSON.parse(e.data);
                 if (msg.type === 'snapshot') {
-                    orderbook.bids = msg.bids || [];
-                    orderbook.asks = msg.asks || [];
+                    orderbook.bids = normalizeLevels(msg.bids);
+                    orderbook.asks = normalizeLevels(msg.asks);
                 } else if (msg.type === 'update') {
                     applyBookUpdate(msg);
                 } else if (msg.bids || msg.asks) {
-                    orderbook.bids = msg.bids || orderbook.bids;
-                    orderbook.asks = msg.asks || orderbook.asks;
+                    orderbook.bids = msg.bids ? normalizeLevels(msg.bids) : orderbook.bids;
+                    orderbook.asks = msg.asks ? normalizeLevels(msg.asks) : orderbook.asks;
                 }
                 renderOrderbook();
             } catch(err) { console.warn('OB WS parse error:', err); }
@@ -622,9 +679,9 @@ function applyBookUpdate(msg) {
 }
 
 function applyLevel(arr, level) {
-    const price = parseFloat(level.price);
-    const qty   = parseFloat(level.quantity);
-    const idx   = arr.findIndex(x => parseFloat(x.price) === price);
+    const price = level.price;
+    const qty   = level.quantity;
+    const idx   = arr.findIndex(x => x.price === price);
     if (qty === 0) {
         if (idx >= 0) arr.splice(idx, 1);
     } else {
@@ -742,13 +799,21 @@ async function submitOrder() {
             );
             document.getElementById('order-quantity').value = '';
             document.getElementById('order-total').textContent = '0.00';
-            // Refresh everything
-            await Promise.all([
-                loadPortfolio(),
-                loadOpenOrders(),
-                loadOrderbook(currentPair),
-                loadTrades(currentPair),
-            ]);
+            // In WS mode, the mux WS pushes orderbook/trades/orders/portfolio updates
+            // within ~40ms. Only do a deferred REST refresh as a safety net.
+            if (USE_MUX_WS && connStatus === 'connected') {
+                setTimeout(() => {
+                    loadPortfolio();
+                    loadOpenOrders();
+                }, 2000);
+            } else {
+                await Promise.all([
+                    loadPortfolio(),
+                    loadOpenOrders(),
+                    loadOrderbook(currentPair),
+                    loadTrades(currentPair),
+                ]);
+            }
         } else {
             const err = await res.json().catch(() => ({}));
             showFeedback(`Order failed: ${err.message || err.error || res.statusText}`, 'error');
