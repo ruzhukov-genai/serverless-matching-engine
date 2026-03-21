@@ -1,0 +1,229 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Serverless Matching Engine — Frontend Stack
+  S3 (private) + CloudFront (OAC) with /api/* forwarded to API Gateway.
+  PriceClass_100 (US + EU) for cheapest CDN.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: serverless-matching-engine
+
+  ApiGatewayUrl:
+    Type: String
+    Description: >
+      API Gateway HTTP API URL (without trailing slash), e.g.
+      https://abc123.execute-api.us-east-1.amazonaws.com
+      Import from backend stack or enter manually.
+
+  CustomDomain:
+    Type: String
+    Default: ''
+    Description: Optional custom domain (e.g. app.example.com). Leave empty to skip.
+
+  AcmCertificateArn:
+    Type: String
+    Default: ''
+    Description: >
+      Optional ACM certificate ARN (must be in us-east-1 for CloudFront).
+      Required if CustomDomain is set.
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  HasCustomDomain: !And
+    - !Not [!Equals [!Ref CustomDomain, '']]
+    - !Not [!Equals [!Ref AcmCertificateArn, '']]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # =========================================================================
+  # S3 Bucket — Static Frontend Files
+  # =========================================================================
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-frontend-${AWS::AccountId}'
+      # Fully private — CloudFront OAC handles access
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =========================================================================
+  # CloudFront Origin Access Control (OAC) — modern replacement for OAI
+  # =========================================================================
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-oac'
+        Description: OAC for SME frontend S3 bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # =========================================================================
+  # S3 Bucket Policy — allow CloudFront OAC only
+  # =========================================================================
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${FrontendBucket}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub >-
+                  arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+
+  # =========================================================================
+  # CloudFront Distribution
+  # =========================================================================
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${ProjectName} frontend + API proxy'
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100   # US, Canada, Europe (cheapest)
+
+        # ---- Custom domain (optional) ------------------------------------
+        Aliases: !If
+          - HasCustomDomain
+          - [!Ref CustomDomain]
+          - !Ref 'AWS::NoValue'
+        ViewerCertificate: !If
+          - HasCustomDomain
+          - AcmCertificateArn: !Ref AcmCertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+
+        # ---- Origins -----------------------------------------------------
+        Origins:
+          # Origin 1: S3 (static files)
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''   # Empty — we use OAC not OAI
+            OriginAccessControlId: !Ref CloudFrontOAC
+
+          # Origin 2: API Gateway (API requests)
+          - Id: ApiGatewayOrigin
+            DomainName: !Select
+              - 2
+              - !Split ['/', !Ref ApiGatewayUrl]
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+
+        # ---- Cache Behaviors ---------------------------------------------
+        # /api/* → API Gateway, no caching
+        CacheBehaviors:
+          - PathPattern: '/api/*'
+            TargetOriginId: ApiGatewayOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            # Managed-CachingDisabled policy
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            # Managed-AllViewer origin request policy (forwards all headers/qs/cookies)
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            Compress: true
+
+          # /ws/* → API Gateway, no caching (WebSocket future path)
+          - PathPattern: '/ws/*'
+            TargetOriginId: ApiGatewayOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            Compress: false
+
+        # Default behavior: S3 static files, cached 24h
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed-CachingOptimized policy (86400s default, 31536000s max)
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+        # ---- Custom error pages for SPA ----------------------------------
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+
+  CloudFrontUrl:
+    Description: CloudFront distribution URL
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+    Export:
+      Name: !Sub '${ProjectName}-cf-url'
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID (needed for cache invalidation)
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${ProjectName}-cf-id'
+
+  FrontendBucketName:
+    Description: S3 bucket name for frontend files
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub '${ProjectName}-frontend-bucket'
+
+  FrontendBucketArn:
+    Description: S3 bucket ARN
+    Value: !GetAtt FrontendBucket.Arn
+    Export:
+      Name: !Sub '${ProjectName}-frontend-bucket-arn'
