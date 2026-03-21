@@ -193,10 +193,9 @@ function doRenderOrderbook() {
         const bestAsk = sortedAsks[0].price;
         const bestBid = sortedBids[0].price;
         const spread = bestAsk - bestBid;
-        const pct = bestBid > 0 ? ((spread / bestBid) * 100).toFixed(2) : '0.00';
-        spreadEl.textContent = `Spread: ${fmtPrice(spread)} (${pct}%)`;
+        const pct = bestBid > 0 ? ((spread / bestBid) * 100).toFixed(3) : '0.000';
+        spreadEl.textContent = `${fmtPrice2.format(Math.abs(spread))} (${pct}%)`;
 
-        // Last price = midpoint for display
         if (lastPriceEl) {
             lastPriceEl.textContent = fmtPrice((bestAsk + bestBid) / 2);
         }
@@ -319,6 +318,40 @@ window.fillPrice = function(price) {
     const priceInput = document.getElementById('order-price');
     priceInput.value = price;
     priceInput.dispatchEvent(new Event('input'));
+};
+
+// ── Quick fill + available balance ──────────────────────────────────────────
+let cachedBalances = {};
+
+function updateAvailableBalance() {
+    const el = document.getElementById('available-balance');
+    if (!el || !currentPairConfig) return;
+    const base = currentPairConfig.base || currentPair?.split('-')[0] || '';
+    const quote = currentPairConfig.quote || currentPair?.split('-')[1] || '';
+    const asset = currentSide === 'buy' ? quote : base;
+    const avail = cachedBalances[asset] || 0;
+    el.textContent = `Avail: ${fmtQty(avail)} ${asset}`;
+    el.onclick = () => quickFill(1.0);
+}
+
+window.quickFill = function(pct) {
+    if (!currentPairConfig) return;
+    const base = currentPairConfig.base || '';
+    const quote = currentPairConfig.quote || '';
+    const priceInput = document.getElementById('order-price');
+    const qtyInput = document.getElementById('order-quantity');
+    const price = parseFloat(priceInput.value) || 0;
+
+    if (currentSide === 'buy') {
+        const avail = cachedBalances[quote] || 0;
+        if (price > 0) {
+            qtyInput.value = (avail * pct / price).toFixed(currentPairConfig.qty_precision || 5);
+        }
+    } else {
+        const avail = cachedBalances[base] || 0;
+        qtyInput.value = (avail * pct).toFixed(currentPairConfig.qty_precision || 5);
+    }
+    qtyInput.dispatchEvent(new Event('input'));
 };
 
 // ── Trades ────────────────────────────────────────────────────────────────────
@@ -522,10 +555,25 @@ function connectMuxWS(wsBase, pairId) {
 }
 
 function updateTicker(data) {
-    // Update the last price / ticker info in the UI
     const lastPriceEl = document.getElementById('last-price');
     if (lastPriceEl && data.last) {
         lastPriceEl.textContent = fmtPrice(parseFloat(data.last));
+    }
+    // Update 24h stats bar
+    const set = (id, val) => { const el = document.getElementById(id); if (el && val != null) el.textContent = val; };
+    if (data.last) set('stat-last', fmtPrice(parseFloat(data.last)));
+    if (data.high_24h) set('stat-high', fmtPrice(parseFloat(data.high_24h)));
+    if (data.low_24h) set('stat-low', fmtPrice(parseFloat(data.low_24h)));
+    if (data.volume_24h) set('stat-volume', fmtQty(parseFloat(data.volume_24h)));
+    if (data.last && data.open_24h) {
+        const change = parseFloat(data.last) - parseFloat(data.open_24h);
+        const changePct = parseFloat(data.open_24h) > 0 ? (change / parseFloat(data.open_24h) * 100) : 0;
+        const changeEl = document.getElementById('stat-change');
+        if (changeEl) {
+            const sign = change >= 0 ? '+' : '';
+            changeEl.textContent = `${sign}${fmtPrice2.format(change)} (${sign}${changePct.toFixed(2)}%)`;
+            changeEl.className = `stat-value ${change >= 0 ? 'positive' : 'negative'}`;
+        }
     }
 }
 
@@ -714,6 +762,7 @@ function setupTabs() {
             const btn = document.getElementById('submit-order');
             btn.textContent = currentSide === 'buy' ? 'Buy' : 'Sell';
             btn.className   = currentSide === 'buy' ? 'btn-buy' : 'btn-sell';
+            updateAvailableBalance();
         });
     });
 }
@@ -839,6 +888,13 @@ async function loadPortfolio() {
 }
 
 function renderPortfolio(balances) {
+    // Cache balances for quick-fill calculations
+    cachedBalances = {};
+    for (const b of balances) {
+        cachedBalances[b.asset] = parseFloat(b.available) || 0;
+    }
+    updateAvailableBalance();
+
     const tbody = document.getElementById('portfolio-body');
     if (balances.length === 0) {
         tbody.innerHTML = '<tr><td colspan="4" class="empty">No balances</td></tr>';
@@ -874,7 +930,7 @@ function renderOpenOrders(orders) {
     const tbody = document.getElementById('orders-body');
 
     if (orders.length === 0 && ordersTotal === 0) {
-        tbody.innerHTML = '<tr><td colspan="7" class="empty">No open orders</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" class="empty empty-orders">No open orders — place an order to get started</td></tr>';
         renderOrdersPagination(0);
         return;
     }

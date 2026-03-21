@@ -20,6 +20,15 @@
         </nav>
     </header>
 
+    <!-- 24h stats bar -->
+    <div id="stats-bar" class="stats-bar">
+        <span class="stat"><span class="stat-label">Last</span> <span id="stat-last" class="stat-value">—</span></span>
+        <span class="stat"><span class="stat-label">24h Change</span> <span id="stat-change" class="stat-value">—</span></span>
+        <span class="stat"><span class="stat-label">24h High</span> <span id="stat-high" class="stat-value">—</span></span>
+        <span class="stat"><span class="stat-label">24h Low</span> <span id="stat-low" class="stat-value">—</span></span>
+        <span class="stat"><span class="stat-label">24h Vol</span> <span id="stat-volume" class="stat-value">—</span></span>
+    </div>
+
     <!-- Single-screen grid -->
     <main>
         <!-- Col 1: Order Book -->
@@ -68,8 +77,17 @@
                         <input type="number" id="order-price" step="any" min="0" placeholder="0.00">
                     </div>
                     <div class="form-group">
-                        <label>Quantity</label>
+                        <div class="label-row">
+                            <label>Quantity</label>
+                            <span id="available-balance" class="avail-hint"></span>
+                        </div>
                         <input type="number" id="order-quantity" step="any" min="0" placeholder="0.00">
+                        <div class="quick-fill">
+                            <button type="button" onclick="quickFill(0.25)">25%</button>
+                            <button type="button" onclick="quickFill(0.50)">50%</button>
+                            <button type="button" onclick="quickFill(0.75)">75%</button>
+                            <button type="button" onclick="quickFill(1.00)">100%</button>
+                        </div>
                     </div>
                     <div class="form-total">
                         <span class="total-label">Total</span>
@@ -128,7 +146,7 @@
                             </tr>
                         </thead>
                         <tbody id="orders-body">
-                            <tr><td colspan="7" class="empty">Loading…</td></tr>
+                            <tr><td colspan="7" class="empty empty-orders">No open orders — place an order to get started</td></tr>
                         </tbody>
                     </table>
                 </div>
