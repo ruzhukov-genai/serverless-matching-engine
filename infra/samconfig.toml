@@ -1,7 +1,9 @@
 version = 0.1
 
 [default.build.parameters]
-use_container = false
+use_container = true
+container_env_var_file = ""
+cached = false
 
 [default.deploy.parameters]
 stack_name = "serverless-matching-engine"

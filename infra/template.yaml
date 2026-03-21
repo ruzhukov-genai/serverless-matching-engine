@@ -492,7 +492,7 @@ Resources:
         - VPCAccessPolicy: {}
     Metadata:
       DockerTag: latest
-      DockerContext: ../
+      DockerContext: ..
       Dockerfile: infra/Dockerfile.gateway
 
   # =========================================================================
