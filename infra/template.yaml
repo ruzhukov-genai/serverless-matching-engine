@@ -32,11 +32,6 @@ Parameters:
     Default: sme_prod_change_me
     Description: PostgreSQL password for the sme user.
 
-  SmeApiBinaryS3Uri:
-    Type: String
-    Default: ''
-    Description: S3 URI for sme-api ARM binary. Leave empty for manual install.
-
   AllowedCorsOrigin:
     Type: String
     Default: '*'
@@ -83,7 +78,6 @@ Resources:
         ProjectName: !Ref ProjectName
         KeyPairName: !Ref KeyPairName
         DBPassword: !Ref DBPassword
-        SmeApiBinaryS3Uri: !Ref SmeApiBinaryS3Uri
         AllowedCorsOrigin: !Ref AllowedCorsOrigin
         VpcId: !GetAtt NetworkStack.Outputs.VpcId
         PublicSubnetA: !GetAtt NetworkStack.Outputs.PublicSubnetA
@@ -92,6 +86,8 @@ Resources:
         EC2SecurityGroupId: !GetAtt NetworkStack.Outputs.EC2SecurityGroupId
         LambdaSecurityGroupId: !GetAtt NetworkStack.Outputs.LambdaSecurityGroupId
         WorkerLambdaSecurityGroupId: !GetAtt NetworkStack.Outputs.WorkerLambdaSecurityGroupId
+        RDSSecurityGroupId: !GetAtt NetworkStack.Outputs.RDSSecurityGroupId
+        PublicSubnetB: !GetAtt NetworkStack.Outputs.PublicSubnetB
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -141,6 +137,10 @@ Outputs:
   EC2PrivateIP:
     Description: EC2 private IP (used by Lambda for Dragonfly)
     Value: !GetAtt BackendStack.Outputs.EC2PrivateIP
+
+  RDSEndpoint:
+    Description: RDS PostgreSQL endpoint
+    Value: !GetAtt BackendStack.Outputs.RDSEndpoint
 
   VpcId:
     Description: VPC ID

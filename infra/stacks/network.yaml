@@ -219,7 +219,7 @@ Resources:
   WorkerLambdaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Lambda sme-worker - allows outbound to EC2 (Dragonfly + PG)
+      GroupDescription: Lambda sme-worker - allows outbound to EC2 (Dragonfly) + RDS (PG)
       VpcId: !Ref VPC
       SecurityGroupEgress:
         - IpProtocol: tcp
@@ -230,8 +230,8 @@ Resources:
         - IpProtocol: tcp
           FromPort: 5432
           ToPort: 5432
-          Description: PostgreSQL on EC2
-          DestinationSecurityGroupId: !Ref EC2SecurityGroup
+          Description: PostgreSQL on RDS
+          DestinationSecurityGroupId: !Ref RDSSecurityGroup
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
@@ -242,6 +242,44 @@ Resources:
           Value: !Sub '${ProjectName}-worker-lambda-sg'
         - Key: Project
           Value: !Ref ProjectName
+
+  # ---- RDS Security Group -------------------------------------------------
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS PostgreSQL - allows inbound from Lambda SGs and EC2
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: PostgreSQL from Gateway Lambda
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+          Description: PostgreSQL from EC2 (Dragonfly cache seeding scripts)
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 127.0.0.1/32
+          Description: No outbound needed
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rds-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # RDS ingress from Worker Lambda (added separately to avoid circular ref)
+  RDSIngressWorkerLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RDSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
+      Description: PostgreSQL from Worker Lambda
 
   # ---- EC2 ingress rules from Lambda SGs (added separately to avoid circular refs) ----
 
@@ -256,17 +294,6 @@ Resources:
       SourceSecurityGroupId: !Ref LambdaSecurityGroup
       Description: Dragonfly from Gateway Lambda
 
-  # Allow Gateway Lambda -> PostgreSQL (5432)
-  EC2IngressPostgres:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref EC2SecurityGroup
-      IpProtocol: tcp
-      FromPort: 5432
-      ToPort: 5432
-      SourceSecurityGroupId: !Ref LambdaSecurityGroup
-      Description: PostgreSQL from Gateway Lambda
-
   # Allow Worker Lambda -> Dragonfly (6379)
   EC2IngressDragonflyWorker:
     Type: AWS::EC2::SecurityGroupIngress
@@ -278,16 +305,7 @@ Resources:
       SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
       Description: Dragonfly from Worker Lambda
 
-  # Allow Worker Lambda -> PostgreSQL (5432)
-  EC2IngressPostgresWorker:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref EC2SecurityGroup
-      IpProtocol: tcp
-      FromPort: 5432
-      ToPort: 5432
-      SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
-      Description: PostgreSQL from Worker Lambda
+
 
 # ---------------------------------------------------------------------------
 # Outputs
@@ -325,3 +343,7 @@ Outputs:
   WorkerLambdaSecurityGroupId:
     Description: Worker Lambda security group ID
     Value: !Ref WorkerLambdaSecurityGroup
+
+  RDSSecurityGroupId:
+    Description: RDS security group ID
+    Value: !Ref RDSSecurityGroup
