@@ -10,8 +10,8 @@ set -euo pipefail
 RDS_HOST="${1:?Usage: $0 <rds-endpoint> <db-password>}"
 DB_PASSWORD="${2:?Usage: $0 <rds-endpoint> <db-password>}"
 
-# Install postgresql client if not present
-which psql > /dev/null 2>&1 || dnf install -y postgresql 2>/dev/null || true
+# Install postgresql client if not present (AL2023 uses postgresql16 package)
+which psql > /dev/null 2>&1 || dnf install -y --allowerasing postgresql16 2>/dev/null || true
 
 export PGPASSWORD="$DB_PASSWORD"
 
