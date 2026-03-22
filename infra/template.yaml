@@ -130,10 +130,6 @@ Outputs:
     Description: S3 bucket name for frontend files
     Value: !GetAtt FrontendStack.Outputs.FrontendBucketName
 
-  EC2PublicIP:
-    Description: EC2 Elastic IP (SSH target)
-    Value: !GetAtt BackendStack.Outputs.EC2PublicIP
-
   EC2PrivateIP:
     Description: EC2 private IP (used by Lambda for Dragonfly)
     Value: !GetAtt BackendStack.Outputs.EC2PrivateIP

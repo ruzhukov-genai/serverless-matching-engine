@@ -6,3 +6,4 @@ Cargo.lock
 .env.local
 .DS_Store
 .aws-sam/
+tools/__pycache__/

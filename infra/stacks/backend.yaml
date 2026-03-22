@@ -200,7 +200,7 @@ Resources:
       ImageId: !FindInMap [AmazonLinux2023ArmAmi, !Ref 'AWS::Region', AMI]
       KeyName: !Ref KeyPairName
       IamInstanceProfile: !Ref EC2InstanceProfile
-      SubnetId: !Ref PublicSubnetA
+      SubnetId: !Ref PrivateSubnetA
       SecurityGroupIds:
         - !Ref EC2SecurityGroupId
       BlockDeviceMappings:
@@ -269,16 +269,8 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
 
-  ElasticIP:
-    Type: AWS::EC2::EIP
-    Properties:
-      Domain: vpc
-      InstanceId: !Ref EC2Instance
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-eip'
-        - Key: Project
-          Value: !Ref ProjectName
+  # ElasticIP removed — EC2 now in private subnet (no public IP needed)
+  # Access via SSM Session Manager only
 
   # =========================================================================
   # RDS PostgreSQL (db.t4g.micro)
@@ -490,10 +482,6 @@ Outputs:
   ApiGatewayUrl:
     Description: API Gateway HTTP API invoke URL
     Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
-
-  EC2PublicIP:
-    Description: EC2 Elastic IP (SSH target)
-    Value: !Ref ElasticIP
 
   EC2PrivateIP:
     Description: EC2 private IP (used by Lambda for Dragonfly)
