@@ -1,8 +1,9 @@
 AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
 Description: >
   Serverless Matching Engine - Backend Stack
-  EC2 t4g.micro (Dragonfly + PostgreSQL + sme-api) + Lambda (sme-gateway) + API Gateway HTTP API
-  Cheapest possible: EC2 in public subnet, Lambda in private subnets, NO NAT Gateway.
+  EC2 t4g.micro (Dragonfly + PostgreSQL + sme-api) + Lambda (sme-gateway + sme-worker) + API Gateway HTTP API.
+  Lambda functions use AWS::Serverless::Function with PackageType: Image.
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -12,31 +13,16 @@ Parameters:
   ProjectName:
     Type: String
     Default: serverless-matching-engine
-    Description: Used for resource naming and tagging.
 
   KeyPairName:
     Type: AWS::EC2::KeyPair::KeyName
     Description: EC2 key pair for SSH access.
 
-  SSHCidr:
+  DBPassword:
     Type: String
-    Default: 0.0.0.0/0
-    Description: CIDR allowed to SSH into EC2. Restrict to your IP for security.
-    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
-
-  GatewayImageUri:
-    Type: String
-    Description: >
-      ECR image URI for sme-gateway container, e.g.
-      123456789.dkr.ecr.us-east-1.amazonaws.com/sme-gateway:latest
-    Default: PLACEHOLDER_UPDATE_AFTER_ECR_PUSH
-
-  WorkerImageUri:
-    Type: String
-    Description: >
-      ECR image URI for sme-worker-lambda container, e.g.
-      123456789.dkr.ecr.us-east-1.amazonaws.com/sme-worker:latest
-    Default: PLACEHOLDER_UPDATE_AFTER_ECR_PUSH
+    NoEcho: true
+    Default: sme_prod_change_me
+    Description: PostgreSQL password for the sme user.
 
   SmeApiBinaryS3Uri:
     Type: String
@@ -45,16 +31,39 @@ Parameters:
       Leave empty to skip download (manual install).
     Default: ''
 
-  DBPassword:
-    Type: String
-    NoEcho: true
-    Default: sme_prod_change_me
-    Description: PostgreSQL password for the sme user.
-
   AllowedCorsOrigin:
     Type: String
     Default: '*'
     Description: CORS allowed origin for API Gateway. Use your CloudFront URL in production.
+
+  # Network inputs (passed from root template via nested stack outputs)
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID from Network stack.
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet A from Network stack.
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet A from Network stack.
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet B from Network stack.
+
+  EC2SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: EC2 security group ID from Network stack.
+
+  LambdaSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Gateway Lambda security group ID from Network stack.
+
+  WorkerLambdaSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Worker Lambda security group ID from Network stack.
 
 # ---------------------------------------------------------------------------
 # Mappings - Amazon Linux 2023 ARM64 AMIs per region
@@ -82,267 +91,6 @@ Mappings:
 # Resources
 # ---------------------------------------------------------------------------
 Resources:
-
-  # =========================================================================
-  # VPC
-  # =========================================================================
-  VPC:
-    Type: AWS::EC2::VPC
-    Properties:
-      CidrBlock: 10.0.0.0/16
-      EnableDnsSupport: true
-      EnableDnsHostnames: true
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-vpc'
-        - Key: Project
-          Value: !Ref ProjectName
-
-  InternetGateway:
-    Type: AWS::EC2::InternetGateway
-    Properties:
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-igw'
-        - Key: Project
-          Value: !Ref ProjectName
-
-  VPCGatewayAttachment:
-    Type: AWS::EC2::VPCGatewayAttachment
-    Properties:
-      VpcId: !Ref VPC
-      InternetGatewayId: !Ref InternetGateway
-
-  # ---- Public Subnets (EC2 lives here) ------------------------------------
-  PublicSubnetA:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.0.1.0/24
-      AvailabilityZone: !Select [0, !GetAZs '']
-      MapPublicIpOnLaunch: true
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-public-a'
-        - Key: Project
-          Value: !Ref ProjectName
-
-  PublicSubnetB:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.0.2.0/24
-      AvailabilityZone: !Select [1, !GetAZs '']
-      MapPublicIpOnLaunch: true
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-public-b'
-        - Key: Project
-          Value: !Ref ProjectName
-
-  # ---- Private Subnets (Lambda lives here - no internet egress needed) ----
-  PrivateSubnetA:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.0.11.0/24
-      AvailabilityZone: !Select [0, !GetAZs '']
-      MapPublicIpOnLaunch: false
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-private-a'
-        - Key: Project
-          Value: !Ref ProjectName
-
-  PrivateSubnetB:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.0.12.0/24
-      AvailabilityZone: !Select [1, !GetAZs '']
-      MapPublicIpOnLaunch: false
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-private-b'
-        - Key: Project
-          Value: !Ref ProjectName
-
-  # ---- Route Tables -------------------------------------------------------
-  PublicRouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref VPC
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-public-rt'
-        - Key: Project
-          Value: !Ref ProjectName
-
-  PublicRoute:
-    Type: AWS::EC2::Route
-    DependsOn: VPCGatewayAttachment
-    Properties:
-      RouteTableId: !Ref PublicRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      GatewayId: !Ref InternetGateway
-
-  PublicSubnetARouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref PublicSubnetA
-      RouteTableId: !Ref PublicRouteTable
-
-  PublicSubnetBRouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref PublicSubnetB
-      RouteTableId: !Ref PublicRouteTable
-
-  # Private subnets use the default (local-only) route table - no internet egress.
-  # Lambda only needs to reach EC2 inside the VPC.
-  PrivateRouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref VPC
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-private-rt'
-        - Key: Project
-          Value: !Ref ProjectName
-
-  PrivateSubnetARouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref PrivateSubnetA
-      RouteTableId: !Ref PrivateRouteTable
-
-  PrivateSubnetBRouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref PrivateSubnetB
-      RouteTableId: !Ref PrivateRouteTable
-
-  # =========================================================================
-  # Security Groups
-  # =========================================================================
-
-  # ---- Lambda Security Group (Gateway) ------------------------------------
-  LambdaSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Lambda sme-gateway - allows outbound to EC2 and Lambda endpoint
-      VpcId: !Ref VPC
-      # No ingress rules needed (Lambda is invoked by API Gateway, not via network)
-      SecurityGroupEgress:
-        - IpProtocol: tcp
-          FromPort: 6379
-          ToPort: 6379
-          Description: Dragonfly on EC2
-          DestinationSecurityGroupId: !Ref EC2SecurityGroup
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: 0.0.0.0/0
-          Description: HTTPS for Lambda invoke API / ECR / CloudWatch
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-lambda-sg'
-        - Key: Project
-          Value: !Ref ProjectName
-
-  # ---- Worker Lambda Security Group ---------------------------------------
-  WorkerLambdaSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Lambda sme-worker - allows outbound to EC2 (Dragonfly + PG)
-      VpcId: !Ref VPC
-      SecurityGroupEgress:
-        - IpProtocol: tcp
-          FromPort: 6379
-          ToPort: 6379
-          Description: Dragonfly on EC2
-          DestinationSecurityGroupId: !Ref EC2SecurityGroup
-        - IpProtocol: tcp
-          FromPort: 5432
-          ToPort: 5432
-          Description: PostgreSQL on EC2
-          DestinationSecurityGroupId: !Ref EC2SecurityGroup
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: 0.0.0.0/0
-          Description: HTTPS for ECR / CloudWatch
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-worker-lambda-sg'
-        - Key: Project
-          Value: !Ref ProjectName
-
-  # ---- EC2 Security Group -------------------------------------------------
-  EC2SecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: EC2 sme backend - Dragonfly PostgreSQL SSH
-      VpcId: !Ref VPC
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: !Ref SSHCidr
-          Description: SSH access
-      SecurityGroupEgress:
-        - IpProtocol: -1
-          CidrIp: 0.0.0.0/0
-          Description: All outbound (for package installs, ECR, etc.)
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-ec2-sg'
-        - Key: Project
-          Value: !Ref ProjectName
-
-  # Allow Gateway Lambda -> Dragonfly (6379)
-  EC2IngressDragonfly:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref EC2SecurityGroup
-      IpProtocol: tcp
-      FromPort: 6379
-      ToPort: 6379
-      SourceSecurityGroupId: !Ref LambdaSecurityGroup
-      Description: Dragonfly from Gateway Lambda
-
-  # Allow Gateway Lambda -> PostgreSQL (5432) - not needed for gateway but useful
-  EC2IngressPostgres:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref EC2SecurityGroup
-      IpProtocol: tcp
-      FromPort: 5432
-      ToPort: 5432
-      SourceSecurityGroupId: !Ref LambdaSecurityGroup
-      Description: PostgreSQL from Gateway Lambda
-
-  # Allow Worker Lambda -> Dragonfly (6379)
-  EC2IngressDragonflyWorker:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref EC2SecurityGroup
-      IpProtocol: tcp
-      FromPort: 6379
-      ToPort: 6379
-      SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
-      Description: Dragonfly from Worker Lambda
-
-  # Allow Worker Lambda -> PostgreSQL (5432)
-  EC2IngressPostgresWorker:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref EC2SecurityGroup
-      IpProtocol: tcp
-      FromPort: 5432
-      ToPort: 5432
-      SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
-      Description: PostgreSQL from Worker Lambda
 
   # =========================================================================
   # IAM - EC2 Instance Profile
@@ -453,7 +201,7 @@ Resources:
       IamInstanceProfile: !Ref EC2InstanceProfile
       SubnetId: !Ref PublicSubnetA
       SecurityGroupIds:
-        - !Ref EC2SecurityGroup
+        - !Ref EC2SecurityGroupId
       BlockDeviceMappings:
         - DeviceName: /dev/xvda
           Ebs:
@@ -631,7 +379,6 @@ Resources:
 
   ElasticIP:
     Type: AWS::EC2::EIP
-    DependsOn: VPCGatewayAttachment
     Properties:
       Domain: vpc
       InstanceId: !Ref EC2Instance
@@ -657,30 +404,17 @@ Resources:
       RetentionInDays: 14
 
   # =========================================================================
-  # ECR Repository — Worker Lambda image
-  # =========================================================================
-  WorkerECRRepository:
-    Type: AWS::ECR::Repository
-    Properties:
-      RepositoryName: !Sub '${ProjectName}-worker'
-      ImageScanningConfiguration:
-        ScanOnPush: true
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-
-  # =========================================================================
   # Lambda Function - sme-gateway via AWS Lambda Web Adapter
+  # Uses AWS::Serverless::Function with PackageType: Image
+  # SAM builds from infra/Dockerfile.gateway with DockerContext = .. (project root)
   # =========================================================================
   GatewayLambda:
-    Type: AWS::Lambda::Function
+    Type: AWS::Serverless::Function
     DependsOn: LambdaLogGroup
     Properties:
       FunctionName: !Sub '${ProjectName}-gateway'
       Description: sme-gateway HTTP handler via AWS Lambda Web Adapter (zero code changes)
       PackageType: Image
-      Code:
-        ImageUri: !Ref GatewayImageUri
       Architectures:
         - arm64
       MemorySize: 512
@@ -692,7 +426,7 @@ Resources:
           - !Ref PrivateSubnetA
           - !Ref PrivateSubnetB
         SecurityGroupIds:
-          - !Ref LambdaSecurityGroup
+          - !Ref LambdaSecurityGroupId
       Environment:
         Variables:
           # Lambda Web Adapter settings
@@ -707,8 +441,11 @@ Resources:
           ORDER_DISPATCH_MODE: lambda
           WORKER_LAMBDA_ARN: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-worker'
       Tags:
-        - Key: Project
-          Value: !Ref ProjectName
+        Project: !Ref ProjectName
+    Metadata:
+      DockerTag: !Sub '${ProjectName}-gateway'
+      DockerContext: ../..
+      Dockerfile: infra/Dockerfile.gateway
 
   LambdaPermissionAPIGW:
     Type: AWS::Lambda::Permission
@@ -719,38 +456,41 @@ Resources:
       SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
 
   # =========================================================================
-  # Worker Lambda Function — sme-worker-lambda (native lambda_runtime)
+  # Worker Lambda Function - sme-worker-lambda (native lambda_runtime)
+  # Uses AWS::Serverless::Function with PackageType: Image
+  # SAM builds from infra/Dockerfile.worker with DockerContext = .. (project root)
   # =========================================================================
   WorkerLambda:
-    Type: AWS::Lambda::Function
+    Type: AWS::Serverless::Function
     DependsOn: WorkerLambdaLogGroup
     Properties:
       FunctionName: !Sub '${ProjectName}-worker'
-      Description: sme-worker-lambda — order matching, PG persistence, cache updates
+      Description: sme-worker-lambda - order matching, PG persistence, cache updates
       PackageType: Image
-      Code:
-        ImageUri: !Ref WorkerImageUri
       Architectures:
         - arm64
       # 1024MB: needs headroom for PG + Dragonfly connection pools and match logic
       MemorySize: 1024
       Timeout: 30
-      # No ReservedConcurrentExecutions — scales freely with order volume
+      # No ReservedConcurrentExecutions - scales freely with order volume
       Role: !GetAtt LambdaRole.Arn
       VpcConfig:
         SubnetIds:
           - !Ref PrivateSubnetA
           - !Ref PrivateSubnetB
         SecurityGroupIds:
-          - !Ref WorkerLambdaSecurityGroup
+          - !Ref WorkerLambdaSecurityGroupId
       Environment:
         Variables:
           DRAGONFLY_URL: !Sub 'redis://${EC2Instance.PrivateIp}:6379'
           DATABASE_URL: !Sub 'postgres://sme:${DBPassword}@${EC2Instance.PrivateIp}:5432/matching_engine'
           RUST_LOG: info
       Tags:
-        - Key: Project
-          Value: !Ref ProjectName
+        Project: !Ref ProjectName
+    Metadata:
+      DockerTag: !Sub '${ProjectName}-worker'
+      DockerContext: ../..
+      Dockerfile: infra/Dockerfile.worker
 
   # =========================================================================
   # API Gateway HTTP API (v2 - cheapest: $1/million requests)
@@ -814,23 +554,11 @@ Outputs:
   ApiGatewayUrl:
     Description: API Gateway HTTP API invoke URL
     Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
-    Export:
-      Name: !Sub '${ProjectName}-api-url'
 
   EC2PublicIP:
     Description: EC2 Elastic IP (SSH target)
     Value: !Ref ElasticIP
-    Export:
-      Name: !Sub '${ProjectName}-ec2-ip'
 
   EC2PrivateIP:
     Description: EC2 private IP (used by Lambda for Dragonfly)
     Value: !GetAtt EC2Instance.PrivateIp
-    Export:
-      Name: !Sub '${ProjectName}-ec2-private-ip'
-
-  VpcId:
-    Description: VPC ID
-    Value: !Ref VPC
-    Export:
-      Name: !Sub '${ProjectName}-vpc-id'

@@ -1,0 +1,326 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Serverless Matching Engine - Network Stack
+  VPC, public/private subnets, route tables, IGW, security groups.
+  NO NAT Gateway (Lambda only needs to reach EC2 inside VPC + HTTPS for ECR via VPC endpoint or 0.0.0.0/0 via SG).
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: serverless-matching-engine
+    Description: Used for resource naming and tagging.
+
+  SSHCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed to SSH into EC2. Restrict to your IP for security.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # =========================================================================
+  # VPC
+  # =========================================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ---- Public Subnets (EC2 lives here) ------------------------------------
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-a'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-b'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---- Private Subnets (Lambda lives here - no internet egress needed) ----
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-a'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-b'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---- Route Tables -------------------------------------------------------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-rt'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # Private subnets use the default (local-only) route table - no internet egress.
+  # Lambda only needs to reach EC2 inside the VPC.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-rt'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # =========================================================================
+  # Security Groups
+  # =========================================================================
+
+  # ---- EC2 Security Group (created first - Lambda SGs reference it) -------
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 sme backend - Dragonfly PostgreSQL SSH
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHCidr
+          Description: SSH access
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound (for package installs, ECR, etc.)
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ec2-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---- Lambda Security Group (Gateway) ------------------------------------
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda sme-gateway - allows outbound to EC2 and HTTPS
+      VpcId: !Ref VPC
+      # No ingress rules needed (Lambda is invoked by API Gateway, not via network)
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          Description: Dragonfly on EC2
+          DestinationSecurityGroupId: !Ref EC2SecurityGroup
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS for Lambda invoke API / ECR / CloudWatch
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---- Worker Lambda Security Group ---------------------------------------
+  WorkerLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda sme-worker - allows outbound to EC2 (Dragonfly + PG)
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          Description: Dragonfly on EC2
+          DestinationSecurityGroupId: !Ref EC2SecurityGroup
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          Description: PostgreSQL on EC2
+          DestinationSecurityGroupId: !Ref EC2SecurityGroup
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS for ECR / CloudWatch
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-worker-lambda-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---- EC2 ingress rules from Lambda SGs (added separately to avoid circular refs) ----
+
+  # Allow Gateway Lambda -> Dragonfly (6379)
+  EC2IngressDragonfly:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Dragonfly from Gateway Lambda
+
+  # Allow Gateway Lambda -> PostgreSQL (5432)
+  EC2IngressPostgres:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: PostgreSQL from Gateway Lambda
+
+  # Allow Worker Lambda -> Dragonfly (6379)
+  EC2IngressDragonflyWorker:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
+      Description: Dragonfly from Worker Lambda
+
+  # Allow Worker Lambda -> PostgreSQL (5432)
+  EC2IngressPostgresWorker:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
+      Description: PostgreSQL from Worker Lambda
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+
+  PublicSubnetA:
+    Description: Public subnet A ID
+    Value: !Ref PublicSubnetA
+
+  PublicSubnetB:
+    Description: Public subnet B ID
+    Value: !Ref PublicSubnetB
+
+  PrivateSubnetA:
+    Description: Private subnet A ID
+    Value: !Ref PrivateSubnetA
+
+  PrivateSubnetB:
+    Description: Private subnet B ID
+    Value: !Ref PrivateSubnetB
+
+  EC2SecurityGroupId:
+    Description: EC2 security group ID
+    Value: !Ref EC2SecurityGroup
+
+  LambdaSecurityGroupId:
+    Description: Gateway Lambda security group ID
+    Value: !Ref LambdaSecurityGroup
+
+  WorkerLambdaSecurityGroupId:
+    Description: Worker Lambda security group ID
+    Value: !Ref WorkerLambdaSecurityGroup

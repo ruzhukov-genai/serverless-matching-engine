@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Serverless Matching Engine - Frontend Stack
-  S3 (private) + CloudFront (OAC) with /api/* forwarded to API Gateway.
+  S3 (private) + CloudFront (OAC) with /api/* and /ws/* forwarded to API Gateway.
   PriceClass_100 (US + EU) for cheapest CDN.
 
 # ---------------------------------------------------------------------------
@@ -18,7 +18,7 @@ Parameters:
     Description: >
       API Gateway HTTP API URL (without trailing slash), e.g.
       https://abc123.execute-api.us-east-1.amazonaws.com
-      Import from backend stack or enter manually.
+      Passed from root template via backend stack output.
 
   CustomDomain:
     Type: String
@@ -207,23 +207,15 @@ Outputs:
   CloudFrontUrl:
     Description: CloudFront distribution URL
     Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
-    Export:
-      Name: !Sub '${ProjectName}-cf-url'
 
   CloudFrontDistributionId:
     Description: CloudFront distribution ID (needed for cache invalidation)
     Value: !Ref CloudFrontDistribution
-    Export:
-      Name: !Sub '${ProjectName}-cf-id'
 
   FrontendBucketName:
     Description: S3 bucket name for frontend files
     Value: !Ref FrontendBucket
-    Export:
-      Name: !Sub '${ProjectName}-frontend-bucket'
 
   FrontendBucketArn:
     Description: S3 bucket ARN
     Value: !GetAtt FrontendBucket.Arn
-    Export:
-      Name: !Sub '${ProjectName}-frontend-bucket-arn'

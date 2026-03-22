@@ -1,9 +1,21 @@
 version = 0.1
 
-[default.deploy.parameters]
-stack_name = "serverless-matching-engine-backend"
+[default.global.parameters]
+stack_name = "serverless-matching-engine"
 region = "us-east-1"
-capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+
+[default.build.parameters]
+# Build all Lambda image functions using Docker
+use_container = false
+
+[default.deploy.parameters]
+stack_name = "serverless-matching-engine"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND"
 confirm_changeset = false
 resolve_s3 = true
+resolve_image_repos = true
 no_fail_on_empty_changeset = true
+# SAM uploads nested stack templates to S3 automatically.
+# Override parameters on first deploy or set them here:
+# parameter_overrides = "KeyPairName=my-key DBPassword=secret123"

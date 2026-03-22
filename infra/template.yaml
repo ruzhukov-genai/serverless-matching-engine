@@ -1,8 +1,18 @@
 AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
 Description: >
-  Serverless Matching Engine - Backend Stack
-  EC2 t4g.micro (Dragonfly + PostgreSQL + sme-api) + Lambda (sme-gateway) + API Gateway HTTP API
-  Cheapest possible: EC2 in public subnet, Lambda in private subnets, NO NAT Gateway.
+  Serverless Matching Engine — Single SAM stack.
+  Network (VPC/subnets/SGs) + Backend (EC2/Lambda/APIGW) + Frontend (S3/CloudFront).
+  Deploy: cd infra && sam build --use-container && sam deploy
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+Globals:
+  Function:
+    Timeout: 30
+    Architectures:
+      - arm64
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -21,29 +31,8 @@ Parameters:
   SSHCidr:
     Type: String
     Default: 0.0.0.0/0
-    Description: CIDR allowed to SSH into EC2. Restrict to your IP for security.
+    Description: CIDR allowed to SSH into EC2.
     AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
-
-  GatewayImageUri:
-    Type: String
-    Description: >
-      ECR image URI for sme-gateway container, e.g.
-      123456789.dkr.ecr.us-east-1.amazonaws.com/sme-gateway:latest
-    Default: PLACEHOLDER_UPDATE_AFTER_ECR_PUSH
-
-  WorkerImageUri:
-    Type: String
-    Description: >
-      ECR image URI for sme-worker-lambda container, e.g.
-      123456789.dkr.ecr.us-east-1.amazonaws.com/sme-worker:latest
-    Default: PLACEHOLDER_UPDATE_AFTER_ECR_PUSH
-
-  SmeApiBinaryS3Uri:
-    Type: String
-    Description: >
-      S3 URI for the sme-api ARM binary, e.g. s3://my-bucket/sme-api.
-      Leave empty to skip download (manual install).
-    Default: ''
 
   DBPassword:
     Type: String
@@ -51,10 +40,33 @@ Parameters:
     Default: sme_prod_change_me
     Description: PostgreSQL password for the sme user.
 
+  SmeApiBinaryS3Uri:
+    Type: String
+    Default: ''
+    Description: S3 URI for sme-api ARM binary. Leave empty for manual install.
+
   AllowedCorsOrigin:
     Type: String
     Default: '*'
-    Description: CORS allowed origin for API Gateway. Use your CloudFront URL in production.
+    Description: CORS allowed origin for API Gateway.
+
+  CustomDomain:
+    Type: String
+    Default: ''
+    Description: Optional CloudFront custom domain.
+
+  AcmCertificateArn:
+    Type: String
+    Default: ''
+    Description: ACM certificate ARN for custom domain (us-east-1).
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  HasCustomDomain: !And
+    - !Not [!Equals [!Ref CustomDomain, '']]
+    - !Not [!Equals [!Ref AcmCertificateArn, '']]
 
 # ---------------------------------------------------------------------------
 # Mappings - Amazon Linux 2023 ARM64 AMIs per region
@@ -62,25 +74,14 @@ Parameters:
 Mappings:
   AmazonLinux2023ArmAmi:
     us-east-1:
-      AMI: ami-0a9eef82780017c25   # AL2023 arm64 us-east-1
+      AMI: ami-0a9eef82780017c25
     us-east-2:
-      AMI: ami-09b7b6f76e4b19aca   # AL2023 arm64 us-east-2
-    us-west-1:
-      AMI: ami-0b3c63d1b69e89b2c   # AL2023 arm64 us-west-1
+      AMI: ami-09b7b6f76e4b19aca
     us-west-2:
-      AMI: ami-03f65b8614a860c29   # AL2023 arm64 us-west-2
+      AMI: ami-03f65b8614a860c29
     eu-west-1:
-      AMI: ami-0a2e4b86924cbb8d5   # AL2023 arm64 eu-west-1
-    eu-central-1:
-      AMI: ami-065deacbcaac64cf2   # AL2023 arm64 eu-central-1
-    ap-southeast-1:
-      AMI: ami-06c4be2792f419b7b   # AL2023 arm64 ap-southeast-1
-    ap-northeast-1:
-      AMI: ami-0dcce5b7b22f83e5a   # AL2023 arm64 ap-northeast-1
+      AMI: ami-0a2e4b86924cbb8d5
 
-# ---------------------------------------------------------------------------
-# Resources
-# ---------------------------------------------------------------------------
 Resources:
 
   # =========================================================================
@@ -226,11 +227,33 @@ Resources:
   # Security Groups
   # =========================================================================
 
+  # ---- EC2 Security Group (created first - Lambda SGs reference it) -------
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 sme backend - Dragonfly PostgreSQL SSH
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHCidr
+          Description: SSH access
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound (for package installs, ECR, etc.)
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ec2-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+
   # ---- Lambda Security Group (Gateway) ------------------------------------
   LambdaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Lambda sme-gateway - allows outbound to EC2 and Lambda endpoint
+      GroupDescription: Lambda sme-gateway - allows outbound to EC2 and HTTPS
       VpcId: !Ref VPC
       # No ingress rules needed (Lambda is invoked by API Gateway, not via network)
       SecurityGroupEgress:
@@ -278,27 +301,7 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
 
-  # ---- EC2 Security Group -------------------------------------------------
-  EC2SecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: EC2 sme backend - Dragonfly PostgreSQL SSH
-      VpcId: !Ref VPC
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: !Ref SSHCidr
-          Description: SSH access
-      SecurityGroupEgress:
-        - IpProtocol: -1
-          CidrIp: 0.0.0.0/0
-          Description: All outbound (for package installs, ECR, etc.)
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-ec2-sg'
-        - Key: Project
-          Value: !Ref ProjectName
+  # ---- EC2 ingress rules from Lambda SGs (added separately to avoid circular refs) ----
 
   # Allow Gateway Lambda -> Dragonfly (6379)
   EC2IngressDragonfly:
@@ -311,7 +314,7 @@ Resources:
       SourceSecurityGroupId: !Ref LambdaSecurityGroup
       Description: Dragonfly from Gateway Lambda
 
-  # Allow Gateway Lambda -> PostgreSQL (5432) - not needed for gateway but useful
+  # Allow Gateway Lambda -> PostgreSQL (5432)
   EC2IngressPostgres:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
@@ -344,7 +347,10 @@ Resources:
       SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
       Description: PostgreSQL from Worker Lambda
 
-  # =========================================================================
+
+  # === Backend Resources ===
+
+# =========================================================================
   # IAM - EC2 Instance Profile
   # =========================================================================
   EC2Role:
@@ -631,7 +637,6 @@ Resources:
 
   ElasticIP:
     Type: AWS::EC2::EIP
-    DependsOn: VPCGatewayAttachment
     Properties:
       Domain: vpc
       InstanceId: !Ref EC2Instance
@@ -657,32 +662,17 @@ Resources:
       RetentionInDays: 14
 
   # =========================================================================
-  # ECR Repository ? Worker Lambda image
-  # =========================================================================
-  WorkerECRRepository:
-    Type: AWS::ECR::Repository
-    Properties:
-      RepositoryName: !Sub '${ProjectName}-worker'
-      ImageScanningConfiguration:
-        ScanOnPush: true
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-
-  # =========================================================================
   # Lambda Function - sme-gateway via AWS Lambda Web Adapter
+  # Uses AWS::Serverless::Function with PackageType: Image
+  # SAM builds from infra/Dockerfile.gateway with DockerContext = .. (project root)
   # =========================================================================
   GatewayLambda:
-    Type: AWS::Lambda::Function
+    Type: AWS::Serverless::Function
     DependsOn: LambdaLogGroup
     Properties:
       FunctionName: !Sub '${ProjectName}-gateway'
       Description: sme-gateway HTTP handler via AWS Lambda Web Adapter (zero code changes)
       PackageType: Image
-      Code:
-        ImageUri: !Ref GatewayImageUri
-      Architectures:
-        - arm64
       MemorySize: 512
       Timeout: 30
       ReservedConcurrentExecutions: 10
@@ -707,8 +697,11 @@ Resources:
           ORDER_DISPATCH_MODE: lambda
           WORKER_LAMBDA_ARN: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-worker'
       Tags:
-        - Key: Project
-          Value: !Ref ProjectName
+        Project: !Ref ProjectName
+    Metadata:
+      DockerTag: !Sub '${ProjectName}-gateway'
+      DockerContext: ..
+      Dockerfile: infra/Dockerfile.gateway
 
   LambdaPermissionAPIGW:
     Type: AWS::Lambda::Permission
@@ -719,23 +712,21 @@ Resources:
       SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
 
   # =========================================================================
-  # Worker Lambda Function ? sme-worker-lambda (native lambda_runtime)
+  # Worker Lambda Function - sme-worker-lambda (native lambda_runtime)
+  # Uses AWS::Serverless::Function with PackageType: Image
+  # SAM builds from infra/Dockerfile.worker with DockerContext = .. (project root)
   # =========================================================================
   WorkerLambda:
-    Type: AWS::Lambda::Function
+    Type: AWS::Serverless::Function
     DependsOn: WorkerLambdaLogGroup
     Properties:
       FunctionName: !Sub '${ProjectName}-worker'
-      Description: sme-worker-lambda ? order matching, PG persistence, cache updates
+      Description: sme-worker-lambda - order matching, PG persistence, cache updates
       PackageType: Image
-      Code:
-        ImageUri: !Ref WorkerImageUri
-      Architectures:
-        - arm64
       # 1024MB: needs headroom for PG + Dragonfly connection pools and match logic
       MemorySize: 1024
       Timeout: 30
-      # No ReservedConcurrentExecutions ? scales freely with order volume
+      # No ReservedConcurrentExecutions - scales freely with order volume
       Role: !GetAtt LambdaRole.Arn
       VpcConfig:
         SubnetIds:
@@ -749,8 +740,11 @@ Resources:
           DATABASE_URL: !Sub 'postgres://sme:${DBPassword}@${EC2Instance.PrivateIp}:5432/matching_engine'
           RUST_LOG: info
       Tags:
-        - Key: Project
-          Value: !Ref ProjectName
+        Project: !Ref ProjectName
+    Metadata:
+      DockerTag: !Sub '${ProjectName}-worker'
+      DockerContext: ..
+      Dockerfile: infra/Dockerfile.worker
 
   # =========================================================================
   # API Gateway HTTP API (v2 - cheapest: $1/million requests)
@@ -806,6 +800,160 @@ Resources:
       Tags:
         Project: !Ref ProjectName
 
+  # === Frontend Resources ===
+
+# =========================================================================
+  # S3 Bucket - Static Frontend Files
+  # =========================================================================
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-frontend-${AWS::AccountId}'
+      # Fully private - CloudFront OAC handles access
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =========================================================================
+  # CloudFront Origin Access Control (OAC) - modern replacement for OAI
+  # =========================================================================
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-oac'
+        Description: OAC for SME frontend S3 bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # =========================================================================
+  # S3 Bucket Policy - allow CloudFront OAC only
+  # =========================================================================
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${FrontendBucket}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub >-
+                  arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+
+  # =========================================================================
+  # CloudFront Distribution
+  # =========================================================================
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${ProjectName} frontend + API proxy'
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100   # US, Canada, Europe (cheapest)
+
+        # ---- Custom domain (optional) ------------------------------------
+        Aliases: !If
+          - HasCustomDomain
+          - [!Ref CustomDomain]
+          - !Ref 'AWS::NoValue'
+        ViewerCertificate: !If
+          - HasCustomDomain
+          - AcmCertificateArn: !Ref AcmCertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+
+        # ---- Origins -----------------------------------------------------
+        Origins:
+          # Origin 1: S3 (static files)
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''   # Empty - we use OAC not OAI
+            OriginAccessControlId: !Ref CloudFrontOAC
+
+          # Origin 2: API Gateway (API requests)
+          - Id: ApiGatewayOrigin
+            DomainName: !Sub '${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+
+        # ---- Cache Behaviors ---------------------------------------------
+        # /api/* -> API Gateway, no caching
+        CacheBehaviors:
+          - PathPattern: '/api/*'
+            TargetOriginId: ApiGatewayOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            # Managed-CachingDisabled policy
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            # Managed-AllViewer origin request policy (forwards all headers/qs/cookies)
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            Compress: true
+
+          # /ws/* -> API Gateway, no caching (WebSocket future path)
+          - PathPattern: '/ws/*'
+            TargetOriginId: ApiGatewayOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            Compress: false
+
+        # Default behavior: S3 static files, cached 24h
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed-CachingOptimized policy (86400s default, 31536000s max)
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+        # ---- Custom error pages for SPA ----------------------------------
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
 # ---------------------------------------------------------------------------
 # Outputs
 # ---------------------------------------------------------------------------
@@ -814,24 +962,27 @@ Outputs:
   ApiGatewayUrl:
     Description: API Gateway HTTP API invoke URL
     Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
-    Export:
-      Name: !Sub '${ProjectName}-api-url'
 
   EC2PublicIP:
     Description: EC2 Elastic IP (SSH target)
     Value: !Ref ElasticIP
-    Export:
-      Name: !Sub '${ProjectName}-ec2-ip'
 
   EC2PrivateIP:
     Description: EC2 private IP (used by Lambda for Dragonfly)
     Value: !GetAtt EC2Instance.PrivateIp
-    Export:
-      Name: !Sub '${ProjectName}-ec2-private-ip'
 
-  VpcId:
-    Description: VPC ID
-    Value: !Ref VPC
-    Export:
-      Name: !Sub '${ProjectName}-vpc-id'
+  CloudFrontUrl:
+    Description: CloudFront distribution URL
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
 
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID (needed for cache invalidation)
+    Value: !Ref CloudFrontDistribution
+
+  FrontendBucketName:
+    Description: S3 bucket name for frontend files
+    Value: !Ref FrontendBucket
+
+  FrontendBucketArn:
+    Description: S3 bucket ARN
+    Value: !GetAtt FrontendBucket.Arn

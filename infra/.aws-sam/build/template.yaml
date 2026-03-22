@@ -1,20 +1,18 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: 'Serverless Matching Engine - Backend Stack (SAM) EC2 t4g.micro (Dragonfly
-  + PostgreSQL + sme-api worker) Lambda container (sme-gateway via AWS Lambda Web
-  Adapter) API Gateway HTTP API (cheapest)
-
-  '
+Description: "Serverless Matching Engine \u2014 Single SAM stack. Network (VPC/subnets/SGs)\
+  \ + Backend (EC2/Lambda/APIGW) + Frontend (S3/CloudFront). Deploy: cd infra && sam\
+  \ build --use-container && sam deploy\n"
 Globals:
   Function:
     Timeout: 30
-    MemorySize: 512
     Architectures:
     - arm64
 Parameters:
   ProjectName:
     Type: String
     Default: serverless-matching-engine
+    Description: Used for resource naming and tagging.
   KeyPairName:
     Type: AWS::EC2::KeyPair::KeyName
     Description: EC2 key pair for SSH access.
@@ -23,23 +21,40 @@ Parameters:
     Default: '0.0.0.0/0'
     Description: CIDR allowed to SSH into EC2.
     AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
-  SmeApiBinaryS3Uri:
-    Type: String
-    Default: ''
-    Description: S3 URI for sme-api ARM binary. Leave empty for manual install.
   DBPassword:
     Type: String
     NoEcho: true
     Default: sme_prod_change_me
     Description: PostgreSQL password for the sme user.
-  GatewayImageUri:
+  SmeApiBinaryS3Uri:
     Type: String
-    Description: ECR image URI for the Gateway Lambda function.
-  WorkerImageUri:
+    Default: ''
+    Description: S3 URI for sme-api ARM binary. Leave empty for manual install.
+  AllowedCorsOrigin:
     Type: String
-    Description: ECR image URI for the Worker Lambda function.
+    Default: '*'
+    Description: CORS allowed origin for API Gateway.
+  CustomDomain:
+    Type: String
+    Default: ''
+    Description: Optional CloudFront custom domain.
+  AcmCertificateArn:
+    Type: String
+    Default: ''
+    Description: ACM certificate ARN for custom domain (us-east-1).
+Conditions:
+  HasCustomDomain:
+    Fn::And:
+    - Fn::Not:
+      - Fn::Equals:
+        - Ref: CustomDomain
+        - ''
+    - Fn::Not:
+      - Fn::Equals:
+        - Ref: AcmCertificateArn
+        - ''
 Mappings:
-  RegionAMI:
+  AmazonLinux2023ArmAmi:
     us-east-1:
       AMI: ami-0a9eef82780017c25
     us-east-2:
@@ -59,8 +74,19 @@ Resources:
       - Key: Name
         Value:
           Fn::Sub: ${ProjectName}-vpc
+      - Key: Project
+        Value:
+          Ref: ProjectName
   InternetGateway:
     Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${ProjectName}-igw
+      - Key: Project
+        Value:
+          Ref: ProjectName
   VPCGatewayAttachment:
     Type: AWS::EC2::VPCGatewayAttachment
     Properties:
@@ -83,6 +109,9 @@ Resources:
       - Key: Name
         Value:
           Fn::Sub: ${ProjectName}-public-a
+      - Key: Project
+        Value:
+          Ref: ProjectName
   PublicSubnetB:
     Type: AWS::EC2::Subnet
     Properties:
@@ -98,6 +127,9 @@ Resources:
       - Key: Name
         Value:
           Fn::Sub: ${ProjectName}-public-b
+      - Key: Project
+        Value:
+          Ref: ProjectName
   PrivateSubnetA:
     Type: AWS::EC2::Subnet
     Properties:
@@ -113,6 +145,9 @@ Resources:
       - Key: Name
         Value:
           Fn::Sub: ${ProjectName}-private-a
+      - Key: Project
+        Value:
+          Ref: ProjectName
   PrivateSubnetB:
     Type: AWS::EC2::Subnet
     Properties:
@@ -128,11 +163,21 @@ Resources:
       - Key: Name
         Value:
           Fn::Sub: ${ProjectName}-private-b
+      - Key: Project
+        Value:
+          Ref: ProjectName
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId:
         Ref: VPC
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${ProjectName}-public-rt
+      - Key: Project
+        Value:
+          Ref: ProjectName
   PublicRoute:
     Type: AWS::EC2::Route
     DependsOn: VPCGatewayAttachment
@@ -142,14 +187,14 @@ Resources:
       DestinationCidrBlock: '0.0.0.0/0'
       GatewayId:
         Ref: InternetGateway
-  PublicSubnetART:
+  PublicSubnetARouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId:
         Ref: PublicSubnetA
       RouteTableId:
         Ref: PublicRouteTable
-  PublicSubnetBRT:
+  PublicSubnetBRouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId:
@@ -161,14 +206,21 @@ Resources:
     Properties:
       VpcId:
         Ref: VPC
-  PrivateSubnetART:
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${ProjectName}-private-rt
+      - Key: Project
+        Value:
+          Ref: ProjectName
+  PrivateSubnetARouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId:
         Ref: PrivateSubnetA
       RouteTableId:
         Ref: PrivateRouteTable
-  PrivateSubnetBRT:
+  PrivateSubnetBRouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId:
@@ -178,7 +230,7 @@ Resources:
   EC2SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: EC2 backend - Dragonfly PostgreSQL SSH
+      GroupDescription: EC2 sme backend - Dragonfly PostgreSQL SSH
       VpcId:
         Ref: VPC
       SecurityGroupIngress:
@@ -187,28 +239,74 @@ Resources:
         ToPort: 22
         CidrIp:
           Ref: SSHCidr
-        Description: SSH
+        Description: SSH access
       SecurityGroupEgress:
       - IpProtocol: -1
         CidrIp: '0.0.0.0/0'
+        Description: All outbound (for package installs, ECR, etc.)
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${ProjectName}-ec2-sg
+      - Key: Project
+        Value:
+          Ref: ProjectName
   LambdaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Lambda gateway - outbound to EC2 only
+      GroupDescription: Lambda sme-gateway - allows outbound to EC2 and HTTPS
       VpcId:
         Ref: VPC
       SecurityGroupEgress:
       - IpProtocol: tcp
         FromPort: 6379
         ToPort: 6379
+        Description: Dragonfly on EC2
         DestinationSecurityGroupId:
           Ref: EC2SecurityGroup
-        Description: Dragonfly
       - IpProtocol: tcp
         FromPort: 443
         ToPort: 443
         CidrIp: '0.0.0.0/0'
-        Description: HTTPS for CloudWatch
+        Description: HTTPS for Lambda invoke API / ECR / CloudWatch
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${ProjectName}-lambda-sg
+      - Key: Project
+        Value:
+          Ref: ProjectName
+  WorkerLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda sme-worker - allows outbound to EC2 (Dragonfly + PG)
+      VpcId:
+        Ref: VPC
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 6379
+        ToPort: 6379
+        Description: Dragonfly on EC2
+        DestinationSecurityGroupId:
+          Ref: EC2SecurityGroup
+      - IpProtocol: tcp
+        FromPort: 5432
+        ToPort: 5432
+        Description: PostgreSQL on EC2
+        DestinationSecurityGroupId:
+          Ref: EC2SecurityGroup
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: '0.0.0.0/0'
+        Description: HTTPS for ECR / CloudWatch
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${ProjectName}-worker-lambda-sg
+      - Key: Project
+        Value:
+          Ref: ProjectName
   EC2IngressDragonfly:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
@@ -219,7 +317,7 @@ Resources:
       ToPort: 6379
       SourceSecurityGroupId:
         Ref: LambdaSecurityGroup
-      Description: Dragonfly from Lambda
+      Description: Dragonfly from Gateway Lambda
   EC2IngressPostgres:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
@@ -230,10 +328,34 @@ Resources:
       ToPort: 5432
       SourceSecurityGroupId:
         Ref: LambdaSecurityGroup
-      Description: PostgreSQL from Lambda
+      Description: PostgreSQL from Gateway Lambda
+  EC2IngressDragonflyWorker:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId:
+        Ref: EC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId:
+        Ref: WorkerLambdaSecurityGroup
+      Description: Dragonfly from Worker Lambda
+  EC2IngressPostgresWorker:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId:
+        Ref: EC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId:
+        Ref: WorkerLambdaSecurityGroup
+      Description: PostgreSQL from Worker Lambda
   EC2Role:
     Type: AWS::IAM::Role
     Properties:
+      RoleName:
+        Fn::Sub: ${ProjectName}-ec2-role
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -244,12 +366,24 @@ Resources:
       ManagedPolicyArns:
       - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
       Policies:
-      - PolicyName: S3Download
+      - PolicyName: ECRPull
         PolicyDocument:
           Version: '2012-10-17'
           Statement:
           - Effect: Allow
-            Action: s3:GetObject
+            Action:
+            - ecr:GetAuthorizationToken
+            - ecr:BatchCheckLayerAvailability
+            - ecr:GetDownloadUrlForLayer
+            - ecr:BatchGetImage
+            Resource: '*'
+      - PolicyName: S3BinaryDownload
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetObject
             Resource: arn:aws:s3:::*
       - PolicyName: CloudWatchLogs
         PolicyDocument:
@@ -261,18 +395,63 @@ Resources:
             - logs:CreateLogStream
             - logs:PutLogEvents
             Resource: arn:aws:logs:*:*:*
+      Tags:
+      - Key: Project
+        Value:
+          Ref: ProjectName
   EC2InstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
+      InstanceProfileName:
+        Fn::Sub: ${ProjectName}-ec2-profile
       Roles:
       - Ref: EC2Role
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: ${ProjectName}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+      - PolicyName: ECRImageAccess
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - ecr:GetAuthorizationToken
+            - ecr:BatchCheckLayerAvailability
+            - ecr:GetDownloadUrlForLayer
+            - ecr:BatchGetImage
+            Resource: '*'
+      - PolicyName: InvokeWorkerLambda
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - lambda:InvokeFunction
+            Resource:
+              Fn::Sub: arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-worker
+      Tags:
+      - Key: Project
+        Value:
+          Ref: ProjectName
   EC2Instance:
     Type: AWS::EC2::Instance
     Properties:
       InstanceType: t4g.micro
       ImageId:
         Fn::FindInMap:
-        - RegionAMI
+        - AmazonLinux2023ArmAmi
         - Ref: AWS::Region
         - AMI
       KeyName:
@@ -293,26 +472,31 @@ Resources:
       UserData:
         Fn::Base64:
           Fn::Sub: "#!/bin/bash\nset -euo pipefail\nexec > /var/log/sme-userdata.log\
-            \ 2>&1\necho \"=== SME EC2 Bootstrap ===\"\n\ndnf update -y\ndnf install\
-            \ -y postgresql16 postgresql16-server wget curl tar unzip\n\n# PostgreSQL\
-            \ setup\npostgresql-setup --initdb || true\nsystemctl enable postgresql\n\
-            systemctl start postgresql\n\nsudo -u postgres psql -c \"CREATE USER sme\
-            \ WITH PASSWORD '${DBPassword}';\" || true\nsudo -u postgres psql -c \"\
-            CREATE DATABASE matching_engine OWNER sme;\" || true\nsudo -u postgres\
-            \ psql -d matching_engine -c \"\n  CREATE TABLE IF NOT EXISTS pairs (\n\
-            \    id VARCHAR(20) PRIMARY KEY, base VARCHAR(10) NOT NULL, quote VARCHAR(10)\
-            \ NOT NULL,\n    tick_size DECIMAL NOT NULL, lot_size DECIMAL NOT NULL,\
-            \ min_order_size DECIMAL NOT NULL,\n    max_order_size DECIMAL NOT NULL,\
-            \ price_precision SMALLINT NOT NULL,\n    qty_precision SMALLINT NOT NULL,\
-            \ price_band_pct DECIMAL NOT NULL DEFAULT 0.10,\n    active BOOLEAN NOT\
-            \ NULL DEFAULT true\n  );\n  CREATE TABLE IF NOT EXISTS orders (\n   \
-            \ id UUID PRIMARY KEY, user_id VARCHAR(50) NOT NULL, pair_id VARCHAR(20)\
-            \ NOT NULL REFERENCES pairs(id),\n    side VARCHAR(4) NOT NULL, order_type\
-            \ VARCHAR(10) NOT NULL, tif VARCHAR(3) NOT NULL,\n    price DECIMAL, quantity\
-            \ DECIMAL NOT NULL, remaining DECIMAL NOT NULL,\n    status VARCHAR(20)\
-            \ NOT NULL, stp_mode VARCHAR(20) NOT NULL DEFAULT 'None',\n    version\
-            \ BIGINT NOT NULL DEFAULT 1, sequence BIGSERIAL,\n    created_at TIMESTAMPTZ\
-            \ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n\
+            \ 2>&1\n\necho \"=== SME EC2 Bootstrap ===\"\nexport DB_PASSWORD=\"${DBPassword}\"\
+            \nexport SME_API_S3_URI=\"${SmeApiBinaryS3Uri}\"\nexport PROJECT=\"${ProjectName}\"\
+            \n\n# Download and run the bootstrap script\n# If you have the script\
+            \ in S3, uncomment:\n# aws s3 cp s3://your-bucket/ec2-userdata.sh /tmp/ec2-userdata.sh\n\
+            # bash /tmp/ec2-userdata.sh\n\n# Inline bootstrap (abbreviated - see infra/ec2-userdata.sh\
+            \ for full version)\ndnf update -y\ndnf install -y postgresql16 postgresql16-server\
+            \ wget curl tar unzip\n\n# ----- PostgreSQL setup -----\npostgresql-setup\
+            \ --initdb || true\nsystemctl enable postgresql\nsystemctl start postgresql\n\
+            \nsudo -u postgres psql -c \"CREATE USER sme WITH PASSWORD '${DBPassword}';\"\
+            \ || true\nsudo -u postgres psql -c \"CREATE DATABASE matching_engine\
+            \ OWNER sme;\" || true\nsudo -u postgres psql -d matching_engine -c \"\
+            \n  CREATE TABLE IF NOT EXISTS pairs (\n    id VARCHAR(20) PRIMARY KEY,\
+            \ base VARCHAR(10) NOT NULL, quote VARCHAR(10) NOT NULL,\n    tick_size\
+            \ DECIMAL NOT NULL, lot_size DECIMAL NOT NULL, min_order_size DECIMAL\
+            \ NOT NULL,\n    max_order_size DECIMAL NOT NULL, price_precision SMALLINT\
+            \ NOT NULL,\n    qty_precision SMALLINT NOT NULL, price_band_pct DECIMAL\
+            \ NOT NULL DEFAULT 0.10,\n    active BOOLEAN NOT NULL DEFAULT true\n \
+            \ );\n  CREATE TABLE IF NOT EXISTS orders (\n    id UUID PRIMARY KEY,\
+            \ user_id VARCHAR(50) NOT NULL, pair_id VARCHAR(20) NOT NULL REFERENCES\
+            \ pairs(id),\n    side VARCHAR(4) NOT NULL, order_type VARCHAR(10) NOT\
+            \ NULL, tif VARCHAR(3) NOT NULL,\n    price DECIMAL, quantity DECIMAL\
+            \ NOT NULL, remaining DECIMAL NOT NULL,\n    status VARCHAR(20) NOT NULL,\
+            \ stp_mode VARCHAR(20) NOT NULL DEFAULT 'None',\n    version BIGINT NOT\
+            \ NULL DEFAULT 1, sequence BIGSERIAL,\n    created_at TIMESTAMPTZ NOT\
+            \ NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n\
             \    client_order_id VARCHAR(64)\n  );\n  CREATE INDEX IF NOT EXISTS idx_orders_pair_status\
             \ ON orders(pair_id, status);\n  CREATE INDEX IF NOT EXISTS idx_orders_user\
             \ ON orders(user_id, status);\n  CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_idempotency\
@@ -343,10 +527,11 @@ Resources:
             \ ON CONFLICT DO NOTHING;\n  INSERT INTO balances VALUES ('user-2','ETH',100,0)\
             \ ON CONFLICT DO NOTHING;\n  INSERT INTO balances VALUES ('user-2','SOL',1000,0)\
             \ ON CONFLICT DO NOTHING;\n  INSERT INTO balances VALUES ('user-2','USDT',1000000,0)\
-            \ ON CONFLICT DO NOTHING;\n\" || true\n\nPG_HBA=$(find /var/lib/pgsql\
-            \ -name pg_hba.conf | head -1)\necho \"host matching_engine sme 10.0.0.0/8\
-            \ md5\" >> \"$PG_HBA\"\nsystemctl reload postgresql\n\n# Dragonfly setup\n\
-            DRAGONFLY_VERSION=\"1.14.2\"\nARCH=\"aarch64\"\nwget -q \"https://github.com/dragonflydb/dragonfly/releases/download/v${!DRAGONFLY_VERSION}/dragonfly-${!ARCH}.tar.gz\"\
+            \ ON CONFLICT DO NOTHING;\n\" || true\n\n# Configure pg_hba.conf to allow\
+            \ password auth for sme user\nPG_HBA=$(find /var/lib/pgsql -name pg_hba.conf\
+            \ | head -1)\necho \"host matching_engine sme 10.0.0.0/8 md5\" >> \"$PG_HBA\"\
+            \nsystemctl reload postgresql\n\n# ----- Dragonfly setup -----\nDRAGONFLY_VERSION=\"\
+            1.14.2\"\nARCH=\"aarch64\"\nwget -q \"https://github.com/dragonflydb/dragonfly/releases/download/v${!DRAGONFLY_VERSION}/dragonfly-${!ARCH}.tar.gz\"\
             \ \\\n  -O /tmp/dragonfly.tar.gz\ntar xzf /tmp/dragonfly.tar.gz -C /tmp\n\
             mv /tmp/dragonfly-${!ARCH} /usr/local/bin/dragonfly\nchmod +x /usr/local/bin/dragonfly\n\
             \nuseradd -r -s /bin/false dragonfly || true\nmkdir -p /var/lib/dragonfly\
@@ -354,91 +539,74 @@ Resources:
             \ > /etc/dragonfly/dragonfly.conf << 'DRAGONCFG'\n--bind=0.0.0.0\n--port=6379\n\
             --maxmemory=256mb\n--default_lua_flags=allow-undeclared-keys\n--dir=/var/lib/dragonfly\n\
             --logtostderr\nDRAGONCFG\n\ncat > /etc/systemd/system/dragonfly.service\
-            \ << 'DFUNIT'\n[Unit]\nDescription=Dragonfly\nAfter=network.target\n[Service]\n\
-            User=dragonfly\nExecStart=/usr/local/bin/dragonfly --flagfile=/etc/dragonfly/dragonfly.conf\n\
+            \ << 'DFUNIT'\n[Unit]\nDescription=Dragonfly In-Memory Data Store\nAfter=network.target\n\
+            [Service]\nUser=dragonfly\nExecStart=/usr/local/bin/dragonfly --flagfile=/etc/dragonfly/dragonfly.conf\n\
             Restart=always\nRestartSec=5\nLimitNOFILE=65536\n[Install]\nWantedBy=multi-user.target\n\
             DFUNIT\n\nsystemctl daemon-reload\nsystemctl enable dragonfly\nsystemctl\
-            \ start dragonfly\n\n# sme-api worker\nif [[ -n \"${SmeApiBinaryS3Uri}\"\
+            \ start dragonfly\n\n# ----- sme-api worker -----\nif [[ -n \"${SmeApiBinaryS3Uri}\"\
             \ ]]; then\n  aws s3 cp \"${SmeApiBinaryS3Uri}\" /usr/local/bin/sme-api\n\
-            \  chmod +x /usr/local/bin/sme-api\nelse\n  echo '#!/bin/bash' > /usr/local/bin/sme-api\n\
-            \  echo 'echo \"sme-api not installed\"' >> /usr/local/bin/sme-api\n \
-            \ chmod +x /usr/local/bin/sme-api\nfi\n\ncat > /etc/systemd/system/sme-api.service\
-            \ << APIUNIT\n[Unit]\nDescription=SME API Worker\nAfter=dragonfly.service\
-            \ postgresql.service\nRequires=dragonfly.service postgresql.service\n\
+            \  chmod +x /usr/local/bin/sme-api\nelse\n  echo \"WARNING: SmeApiBinaryS3Uri\
+            \ not set - sme-api will not start automatically.\"\n  echo \"SSH in and\
+            \ deploy manually: scp sme-api ec2-user@<ip>:/usr/local/bin/\"\n  # Create\
+            \ placeholder so service file doesn't fail\n  echo '#!/bin/bash' > /usr/local/bin/sme-api\n\
+            \  echo 'echo \"sme-api binary not installed\"' >> /usr/local/bin/sme-api\n\
+            \  chmod +x /usr/local/bin/sme-api\nfi\n\ncat > /etc/systemd/system/sme-api.service\
+            \ << APIUNIT\n[Unit]\nDescription=SME API Worker\nAfter=network.target\
+            \ dragonfly.service postgresql.service\nRequires=dragonfly.service postgresql.service\n\
             [Service]\nUser=ec2-user\nEnvironment=\"DATABASE_URL=postgres://sme:${DBPassword}@localhost:5432/matching_engine\"\
             \nEnvironment=\"DRAGONFLY_URL=redis://localhost:6379\"\nEnvironment=\"\
             RUST_LOG=info\"\nExecStart=/usr/local/bin/sme-api\nRestart=always\nRestartSec=10\n\
             [Install]\nWantedBy=multi-user.target\nAPIUNIT\n\nsystemctl daemon-reload\n\
-            systemctl enable sme-api\nsystemctl start sme-api || true\necho \"===\
-            \ Bootstrap complete ===\"\n"
+            systemctl enable sme-api\n[[ -f /usr/local/bin/sme-api ]] && systemctl\
+            \ start sme-api || true\n\necho \"=== Bootstrap complete ===\"\n"
       Tags:
       - Key: Name
         Value:
           Fn::Sub: ${ProjectName}-ec2
+      - Key: Project
+        Value:
+          Ref: ProjectName
   ElasticIP:
     Type: AWS::EC2::EIP
-    DependsOn: VPCGatewayAttachment
     Properties:
       Domain: vpc
       InstanceId:
         Ref: EC2Instance
-  WorkerLambdaSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${ProjectName}-eip
+      - Key: Project
+        Value:
+          Ref: ProjectName
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
     Properties:
-      GroupDescription: Worker Lambda - outbound to EC2 (PG + Dragonfly)
-      VpcId:
-        Ref: VPC
-      SecurityGroupEgress:
-      - IpProtocol: tcp
-        FromPort: 6379
-        ToPort: 6379
-        DestinationSecurityGroupId:
-          Ref: EC2SecurityGroup
-        Description: Dragonfly on EC2
-      - IpProtocol: tcp
-        FromPort: 5432
-        ToPort: 5432
-        DestinationSecurityGroupId:
-          Ref: EC2SecurityGroup
-        Description: PostgreSQL on EC2
-      - IpProtocol: tcp
-        FromPort: 443
-        ToPort: 443
-        CidrIp: '0.0.0.0/0'
-        Description: HTTPS for CloudWatch
-  EC2IngressDragonflyFromWorker:
-    Type: AWS::EC2::SecurityGroupIngress
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${ProjectName}-gateway
+      RetentionInDays: 14
+  WorkerLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
     Properties:
-      GroupId:
-        Ref: EC2SecurityGroup
-      IpProtocol: tcp
-      FromPort: 6379
-      ToPort: 6379
-      SourceSecurityGroupId:
-        Ref: WorkerLambdaSecurityGroup
-      Description: Dragonfly from Worker Lambda
-  EC2IngressPostgresFromWorker:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId:
-        Ref: EC2SecurityGroup
-      IpProtocol: tcp
-      FromPort: 5432
-      ToPort: 5432
-      SourceSecurityGroupId:
-        Ref: WorkerLambdaSecurityGroup
-      Description: PostgreSQL from Worker Lambda
-  GatewayFunction:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${ProjectName}-worker
+      RetentionInDays: 14
+  GatewayLambda:
     Type: AWS::Serverless::Function
+    DependsOn: LambdaLogGroup
     Properties:
       FunctionName:
         Fn::Sub: ${ProjectName}-gateway
-      Description: sme-gateway via AWS Lambda Web Adapter (zero code changes)
+      Description: sme-gateway HTTP handler via AWS Lambda Web Adapter (zero code
+        changes)
       PackageType: Image
-      ImageUri:
-        Ref: GatewayImageUri
       MemorySize: 512
       Timeout: 30
+      ReservedConcurrentExecutions: 10
+      Role:
+        Fn::GetAtt:
+        - LambdaRole
+        - Arn
       VpcConfig:
         SubnetIds:
         - Ref: PrivateSubnetA
@@ -453,43 +621,42 @@ Resources:
           AWS_LWA_PASS_THROUGH_PATH: /
           DRAGONFLY_URL:
             Fn::Sub: redis://${EC2Instance.PrivateIp}:6379
+          RUST_LOG: info
           ORDER_DISPATCH_MODE: lambda
           WORKER_LAMBDA_ARN:
-            Fn::GetAtt:
-            - WorkerFunction
-            - Arn
-          RUST_LOG: info
-      Events:
-        CatchAll:
-          Type: HttpApi
-          Properties:
-            ApiId:
-              Ref: HttpApi
-            Path: /{proxy+}
-            Method: ANY
-        Root:
-          Type: HttpApi
-          Properties:
-            ApiId:
-              Ref: HttpApi
-            Path: /
-            Method: ANY
-      Policies:
-      - VPCAccessPolicy: {}
-      - LambdaInvokePolicy:
-          FunctionName:
-            Ref: WorkerFunction
-  WorkerFunction:
+            Fn::Sub: arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-worker
+      Tags:
+        Project:
+          Ref: ProjectName
+      ImageUri: gatewaylambda:serverless-matching-engine-gateway
+    Metadata:
+      DockerContext: /home/ubuntu/projects/serverless-matching-engine
+      DockerTag: serverless-matching-engine-gateway
+      Dockerfile: infra/Dockerfile.gateway
+      SamResourceId: GatewayLambda
+  LambdaPermissionAPIGW:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: GatewayLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn:
+        Fn::Sub: arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*
+  WorkerLambda:
     Type: AWS::Serverless::Function
+    DependsOn: WorkerLambdaLogGroup
     Properties:
       FunctionName:
         Fn::Sub: ${ProjectName}-worker
-      Description: sme-worker-lambda - order matching via Lambda custom runtime
+      Description: sme-worker-lambda - order matching, PG persistence, cache updates
       PackageType: Image
-      ImageUri:
-        Ref: WorkerImageUri
       MemorySize: 1024
       Timeout: 30
+      Role:
+        Fn::GetAtt:
+        - LambdaRole
+        - Arn
       VpcConfig:
         SubnetIds:
         - Ref: PrivateSubnetA
@@ -498,20 +665,30 @@ Resources:
         - Ref: WorkerLambdaSecurityGroup
       Environment:
         Variables:
-          DATABASE_URL:
-            Fn::Sub: postgres://sme:${DBPassword}@${EC2Instance.PrivateIp}:5432/matching_engine
           DRAGONFLY_URL:
             Fn::Sub: redis://${EC2Instance.PrivateIp}:6379
+          DATABASE_URL:
+            Fn::Sub: postgres://sme:${DBPassword}@${EC2Instance.PrivateIp}:5432/matching_engine
           RUST_LOG: info
-      Policies:
-      - VPCAccessPolicy: {}
+      Tags:
+        Project:
+          Ref: ProjectName
+      ImageUri: workerlambda:serverless-matching-engine-worker
+    Metadata:
+      DockerContext: /home/ubuntu/projects/serverless-matching-engine
+      DockerTag: serverless-matching-engine-worker
+      Dockerfile: infra/Dockerfile.worker
+      SamResourceId: WorkerLambda
   HttpApi:
-    Type: AWS::Serverless::HttpApi
+    Type: AWS::ApiGatewayV2::Api
     Properties:
-      StageName: $default
+      Name:
+        Fn::Sub: ${ProjectName}-http-api
+      Description: SME Gateway HTTP API
+      ProtocolType: HTTP
       CorsConfiguration:
         AllowOrigins:
-        - '*'
+        - Ref: AllowedCorsOrigin
         AllowMethods:
         - GET
         - POST
@@ -523,12 +700,193 @@ Resources:
         - Authorization
         - X-Requested-With
         MaxAge: 86400
+      Tags:
+        Project:
+          Ref: ProjectName
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId:
+        Ref: HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        Fn::GetAtt:
+        - GatewayLambda
+        - Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 30000
+  HttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId:
+        Ref: HttpApi
+      RouteKey: $default
+      Target:
+        Fn::Sub: integrations/${HttpApiIntegration}
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId:
+        Ref: HttpApi
+      StageName: $default
+      AutoDeploy: true
       DefaultRouteSettings:
-        ThrottlingBurstLimit: 1000
+        ThrottlingBurstLimit: 5000
         ThrottlingRateLimit: 1000
+      Tags:
+        Project:
+          Ref: ProjectName
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Sub: ${ProjectName}-frontend-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+        - Id: ExpireOldVersions
+          Status: Enabled
+          NoncurrentVersionExpiration:
+            NoncurrentDays: 30
+      Tags:
+      - Key: Project
+        Value:
+          Ref: ProjectName
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name:
+          Fn::Sub: ${ProjectName}-oac
+        Description: OAC for SME frontend S3 bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: AllowCloudFrontOAC
+          Effect: Allow
+          Principal:
+            Service: cloudfront.amazonaws.com
+          Action: s3:GetObject
+          Resource:
+            Fn::Sub: arn:aws:s3:::${FrontendBucket}/*
+          Condition:
+            StringEquals:
+              AWS:SourceArn:
+                Fn::Sub: arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment:
+          Fn::Sub: ${ProjectName} frontend + API proxy
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        Aliases:
+          Fn::If:
+          - HasCustomDomain
+          - - Ref: CustomDomain
+          - Ref: AWS::NoValue
+        ViewerCertificate:
+          Fn::If:
+          - HasCustomDomain
+          - AcmCertificateArn:
+              Ref: AcmCertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        Origins:
+        - Id: S3Origin
+          DomainName:
+            Fn::GetAtt:
+            - FrontendBucket
+            - RegionalDomainName
+          S3OriginConfig:
+            OriginAccessIdentity: ''
+          OriginAccessControlId:
+            Ref: CloudFrontOAC
+        - Id: ApiGatewayOrigin
+          DomainName:
+            Fn::Sub: ${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+          CustomOriginConfig:
+            HTTPSPort: 443
+            OriginProtocolPolicy: https-only
+            OriginSSLProtocols:
+            - TLSv1.2
+        CacheBehaviors:
+        - PathPattern: /api/*
+          TargetOriginId: ApiGatewayOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+          - GET
+          - HEAD
+          - OPTIONS
+          - PUT
+          - PATCH
+          - POST
+          - DELETE
+          CachedMethods:
+          - GET
+          - HEAD
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          Compress: true
+        - PathPattern: /ws/*
+          TargetOriginId: ApiGatewayOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+          - GET
+          - HEAD
+          - OPTIONS
+          CachedMethods:
+          - GET
+          - HEAD
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          Compress: false
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+          - GET
+          - HEAD
+          CachedMethods:
+          - GET
+          - HEAD
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CustomErrorResponses:
+        - ErrorCode: 403
+          ResponseCode: 200
+          ResponsePagePath: /index.html
+          ErrorCachingMinTTL: 10
+        - ErrorCode: 404
+          ResponseCode: 200
+          ResponsePagePath: /index.html
+          ErrorCachingMinTTL: 10
+      Tags:
+      - Key: Project
+        Value:
+          Ref: ProjectName
 Outputs:
   ApiGatewayUrl:
-    Description: API Gateway URL
+    Description: API Gateway HTTP API invoke URL
     Value:
       Fn::Sub: https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
   EC2PublicIP:
@@ -536,12 +894,26 @@ Outputs:
     Value:
       Ref: ElasticIP
   EC2PrivateIP:
-    Description: EC2 private IP (Lambda connects to Dragonfly here)
+    Description: EC2 private IP (used by Lambda for Dragonfly)
     Value:
       Fn::GetAtt:
       - EC2Instance
       - PrivateIp
-  VpcId:
-    Description: VPC ID
+  CloudFrontUrl:
+    Description: CloudFront distribution URL
     Value:
-      Ref: VPC
+      Fn::Sub: https://${CloudFrontDistribution.DomainName}
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID (needed for cache invalidation)
+    Value:
+      Ref: CloudFrontDistribution
+  FrontendBucketName:
+    Description: S3 bucket name for frontend files
+    Value:
+      Ref: FrontendBucket
+  FrontendBucketArn:
+    Description: S3 bucket ARN
+    Value:
+      Fn::GetAtt:
+      - FrontendBucket
+      - Arn
