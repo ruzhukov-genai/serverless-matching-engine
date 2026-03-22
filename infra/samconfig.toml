@@ -1,14 +1,19 @@
 version = 0.1
 
 [default.build.parameters]
-use_container = true
-container_env_var_file = ""
-cached = false
+cached = true
+parallel = true
+
+[default.package.parameters]
+region = "us-east-1"
+resolve_image_repos = true
+resolve_s3 = true
 
 [default.deploy.parameters]
 stack_name = "serverless-matching-engine"
 region = "us-east-1"
 capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
-confirm_changeset = true
+confirm_changeset = false
 resolve_image_repos = true
 resolve_s3 = true
+parameter_overrides = "KeyPairName=GmindRZKeyPair DBPassword=sme_prod_9b43c1802d8440e9666be882d925d933"

@@ -10,8 +10,10 @@
 
 # ============================================================================
 # Stage 1: Build — cross-compile sme-gateway for aarch64 Linux
+# $BUILDPLATFORM = host arch (amd64), $TARGETPLATFORM = Lambda arch (arm64)
 # ============================================================================
-FROM --platform=linux/amd64 rust:1.91-bookworm AS builder
+ARG BUILDPLATFORM
+FROM --platform=${BUILDPLATFORM:-linux/amd64} rust:1.91-bookworm AS builder
 
 WORKDIR /build
 
@@ -72,10 +74,11 @@ RUN cargo build --release --target aarch64-unknown-linux-gnu --package sme-gatew
 # sme-gateway runs on PORT=3001 as a normal HTTP server.
 # LWA listens for Lambda events and forwards them as HTTP requests.
 # ============================================================================
-FROM public.ecr.aws/awsguru/aws-lambda-adapter:0.8.4-aarch64 AS lwa
+ARG TARGETPLATFORM
+FROM --platform=${TARGETPLATFORM:-linux/arm64} public.ecr.aws/awsguru/aws-lambda-adapter:0.8.4-aarch64 AS lwa
 
 # Use minimal ARM64 base for the final image
-FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal AS runtime
+FROM --platform=${TARGETPLATFORM:-linux/arm64} public.ecr.aws/amazonlinux/amazonlinux:2023-minimal AS runtime
 
 # Copy Lambda Web Adapter binary + bootstrap from LWA image
 COPY --from=lwa /lambda-adapter /opt/extensions/lambda-adapter

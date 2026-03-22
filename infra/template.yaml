@@ -452,6 +452,52 @@ Resources:
   # =========================================================================
   # Lambda Function (SAM-managed - auto build + push Docker image)
   # =========================================================================
+  # --- Worker Lambda Security Group (separate from gateway for least-privilege) ---
+  WorkerLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Worker Lambda - outbound to EC2 (PG + Dragonfly)
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          DestinationSecurityGroupId: !Ref EC2SecurityGroup
+          Description: Dragonfly on EC2
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          DestinationSecurityGroupId: !Ref EC2SecurityGroup
+          Description: PostgreSQL on EC2
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS for CloudWatch
+
+  EC2IngressDragonflyFromWorker:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
+      Description: Dragonfly from Worker Lambda
+
+  EC2IngressPostgresFromWorker:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
+      Description: PostgreSQL from Worker Lambda
+
+  # =========================================================================
+  # Lambda Functions (SAM-managed, Makefile-based Docker build)
+  # =========================================================================
   GatewayFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -460,7 +506,6 @@ Resources:
       PackageType: Image
       MemorySize: 512
       Timeout: 30
-      ReservedConcurrentExecutions: 10
       VpcConfig:
         SubnetIds:
           - !Ref PrivateSubnetA
@@ -474,6 +519,8 @@ Resources:
           AWS_LWA_READINESS_CHECK_PATH: '/api/pairs'
           AWS_LWA_PASS_THROUGH_PATH: '/'
           DRAGONFLY_URL: !Sub 'redis://${EC2Instance.PrivateIp}:6379'
+          ORDER_DISPATCH_MODE: lambda
+          WORKER_LAMBDA_ARN: !GetAtt WorkerFunction.Arn
           RUST_LOG: info
       Events:
         CatchAll:
@@ -490,10 +537,38 @@ Resources:
             Method: ANY
       Policies:
         - VPCAccessPolicy: {}
+        - LambdaInvokePolicy:
+            FunctionName: !Ref WorkerFunction
     Metadata:
       DockerTag: latest
       DockerContext: ..
       Dockerfile: infra/Dockerfile.gateway
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-worker'
+      Description: sme-worker-lambda - order matching via Lambda custom runtime
+      PackageType: Image
+      MemorySize: 1024
+      Timeout: 30
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+        SecurityGroupIds:
+          - !Ref WorkerLambdaSecurityGroup
+      Environment:
+        Variables:
+          DATABASE_URL: !Sub 'postgres://sme:${DBPassword}@${EC2Instance.PrivateIp}:5432/matching_engine'
+          DRAGONFLY_URL: !Sub 'redis://${EC2Instance.PrivateIp}:6379'
+          RUST_LOG: info
+      Policies:
+        - VPCAccessPolicy: {}
+    Metadata:
+      DockerTag: latest
+      DockerContext: ..
+      Dockerfile: infra/Dockerfile.worker
 
   # =========================================================================
   # API Gateway HTTP API (cheapest - $1/million requests)
@@ -516,6 +591,9 @@ Resources:
           - Authorization
           - X-Requested-With
         MaxAge: 86400
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 1000
+        ThrottlingRateLimit: 1000
 
 # ---------------------------------------------------------------------------
 # Outputs
