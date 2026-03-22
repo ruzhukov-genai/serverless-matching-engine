@@ -295,22 +295,32 @@ pub async fn create_order(
     // Dispatch order to worker — mode selected by ORDER_DISPATCH_MODE env var
     match s.dispatch_mode {
         crate::DispatchMode::Lambda => {
-            // Async Lambda invoke (fire-and-forget) — returns immediately
+            // Fire-and-forget Lambda invoke — spawns background task, returns immediately
             if let Some(ref lambda_client) = s.lambda_client {
                 let payload = aws_sdk_lambda::primitives::Blob::new(order_str.into_bytes());
-                let _ = lambda_client.invoke()
-                    .function_name(&s.worker_lambda_arn)
-                    .invocation_type(aws_sdk_lambda::types::InvocationType::Event)
-                    .payload(payload)
-                    .send()
-                    .await;
-                tracing::info!(
-                    order_id = %order_id,
-                    pair_id = %req.pair_id,
-                    user_id = %user_id,
-                    arn = %s.worker_lambda_arn,
-                    "order dispatched to Worker Lambda"
-                );
+                let client = lambda_client.clone();
+                let arn = s.worker_lambda_arn.clone();
+                let oid = order_id.to_string();
+                let pid = req.pair_id.clone();
+                let uid = user_id.clone();
+                tokio::spawn(async move {
+                    match client.invoke()
+                        .function_name(&arn)
+                        .invocation_type(aws_sdk_lambda::types::InvocationType::Event)
+                        .payload(payload)
+                        .send()
+                        .await
+                    {
+                        Ok(_) => tracing::info!(
+                            order_id = %oid, pair_id = %pid, user_id = %uid,
+                            arn = %arn, "order dispatched to Worker Lambda"
+                        ),
+                        Err(e) => tracing::error!(
+                            order_id = %oid, pair_id = %pid, user_id = %uid,
+                            error = %e, "Worker Lambda invoke failed"
+                        ),
+                    }
+                });
             } else {
                 tracing::error!("dispatch_mode=lambda but lambda_client is None");
             }
