@@ -1,5 +1,7 @@
 # Tests
 
+Note: Integration tests require local Docker services (PostgreSQL + Dragonfly), not AWS.
+
 ## Test Categories
 
 ### Unit Tests

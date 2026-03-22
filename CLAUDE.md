@@ -13,11 +13,16 @@ Dragonfly (Redis-compatible) for distributed locking/caching, PostgreSQL for per
 ```
 crates/
   gateway/      → stateless HTTP/WS gateway (port 3001), reads Dragonfly cache
-  api/          → worker process, BRPOP queue consumer, matching, PG writes
+  worker-lambda/ → Worker Lambda (processes individual orders)
+  api/          → local dev worker (BRPOP queue consumer), matching, PG writes
   shared/       → types, config, cache (sorted sets + Lua matching), DB, engine
   matching-engine/  → re-exports shared engine (standalone binary, unused in PoC)
   order-service/    → stream consumer (reference impl, unused in PoC)
   transaction-service/ → stream consumer (reference impl, unused in PoC)
+infra/
+  template.yaml → Root SAM template with nested stacks
+  stacks/       → Network, backend, frontend CloudFormation stacks
+  Dockerfile.*  → Lambda container builds (ARM64 cross-compile)
 web/
   trading/      → vanilla HTML/CSS/JS trading UI
   dashboard/    → vanilla HTML/CSS/JS admin dashboard
@@ -25,7 +30,11 @@ docs/
   adr/          → Architecture Decision Records (READ THESE FIRST)
 ```
 
-**Core flow (gateway → worker queue):**
+**Core flow (gateway → worker Lambda):**
+`POST /api/orders` → gateway validates → async invoke Worker Lambda → 202 Accepted
+→ Worker Lambda → lock balance (PG) → Lua EVAL match (Dragonfly) → persist trades (PG) → update cache
+
+**Legacy flow (local dev):**
 `POST /api/orders` → gateway validates → `LPUSH queue:orders:{pair_id}` → 202 Accepted
 → worker BRPOP → lock balance (PG) → Lua EVAL match (Dragonfly) → async persist (PG) → update cache
 

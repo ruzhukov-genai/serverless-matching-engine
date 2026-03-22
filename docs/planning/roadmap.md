@@ -51,7 +51,16 @@ Prove the stateless matching pattern works — correctness first, then performan
 - [x] Proper HTTP status codes: 400 validation, 404 not found, 409 conflict
 - [x] Unused imports cleaned (`cargo fix`)
 
-> All PoC phases complete. 85 tests passing. Pattern proven.
+## Phase 7 — AWS Deployment ✅ DONE
+- [x] Gateway Lambda (HTTP/WS server, stateless reads from cache)
+- [x] Worker Lambda (individual order processing, async invoked)
+- [x] EC2 backend (PostgreSQL + Dragonfly only, no sme-api binary)
+- [x] SAM infrastructure as code (3 nested stacks: network, backend, frontend)
+- [x] CloudFront distribution with S3 frontend + API origins
+- [x] Docker cross-compilation for ARM64 Lambda containers
+- [x] Full deployment automation with `sam build && sam deploy`
+
+> All phases complete. 85 tests passing. Pattern proven and deployed to AWS.
 
 ---
 
@@ -59,11 +68,10 @@ Prove the stateless matching pattern works — correctness first, then performan
 
 | Item | Reason |
 |------|--------|
-| **Production Deployment** | Lambda/IaC/Aurora out of PoC scope |
 | **Stream-based service flow** | Inline matching is the proven pattern; crates kept as reference |
-| **Dead letter handling** | Production concern |
-| **Stop/Trailing/OCO/Iceberg orders** | Tier 2-3, post-PoC |
-| **Circuit breaker / kill switch / rate limiting** | Production safety |
+| **Dead letter handling** | Lambda retries work for now; proper DLQ is post-MVP |
+| **Stop/Trailing/OCO/Iceberg orders** | Tier 2-3, post-deployment |
+| **Circuit breaker / kill switch / rate limiting** | Production safety, post-MVP |
 
 ---
 

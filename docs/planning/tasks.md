@@ -1,6 +1,6 @@
 # Task Backlog
 
-All PoC tasks complete. ✅
+All phases complete. ✅
 
 ---
 
@@ -26,6 +26,17 @@ All PoC tasks complete. ✅
 
 - [x] **C.1** Remove unused imports (`cargo fix`)
 - [x] **C.3** Proper HTTP status codes (400/404/409 via AppErrorKind)
+
+## Phase 7 — AWS Deployment ✅
+
+- [x] **7.1** Gateway Lambda implementation (HTTP/WS handler, cache reads)
+- [x] **7.2** Worker Lambda implementation (async order processing)
+- [x] **7.3** SAM template structure (network + backend + frontend stacks)
+- [x] **7.4** Docker ARM64 cross-compilation for Lambda containers
+- [x] **7.5** EC2 infrastructure (PostgreSQL + Dragonfly, no sme-api binary)
+- [x] **7.6** CloudFront distribution with S3 + API origins
+- [x] **7.7** End-to-end deployment automation
+- [x] **7.8** Update documentation to reflect Lambda architecture
 
 ## Deferred
 

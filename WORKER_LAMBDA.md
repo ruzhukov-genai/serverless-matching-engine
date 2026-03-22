@@ -51,7 +51,7 @@ The Worker Lambda implementation is a new Rust crate (`sme-worker-lambda`) that:
 - `crates/worker-lambda/src/main.rs` — Lambda handler (858 lines)
 - `crates/worker-lambda/Cargo.toml` — Dependencies (lambda_runtime, aws SDK, etc)
 - `infra/Dockerfile.worker` — ARM64 Docker build for Lambda custom runtime
-- `infra/cfn-backend.yaml` — CloudFormation Worker Lambda resource
+- `infra/stacks/backend.yaml` — SAM backend stack with Worker Lambda resource
 
 ### Gateway Lambda Changes
 
@@ -106,31 +106,7 @@ This script:
 
 **Option B: Manual**
 ```bash
-# Build (multi-stage ARM64 cross-compile)
-docker buildx build \
-  --platform linux/arm64 \
-  -f infra/Dockerfile.worker \
-  -t 210352747749.dkr.ecr.us-east-1.amazonaws.com/serverless-matching-engine/sme-worker:latest \
-  --provenance=false --sbom=false \
-  .
-
-# Authenticate with ECR
-aws ecr get-login-password --region us-east-1 | \
-  docker login --username AWS --password-stdin 210352747749.dkr.ecr.us-east-1.amazonaws.com
-
-# Push
-docker tag sme-worker:latest 210352747749.dkr.ecr.us-east-1.amazonaws.com/serverless-matching-engine/sme-worker:latest
-docker push 210352747749.dkr.ecr.us-east-1.amazonaws.com/serverless-matching-engine/sme-worker:latest
-
-# Get image digest
-IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' 210352747749.dkr.ecr.us-east-1.amazonaws.com/serverless-matching-engine/sme-worker:latest | cut -d'@' -f2)
-
-# Update stack
-aws cloudformation update-stack \
-  --stack-name serverless-matching-engine-backend \
-  --template-body file://infra/cfn-backend.yaml \
-  --parameters ParameterKey=WorkerImageUri,ParameterValue="210352747749.dkr.ecr.us-east-1.amazonaws.com/serverless-matching-engine/sme-worker@${IMAGE_DIGEST}" \
-  --capabilities CAPABILITY_NAMED_IAM
+SAM handles Docker building and ECR push automatically. See updated deployment process in infra/README.md.
 ```
 
 ### 2. Monitor CloudFormation Deployment
@@ -147,8 +123,14 @@ Wait for `UPDATE_COMPLETE` (typically 5-10 minutes).
 ### 3. Test Order Flow
 
 ```bash
+# Get API URL from CloudFront distribution
+CLOUDFRONT_URL=$(aws cloudformation describe-stacks \
+  --stack-name serverless-matching-engine-frontend \
+  --query 'Stacks[0].Outputs[?OutputKey==`CloudFrontUrl`].OutputValue' \
+  --output text)
+
 # Submit an order
-curl -X POST https://6dzuqeifq5.execute-api.us-east-1.amazonaws.com/api/orders \
+curl -X POST ${CLOUDFRONT_URL}/api/orders \
   -H "Content-Type: application/json" \
   -d '{
     "user_id": "user-1",
@@ -163,7 +145,7 @@ curl -X POST https://6dzuqeifq5.execute-api.us-east-1.amazonaws.com/api/orders \
 # Response: 202 Accepted (order queued for Worker Lambda processing)
 
 # Check order status (via Gateway snapshot cache)
-curl https://6dzuqeifq5.execute-api.us-east-1.amazonaws.com/api/snapshot/BTC-USDT
+curl ${CLOUDFRONT_URL}/api/snapshot/BTC-USDT
 ```
 
 ### 4. Verify Worker Lambda Logs
@@ -344,6 +326,6 @@ sam local invoke WorkerLambda --event test-order.json
 
 ---
 
-**Last updated:** 2026-03-21
+**Last updated:** 2026-03-22
 **Author:** Claw Opus
-**Status:** Code complete, awaiting Docker image build + CloudFormation deployment
+**Status:** ✅ Deployed and working

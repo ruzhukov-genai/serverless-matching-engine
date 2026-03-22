@@ -2,6 +2,10 @@
 
 Dev and operational scripts.
 
+| Script | Purpose |
+|--------|---------|
+| `bench-mode.sh` | Run benchmark mode (parallel process management) |
+
 ## Planned
 
 | Script | Purpose |

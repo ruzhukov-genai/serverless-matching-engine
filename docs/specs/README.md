@@ -9,3 +9,7 @@ Detailed specs written before implementation (spec-driven approach).
 | [order-service.md](order-service.md) | Order Service (`crates/order-service`) |
 | [transaction-service.md](transaction-service.md) | Transaction Service (`crates/transaction-service`) |
 | [common-functions.md](common-functions.md) | Shared: Order Book Locking (`crates/shared`) |
+
+## Architecture
+
+For AWS deployment architecture and infrastructure details, see [../aws-architecture.md](../aws-architecture.md).
