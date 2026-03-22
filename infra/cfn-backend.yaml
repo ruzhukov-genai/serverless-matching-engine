@@ -436,7 +436,7 @@ Resources:
               - Effect: Allow
                 Action:
                   - lambda:InvokeFunction
-                Resource: !GetAtt WorkerLambda.Arn
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-worker'
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -705,7 +705,7 @@ Resources:
           RUST_LOG: info
           # Worker Lambda dispatch
           ORDER_DISPATCH_MODE: lambda
-          WORKER_LAMBDA_ARN: !GetAtt WorkerLambda.Arn
+          WORKER_LAMBDA_ARN: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-worker'
       Tags:
         - Key: Project
           Value: !Ref ProjectName

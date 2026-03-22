@@ -67,7 +67,9 @@ COPY crates/ ./crates/
 COPY tools/loadtest ./tools/loadtest/
 
 # Build sme-worker-lambda for ARM (binary is named 'bootstrap' per Cargo.toml)
-RUN cargo build --release --target aarch64-unknown-linux-gnu --package sme-worker-lambda
+RUN cargo build --release --target aarch64-unknown-linux-gnu --package sme-worker-lambda && \
+    ls -lah /build/target/aarch64-unknown-linux-gnu/release/bootstrap || \
+    (echo "ERROR: bootstrap binary not found!" && find /build/target/aarch64-unknown-linux-gnu/release -name "bootstrap*" -o -name "sme-worker*" && exit 1)
 
 # ============================================================================
 # Stage 2: Runtime — Lambda custom runtime base image (ARM64)
@@ -77,11 +79,8 @@ RUN cargo build --release --target aarch64-unknown-linux-gnu --package sme-worke
 # ============================================================================
 FROM public.ecr.aws/lambda/provided:al2023-arm64 AS runtime
 
-# Copy compiled bootstrap binary
-COPY --from=builder /build/target/aarch64-unknown-linux-gnu/release/bootstrap /var/runtime/bootstrap
-
-# Ensure executable
-RUN chmod +x /var/runtime/bootstrap
+# Copy compiled bootstrap binary from builder (already executable from cargo build)
+COPY --from=builder --chmod=755 /build/target/aarch64-unknown-linux-gnu/release/bootstrap /var/runtime/bootstrap
 
 # Default environment (override in CloudFormation)
 ENV RUST_LOG=info
