@@ -5,3 +5,4 @@ Cargo.lock
 .env
 .env.local
 .DS_Store
+.aws-sam/
