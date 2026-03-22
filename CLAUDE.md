@@ -137,6 +137,7 @@ python3 tools/benchmark.py
 ### Docs (all paths relative to repo root)
 | Path | Purpose |
 |------|---------|
+| `docs/aws-architecture.md` | AWS infra: SAM stacks, Lambda, EC2, gotchas |
 | `docs/adr/*.md` | Architecture Decision Records (5 active) |
 | `docs/specs/features.md` | Feature spec (Tier 1/2/3 order types, TIF, STP) |
 | `docs/specs/matching-engine.md` | Matching engine spec |
@@ -146,6 +147,16 @@ python3 tools/benchmark.py
 | `docs/benchmarks/` | Historical benchmark results (2026-03-14) |
 | `docs/brainstorm/README.md` | Open questions + resolved decisions |
 | `tools/benchmark.py` | Comprehensive load test + server profiling |
+
+### Infrastructure
+| Path | Purpose |
+|------|---------|
+| `infra/template.yaml` | Root SAM template (3 nested stacks) |
+| `infra/stacks/network.yaml` | VPC, subnets, security groups |
+| `infra/stacks/backend.yaml` | EC2, Lambda ×2, API Gateway, UserData |
+| `infra/stacks/frontend.yaml` | S3, CloudFront, OAC |
+| `infra/Dockerfile.gateway` | Gateway Lambda Docker build (cross-compile arm64) |
+| `infra/Dockerfile.worker` | Worker Lambda Docker build (cross-compile arm64) |
 
 ### Symlinks
 | Path | Target |
