@@ -305,7 +305,43 @@ Resources:
       SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
       Description: Dragonfly from Worker Lambda
 
+  # =========================================================================
+  # VPC Endpoint for Lambda — allows private subnet Lambda to invoke Lambda
+  # =========================================================================
+  LambdaVpcEndpointSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: VPC Endpoint for Lambda service
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: HTTPS from Gateway Lambda
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
+          Description: HTTPS from Worker Lambda
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-vpce-sg'
+        - Key: Project
+          Value: !Ref ProjectName
 
+  LambdaVpcEndpoint:
+    Type: AWS::EC2::VpcEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.lambda'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      SecurityGroupIds:
+        - !Ref LambdaVpcEndpointSG
 
 # ---------------------------------------------------------------------------
 # Outputs
