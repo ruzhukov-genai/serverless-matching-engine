@@ -1,0 +1,58 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Update existing Gateway and Worker Lambda functions with latest images
+
+Parameters:
+  GatewayImageUri:
+    Type: String
+    Default: '210352747749.dkr.ecr.us-east-1.amazonaws.com/serverless-matching-engine/sme-gateway:latest'
+    Description: Gateway Lambda image URI
+  
+  WorkerImageUri:
+    Type: String
+    Default: '210352747749.dkr.ecr.us-east-1.amazonaws.com/serverless-matching-engine/sme-worker:latest'
+    Description: Worker Lambda image URI
+
+Resources:
+  GatewayFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: serverless-matching-engine-gateway
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/serverless-matching-engine-gateway-role'
+      Code:
+        ImageUri: !Ref GatewayImageUri
+      PackageType: Image
+      MemorySize: 512
+      Timeout: 30
+      Environment:
+        Variables:
+          PORT: '3001'
+          AWS_LWA_PORT: '3001'
+          AWS_LWA_READINESS_CHECK_PATH: '/api/pairs'
+          AWS_LWA_PASS_THROUGH_PATH: '/'
+          ORDER_DISPATCH_MODE: 'lambda'
+          DRAGONFLY_URL: 'redis://10.0.1.197:6379'
+          WORKER_LAMBDA_ARN: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:serverless-matching-engine-worker'
+          RUST_LOG: 'info'
+
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: serverless-matching-engine-worker
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/serverless-matching-engine-worker-role'
+      Code:
+        ImageUri: !Ref WorkerImageUri
+      PackageType: Image
+      MemorySize: 1024
+      Timeout: 30
+      VpcConfig:
+        SubnetIds:
+          - 'subnet-0bd2d9a5b54753fbb'
+          - 'subnet-0fd06c6ab047db36a'
+        SecurityGroupIds:
+          - 'sg-0788880509406ca5a'
+      Environment:
+        Variables:
+          DATABASE_URL: 'postgres://sme:sme_prod_9b43c1802d8440e9666be882d925d933@10.0.1.197:5432/matching_engine'
+          DRAGONFLY_URL: 'redis://10.0.1.197:6379'
+          RUST_LOG: 'info'
