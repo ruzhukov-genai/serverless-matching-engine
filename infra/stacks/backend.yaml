@@ -227,7 +227,7 @@ Resources:
 
           # Inline bootstrap (abbreviated - see infra/ec2-userdata.sh for full version)
           dnf update -y
-          dnf install -y postgresql16 postgresql16-server wget curl tar unzip
+          dnf install -y --allowerasing postgresql16 postgresql16-server wget curl tar unzip
 
           # ----- PostgreSQL setup -----
           postgresql-setup --initdb || true
@@ -291,13 +291,19 @@ Resources:
             INSERT INTO balances VALUES ('user-2','USDT',1000000,0) ON CONFLICT DO NOTHING;
           " || true
 
-          # Configure pg_hba.conf to allow password auth for sme user
+          # Grant permissions to sme user
+          sudo -u postgres psql -d matching_engine -c "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO sme;" || true
+          sudo -u postgres psql -d matching_engine -c "GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO sme;" || true
+
+          # Configure pg_hba.conf + listen_addresses for Lambda access
+          PG_CONF=$(find /var/lib/pgsql -name postgresql.conf | head -1)
           PG_HBA=$(find /var/lib/pgsql -name pg_hba.conf | head -1)
+          sed -i "s/^#listen_addresses.*/listen_addresses = '*'/" "$PG_CONF"
           echo "host matching_engine sme 10.0.0.0/8 md5" >> "$PG_HBA"
-          systemctl reload postgresql
+          systemctl restart postgresql
 
           # ----- Dragonfly setup -----
-          DRAGONFLY_VERSION="1.14.2"
+          DRAGONFLY_VERSION="1.28.2"
           ARCH="aarch64"
           wget -q "https://github.com/dragonflydb/dragonfly/releases/download/v${!DRAGONFLY_VERSION}/dragonfly-${!ARCH}.tar.gz" \
             -O /tmp/dragonfly.tar.gz
@@ -313,6 +319,7 @@ Resources:
           --bind=0.0.0.0
           --port=6379
           --maxmemory=256mb
+          --proactor_threads=1
           --default_lua_flags=allow-undeclared-keys
           --dir=/var/lib/dragonfly
           --logtostderr
