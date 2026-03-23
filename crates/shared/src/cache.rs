@@ -326,10 +326,9 @@ pub async fn save_order_to_book(pool: &Pool, order: &Order) -> Result<()> {
     let bids_key = format!("book:{}:bids", order.pair_id);
     let asks_key = format!("book:{}:asks", order.pair_id);
     let order_key = format!("order:{}", order.id);
-    let score = order.book_score();
-    let book_key = match order.side { Side::Buy => &bids_key, Side::Sell => &asks_key };
-
     let price_i = order.price.map(decimal_to_i64).unwrap_or(0);
+    let score = match order.side { Side::Buy => -price_i, Side::Sell => price_i } as f64;
+    let book_key = match order.side { Side::Buy => &bids_key, Side::Sell => &asks_key };
 
     let mut conn = pool.get().await.context("pool.get")?;
     let () = redis::pipe()
@@ -833,11 +832,13 @@ pub async fn apply_book_mutations_cas(
         if needs_hset {
             upsert_orders.push(upd);
         }
+        let price_i = upd.price.map(decimal_to_i64).unwrap_or(0);
+        let score = match upd.side { Side::Buy => -price_i, Side::Sell => price_i } as f64;
         mutations.push(Mutation {
             op,
             oid: upd.id.to_string(),
             order_key: format!("order:{}", upd.id),
-            score: upd.book_score(),
+            score,
         });
     }
 
@@ -847,11 +848,13 @@ pub async fn apply_book_mutations_cas(
             Side::Sell => "UPSERT_ASK",
         };
         upsert_orders.push(incoming);
+        let price_i = incoming.price.map(decimal_to_i64).unwrap_or(0);
+        let score = match incoming.side { Side::Buy => -price_i, Side::Sell => price_i } as f64;
         mutations.push(Mutation {
             op,
             oid: incoming.id.to_string(),
             order_key: format!("order:{}", incoming.id),
-            score: incoming.book_score(),
+            score,
         });
     }
 
@@ -1016,7 +1019,9 @@ pub async fn match_order_lua(
         .arg(stp_char(order.stp_mode))
         .arg(order.created_at.timestamp_millis().to_string())
         .arg(&order.pair_id)
-        .arg(score.to_string())
+        // CRITICAL: Use scaled price_i as score so ZRANGEBYSCORE bounds match (see ADR-004)
+        // Buy: score = -(price_i), Sell: score = +(price_i) → both are large scaled integers
+        .arg((match order.side { Side::Buy => -price_i, Side::Sell => price_i }) as f64)
         .arg(&max_score)
         .arg(lock_asset)
         .arg(lock_amount_scaled.to_string());
