@@ -39,6 +39,11 @@ Parameters:
     Default: '210352747749.dkr.ecr.us-east-1.amazonaws.com/serverless-matching-engine/sme-worker:latest'
     Description: Worker Lambda ECR image URI
 
+  WsHandlerImageUri:
+    Type: String
+    Default: '210352747749.dkr.ecr.us-east-1.amazonaws.com/serverless-matching-engine/sme-ws-handler:latest'
+    Description: WebSocket Handler Lambda ECR image URI
+
   # Network inputs (passed from root template via nested stack outputs)
   VpcId:
     Type: AWS::EC2::VPC::Id
@@ -197,6 +202,14 @@ Resources:
                 Action:
                   - lambda:InvokeFunction
                 Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-worker'
+        - PolicyName: ManageWebSocketConnections
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - execute-api:ManageConnections
+                Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -422,6 +435,108 @@ Resources:
           DRAGONFLY_URL: !Sub 'redis://${EC2Instance.PrivateIp}:6379'
           DATABASE_URL: !Sub 'postgres://sme:${DBPassword}@${RDSInstance.Endpoint.Address}:5432/matching_engine'
           RUST_LOG: info
+          WS_API_ENDPOINT: !Sub 'https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/ws'
+      Tags:
+        Project: !Ref ProjectName
+
+  # =========================================================================
+  # WebSocket API for real-time feeds (ADR-006)
+  # =========================================================================
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-ws-api'
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: '$request.body.action'
+      Tags:
+        Project: !Ref ProjectName
+
+  WebSocketIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsHandlerLambda.Arn}/invocations'
+
+  WebSocketConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${WebSocketIntegration}'
+
+  WebSocketDisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      Target: !Sub 'integrations/${WebSocketIntegration}'
+
+  WebSocketDefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $default
+      Target: !Sub 'integrations/${WebSocketIntegration}'
+
+  WebSocketDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - WebSocketConnectRoute
+      - WebSocketDisconnectRoute
+      - WebSocketDefaultRoute
+    Properties:
+      ApiId: !Ref WebSocketApi
+
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebSocketApi
+      StageName: ws
+      AutoDeploy: true
+      DeploymentId: !Ref WebSocketDeployment
+
+  LambdaPermissionWebSocket:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WsHandlerLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  # =========================================================================
+  # WebSocket Handler Lambda (sme-ws-handler, native lambda_runtime, no LWA)
+  # =========================================================================
+  WsHandlerLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-ws-handler'
+      RetentionInDays: 14
+
+  WsHandlerLambda:
+    Type: AWS::Serverless::Function
+    DependsOn: WsHandlerLambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-ws-handler'
+      Description: sme-ws-handler - API GW WebSocket event handler (connect/disconnect/subscribe)
+      PackageType: Image
+      ImageUri: !Ref WsHandlerImageUri
+      Architectures:
+        - arm64
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt LambdaRole.Arn
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroupId
+      Environment:
+        Variables:
+          DRAGONFLY_URL: !Sub 'redis://${EC2Instance.PrivateIp}:6379'
+          RUST_LOG: info
       Tags:
         Project: !Ref ProjectName
 
@@ -487,6 +602,10 @@ Outputs:
   ApiGatewayUrl:
     Description: API Gateway HTTP API invoke URL
     Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+
+  WebSocketUrl:
+    Description: WebSocket API URL for real-time feeds
+    Value: !Sub 'wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/ws'
 
   EC2PrivateIP:
     Description: EC2 private IP (used by Lambda for Dragonfly)

@@ -301,6 +301,12 @@ async fn process_order(state: &WorkerState, payload: &Value) -> Result<()> {
     update_cache_after_processing(state, &order, &trades).await
         .context("cache update failed")?;
 
+    // 9. Push updates to WebSocket subscribers (fire-and-forget, non-critical)
+    let ws_endpoint = std::env::var("WS_API_ENDPOINT").unwrap_or_default();
+    if !ws_endpoint.is_empty() {
+        push_ws_updates(&state.dragonfly, &pair_id, &ws_endpoint).await;
+    }
+
     let total_ms = total_start.elapsed().as_millis() as u64;
 
     tracing::info!(
@@ -664,6 +670,131 @@ async fn update_portfolio_caches(
         conn.set::<_, _, ()>(format!("cache:portfolio:{}", user_id), &portfolio_str).await?;
     }
     Ok(())
+}
+
+// ── WebSocket push ────────────────────────────────────────────────────────────
+
+/// Push cache updates to WebSocket subscribers via API Gateway Management API.
+/// Fire-and-forget: errors are logged but never propagate to the caller.
+/// Stale connections (410 Gone) are removed from Dragonfly automatically.
+async fn push_ws_updates(
+    pool: &deadpool_redis::Pool,
+    pair_id: &str,
+    ws_endpoint: &str,
+) {
+    let mut conn = match pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "push_ws_updates: failed to get redis conn");
+            return;
+        }
+    };
+
+    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let apigw_config = aws_sdk_apigatewaymanagement::config::Builder::from(&config)
+        .endpoint_url(ws_endpoint)
+        .build();
+    let apigw = aws_sdk_apigatewaymanagement::Client::from_conf(apigw_config);
+
+    // Channels updated by this order's processing
+    let channels = [
+        format!("orderbook:{}", pair_id),
+        format!("trades:{}", pair_id),
+        format!("ticker:{}", pair_id),
+    ];
+
+    use deadpool_redis::redis::AsyncCommands;
+
+    for ch_name in &channels {
+        // Get subscribers for this channel
+        let subscribers: Vec<String> = match conn
+            .smembers::<_, Vec<String>>(format!("ws:subs:{}", ch_name))
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(channel = %ch_name, error = %e, "push_ws_updates: smembers failed");
+                continue;
+            }
+        };
+
+        if subscribers.is_empty() {
+            continue;
+        }
+
+        // Get current cached value
+        let cache_key = format!("cache:{}", ch_name);
+        let val: String = match conn.get::<_, String>(&cache_key).await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if val.is_empty() {
+            continue;
+        }
+
+        let msg = format!(r#"{{"ch":"{}","data":{}}}"#, ch_name, val);
+        let msg_bytes = msg.into_bytes();
+
+        let mut stale_conns: Vec<String> = vec![];
+
+        // Push to all subscribers
+        for conn_id in &subscribers {
+            match apigw
+                .post_to_connection()
+                .connection_id(conn_id)
+                .data(aws_sdk_apigatewaymanagement::primitives::Blob::new(msg_bytes.clone()))
+                .send()
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    // 410 Gone = stale connection; collect for cleanup
+                    let is_gone = e
+                        .as_service_error()
+                        .map(|se| se.is_gone_exception())
+                        .unwrap_or(false);
+
+                    if is_gone {
+                        tracing::info!(connection_id = %conn_id, "removing stale ws connection");
+                        stale_conns.push(conn_id.clone());
+                    } else {
+                        tracing::warn!(
+                            connection_id = %conn_id,
+                            channel = %ch_name,
+                            error = %e,
+                            "push_ws_updates: post_to_connection failed"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Remove stale connections from Dragonfly
+        for stale_id in &stale_conns {
+            let _ = conn.srem::<_, _, ()>("ws:connections", stale_id).await;
+            let _ = conn.srem::<_, _, ()>(format!("ws:subs:{}", ch_name), stale_id).await;
+            // Also clean up the reverse mapping
+            let subscribed_channels: Vec<String> = conn
+                .smembers(format!("ws:conn:{}", stale_id))
+                .await
+                .unwrap_or_default();
+            for other_ch in &subscribed_channels {
+                let _ = conn
+                    .srem::<_, _, ()>(format!("ws:subs:{}", other_ch), stale_id)
+                    .await;
+            }
+            let _ = conn.del::<_, ()>(format!("ws:conn:{}", stale_id)).await;
+        }
+
+        if !stale_conns.is_empty() {
+            tracing::info!(
+                channel = %ch_name,
+                stale_count = stale_conns.len(),
+                "cleaned up stale ws connections"
+            );
+        }
+    }
 }
 
 // ── Static string helpers ─────────────────────────────────────────────────────

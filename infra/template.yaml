@@ -47,6 +47,11 @@ Parameters:
     Default: ''
     Description: ACM certificate ARN for custom domain (us-east-1).
 
+  WsHandlerImageUri:
+    Type: String
+    Default: '210352747749.dkr.ecr.us-east-1.amazonaws.com/serverless-matching-engine/sme-ws-handler:latest'
+    Description: WebSocket Handler Lambda ECR image URI.
+
 # ---------------------------------------------------------------------------
 # Resources — Nested CloudFormation stacks (each is a SAM template)
 # ---------------------------------------------------------------------------
@@ -88,6 +93,7 @@ Resources:
         WorkerLambdaSecurityGroupId: !GetAtt NetworkStack.Outputs.WorkerLambdaSecurityGroupId
         RDSSecurityGroupId: !GetAtt NetworkStack.Outputs.RDSSecurityGroupId
         PublicSubnetB: !GetAtt NetworkStack.Outputs.PublicSubnetB
+        WsHandlerImageUri: !Ref WsHandlerImageUri
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -141,3 +147,7 @@ Outputs:
   VpcId:
     Description: VPC ID
     Value: !GetAtt NetworkStack.Outputs.VpcId
+
+  WebSocketUrl:
+    Description: WebSocket API URL for real-time feeds
+    Value: !GetAtt BackendStack.Outputs.WebSocketUrl
