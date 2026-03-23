@@ -29,6 +29,16 @@ Parameters:
     Default: '*'
     Description: CORS allowed origin for API Gateway. Use your CloudFront URL in production.
 
+  GatewayImageUri:
+    Type: String
+    Default: '210352747749.dkr.ecr.us-east-1.amazonaws.com/serverless-matching-engine/sme-gateway:latest'
+    Description: Gateway Lambda ECR image URI
+
+  WorkerImageUri:
+    Type: String
+    Default: '210352747749.dkr.ecr.us-east-1.amazonaws.com/serverless-matching-engine/sme-worker:latest'
+    Description: Worker Lambda ECR image URI
+
   # Network inputs (passed from root template via nested stack outputs)
   VpcId:
     Type: AWS::EC2::VPC::Id
@@ -344,6 +354,7 @@ Resources:
       FunctionName: !Sub '${ProjectName}-gateway'
       Description: sme-gateway HTTP handler via AWS Lambda Web Adapter (zero code changes)
       PackageType: Image
+      ImageUri: !Ref GatewayImageUri
       Architectures:
         - arm64
       MemorySize: 512
@@ -371,10 +382,6 @@ Resources:
           WORKER_LAMBDA_ARN: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-worker'
       Tags:
         Project: !Ref ProjectName
-    Metadata:
-      DockerTag: !Sub '${ProjectName}-gateway'
-      DockerContext: ../..
-      Dockerfile: infra/Dockerfile.gateway
 
   LambdaPermissionAPIGW:
     Type: AWS::Lambda::Permission
@@ -396,6 +403,7 @@ Resources:
       FunctionName: !Sub '${ProjectName}-worker'
       Description: sme-worker-lambda - order matching, PG persistence, cache updates
       PackageType: Image
+      ImageUri: !Ref WorkerImageUri
       Architectures:
         - arm64
       # 1024MB: needs headroom for PG + Dragonfly connection pools and match logic
@@ -416,10 +424,6 @@ Resources:
           RUST_LOG: info
       Tags:
         Project: !Ref ProjectName
-    Metadata:
-      DockerTag: !Sub '${ProjectName}-worker'
-      DockerContext: ../..
-      Dockerfile: infra/Dockerfile.worker
 
   # =========================================================================
   # API Gateway HTTP API (v2 - cheapest: $1/million requests)
