@@ -20,8 +20,10 @@ INFRA_DIR="${PROJECT_ROOT}/infra"
 
 GATEWAY_REPO="serverless-matching-engine/sme-gateway"
 WORKER_REPO="serverless-matching-engine/sme-worker"
+WS_HANDLER_REPO="serverless-matching-engine/sme-ws-handler"
 GATEWAY_URI="${ECR_BASE}/${GATEWAY_REPO}:latest"
 WORKER_URI="${ECR_BASE}/${WORKER_REPO}:latest"
+WS_HANDLER_URI="${ECR_BASE}/${WS_HANDLER_REPO}:latest"
 
 STACK_NAME="serverless-matching-engine-backend"
 
@@ -54,6 +56,14 @@ if [[ "$SKIP_BUILD" == false && "$DEPLOY_ONLY" == false ]]; then
     -t "${WORKER_URI}" \
     "${PROJECT_ROOT}"
 
+  echo "→ Building ws-handler..."
+  docker buildx build \
+    --platform linux/arm64 \
+    --provenance=false \
+    -f "${INFRA_DIR}/Dockerfile.ws-handler" \
+    -t "${WS_HANDLER_URI}" \
+    "${PROJECT_ROOT}"
+
   echo "=== Docker images built ==="
 fi
 
@@ -64,7 +74,7 @@ if [[ "$DEPLOY_ONLY" == false ]]; then
   aws ecr get-login-password --region "${REGION}" | \
     docker login --username AWS --password-stdin "${ECR_BASE}"
 
-  for repo in "${GATEWAY_REPO}" "${WORKER_REPO}"; do
+  for repo in "${GATEWAY_REPO}" "${WORKER_REPO}" "${WS_HANDLER_REPO}"; do
     aws ecr describe-repositories --repository-names "${repo}" --region "${REGION}" 2>/dev/null || \
       aws ecr create-repository --repository-name "${repo}" --region "${REGION}" \
         --image-scanning-configuration scanOnPush=false
@@ -75,6 +85,9 @@ if [[ "$DEPLOY_ONLY" == false ]]; then
 
   echo "→ Pushing worker..."
   docker push "${WORKER_URI}"
+
+  echo "→ Pushing ws-handler..."
+  docker push "${WS_HANDLER_URI}"
 
   echo "=== Images pushed ==="
 fi
