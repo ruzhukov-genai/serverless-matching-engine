@@ -41,6 +41,7 @@ enum Mode {
 
 struct Config {
     base_url: String,
+    ws_url: Option<String>,
     pairs: Vec<String>,
     concurrency_levels: Vec<usize>,
     duration_secs: u64,
@@ -95,8 +96,15 @@ impl Config {
             .and_then(|i| args.get(i + 1))
             .cloned();
 
+        let ws_url = args
+            .iter()
+            .position(|a| a == "--ws-url")
+            .and_then(|i| args.get(i + 1))
+            .cloned();
+
         Config {
             base_url: get("--url", "http://localhost:3001"),
+            ws_url,
             pairs,
             concurrency_levels,
             duration_secs: get("--duration", "10").parse().unwrap_or(10),
@@ -108,6 +116,9 @@ impl Config {
     }
 
     fn ws_base_url(&self) -> String {
+        if let Some(ref url) = self.ws_url {
+            return url.clone();
+        }
         self.base_url
             .replacen("https://", "wss://", 1)
             .replacen("http://", "ws://", 1)
@@ -247,7 +258,13 @@ async fn ws_trade_loop(
     trade_count: Arc<AtomicU64>,
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<()> {
-    let url = format!("{ws_url}/ws/stream");
+    // On AWS: ws_url is wss://xxx.execute-api.../ws (complete, no suffix needed)
+    // Locally: ws_url is ws://localhost:3001 (needs /ws/stream suffix)
+    let url = if ws_url.contains("execute-api") || ws_url.ends_with("/ws") {
+        ws_url.clone()
+    } else {
+        format!("{ws_url}/ws/stream")
+    };
     let (ws_stream, _) = connect_async(&url).await?;
     let (mut write, mut read) = ws_stream.split();
 
