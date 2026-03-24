@@ -590,7 +590,7 @@ Resources:
       AutoDeploy: true
       DefaultRouteSettings:
         ThrottlingBurstLimit: 5000
-        ThrottlingRateLimit: 1000
+        ThrottlingRateLimit: 5000
       Tags:
         Project: !Ref ProjectName
 
