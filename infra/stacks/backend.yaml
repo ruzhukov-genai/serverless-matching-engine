@@ -361,7 +361,6 @@ Resources:
   # Non-cluster mode required: our Lua scripts access keys in different slots (ADR-004)
   # =========================================================================
   ElastiCacheSubnetGroup:
-    Condition: UseElastiCache
     Type: AWS::ElastiCache::SubnetGroup
     Properties:
       Description: ElastiCache subnet group for SME
@@ -370,7 +369,6 @@ Resources:
         - !Ref PrivateSubnetB
 
   ElastiCacheRedis:
-    Condition: UseElastiCache
     Type: AWS::ElastiCache::CacheCluster
     Properties:
       CacheNodeType: cache.t4g.micro
