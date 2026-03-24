@@ -98,6 +98,31 @@ python3 tests/smoke/smoke_test.py \
 python3 tests/smoke/smoke_test.py --no-browser
 ```
 
+### Latency Instrumentation
+
+Every order records three lifecycle timestamps in the `orders` table:
+- `received_at` — when Gateway Lambda receives the order from the client
+- `matched_at` — when Lua EVAL completes (order matched or placed in book)
+- `persisted_at` — when PG transaction commits (set via `NOW()` inside INSERT)
+
+**Latency analysis queries after a benchmark run:**
+```sql
+-- Average latency breakdown
+SELECT
+  count(*) as orders,
+  avg(extract(epoch from matched_at - received_at) * 1000)::int as avg_match_ms,
+  avg(extract(epoch from persisted_at - matched_at) * 1000)::int as avg_persist_ms,
+  avg(extract(epoch from persisted_at - received_at) * 1000)::int as avg_total_ms
+FROM orders WHERE received_at IS NOT NULL;
+
+-- Percentiles (gateway→match latency)
+SELECT
+  percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from matched_at - received_at) * 1000)::int as p50_ms,
+  percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch from matched_at - received_at) * 1000)::int as p95_ms,
+  percentile_cont(0.99) WITHIN GROUP (ORDER BY extract(epoch from matched_at - received_at) * 1000)::int as p99_ms
+FROM orders WHERE received_at IS NOT NULL;
+```
+
 ### Concurrency
 - **Matching is atomic via Lua EVAL** — no distributed lock needed (ADR-004)
 - Version counter: `version:{pair_id}` (INCR inside Lua after book mutation)
