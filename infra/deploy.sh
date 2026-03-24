@@ -156,10 +156,7 @@ echo "  WS_URL:  ${WS_URL}"
 # ── Step 5: Upload frontend to S3 + invalidate CloudFront ────────────────────
 if [[ -n "${BUCKET}" ]]; then
   echo "=== Uploading frontend to S3 ==="
-  aws s3 sync "${PROJECT_ROOT}/web/trading/" "s3://${BUCKET}/trading/" --delete
-  aws s3 sync "${PROJECT_ROOT}/web/dashboard/" "s3://${BUCKET}/dashboard/" --delete 2>/dev/null || true
-  echo '<html><head><meta http-equiv="refresh" content="0; url=/trading/"></head></html>' | \
-    aws s3 cp - "s3://${BUCKET}/index.html" --content-type "text/html"
+  aws s3 sync "${PROJECT_ROOT}/web/trading/" "s3://${BUCKET}/" --exclude "*.md" --delete
 
   if [[ -n "${CF_DIST_ID}" ]]; then
     echo "=== Invalidating CloudFront cache ==="
@@ -168,5 +165,5 @@ if [[ -n "${BUCKET}" ]]; then
   fi
 
   echo ""
-  echo "Frontend: ${CF_URL}/trading/"
+  echo "Frontend: ${CF_URL}/"
 fi
