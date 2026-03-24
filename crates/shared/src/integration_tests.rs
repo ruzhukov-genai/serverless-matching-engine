@@ -2153,7 +2153,8 @@ mod tests {
 
         // Incoming crossing bid
         let bid = test_order(Side::Buy, dec!(100), dec!(1), pair, "buyer-1");
-        let result = cache::match_order_lua(&pool, &bid).await.unwrap();
+        let pair_keys = cache::PairKeys::new(pair);
+        let result = cache::match_order_lua(&pool, &bid, &pair_keys, "", 0).await.unwrap();
 
         // One trade should have been produced
         assert_eq!(result.trades.len(), 1, "expected 1 trade");
@@ -2188,7 +2189,8 @@ mod tests {
 
         // Smaller incoming bid: 2 units @ 100
         let bid = test_order(Side::Buy, dec!(100), dec!(2), pair, "buyer-2");
-        let result = cache::match_order_lua(&pool, &bid).await.unwrap();
+        let pair_keys = cache::PairKeys::new(pair);
+        let result = cache::match_order_lua(&pool, &bid, &pair_keys, "", 0).await.unwrap();
 
         // Bid fully filled, 1 trade for 2 units
         assert_eq!(result.trades.len(), 1);
@@ -2219,7 +2221,8 @@ mod tests {
 
         // Incoming bid at 100 — below best ask, no cross
         let bid = test_order(Side::Buy, dec!(100), dec!(1), pair, "buyer-3");
-        let result = cache::match_order_lua(&pool, &bid).await.unwrap();
+        let pair_keys = cache::PairKeys::new(pair);
+        let result = cache::match_order_lua(&pool, &bid, &pair_keys, "", 0).await.unwrap();
 
         // No trades
         assert_eq!(result.trades.len(), 0, "no trades expected when bid < ask");
@@ -2258,7 +2261,8 @@ mod tests {
 
         // Incoming bid: 3 units @ 105 — sweeps all 3 price levels
         let bid = test_order(Side::Buy, dec!(105), dec!(3), pair, "b-ml-1");
-        let result = cache::match_order_lua(&pool, &bid).await.unwrap();
+        let pair_keys = cache::PairKeys::new(pair);
+        let result = cache::match_order_lua(&pool, &bid, &pair_keys, "", 0).await.unwrap();
 
         // 3 trades at the 3 ask prices
         assert_eq!(result.trades.len(), 3, "expected 3 trades");
@@ -2309,7 +2313,8 @@ mod tests {
             updated_at: Utc::now(),
             client_order_id: None,
         };
-        let result = cache::match_order_lua(&pool, &bid).await.unwrap();
+        let pair_keys = cache::PairKeys::new(pair);
+        let result = cache::match_order_lua(&pool, &bid, &pair_keys, "", 0).await.unwrap();
 
         // No trade — STP prevented it
         assert_eq!(result.trades.len(), 0, "STP CancelMaker must produce no trade");

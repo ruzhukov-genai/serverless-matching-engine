@@ -426,10 +426,12 @@ pub async fn load_order_book_filtered(
     let (min_score, max_score) = match limit_price {
         None => ("-inf".to_string(), "+inf".to_string()),
         Some(price) => {
-            let f: f64 = price.to_string().parse().unwrap_or(0.0);
+            let price_i = decimal_to_i64(price);
             match side {
-                Side::Sell => ("-inf".to_string(), f.to_string()),
-                Side::Buy => ("-inf".to_string(), (-f).to_string()),
+                // Asks stored with score = +price_i; filter asks <= buyer's price
+                Side::Sell => ("-inf".to_string(), (price_i as f64).to_string()),
+                // Bids stored with score = -price_i; filter bids >= seller's price → score <= -price_i
+                Side::Buy => ("-inf".to_string(), (-(price_i as f64)).to_string()),
             }
         }
     };
@@ -696,10 +698,12 @@ pub async fn load_order_book_snapshot(
     let (min_score, max_score) = match limit_price {
         None => ("-inf".to_string(), "+inf".to_string()),
         Some(price) => {
-            let f: f64 = price.to_string().parse().unwrap_or(0.0);
+            let price_i = decimal_to_i64(price);
             match side {
-                Side::Sell => ("-inf".to_string(), f.to_string()),
-                Side::Buy => ("-inf".to_string(), (-f).to_string()),
+                // Asks stored with score = +price_i; filter asks <= buyer's price
+                Side::Sell => ("-inf".to_string(), (price_i as f64).to_string()),
+                // Bids stored with score = -price_i; filter bids >= seller's price → score <= -price_i
+                Side::Buy => ("-inf".to_string(), (-(price_i as f64)).to_string()),
             }
         }
     };
@@ -977,7 +981,7 @@ pub async fn match_order_lua(
     let incoming_order_key = format!("order:{}", order.id);
 
     let price_i = order.price.map(decimal_to_i64).unwrap_or(0);
-    let score = order.book_score();
+    let _score = order.book_score();
 
     // Calculate price bound (max_score) for ZRANGEBYSCORE inside Lua.
     // Ask scores are positive (+price_i). Bid scores are negative (-price_i).
