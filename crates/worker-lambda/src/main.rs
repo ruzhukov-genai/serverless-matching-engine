@@ -92,6 +92,10 @@ async fn get_state() -> Result<&'static WorkerState> {
     cache::init_balances_from_pg(&dragonfly, &pg).await
         .context("failed to init balance cache")?;
 
+    // Seed cache:pairs on cold start (Gateway reads this for /api/pairs)
+    seed_pairs_cache(&dragonfly, &pg).await
+        .context("failed to seed cache:pairs")?;
+
     let state = WorkerState { dragonfly, pg, pairs_cache, pair_keys };
 
     // Ignore error if another invocation raced us (OnceCell guarantees only one wins)
@@ -118,6 +122,42 @@ async fn load_pairs_cache(pg: &sqlx::PgPool) -> Result<HashMap<String, PairConfi
         });
     }
     Ok(map)
+}
+
+/// Seed cache:pairs from PG so the Gateway's /api/pairs endpoint returns valid JSON.
+async fn seed_pairs_cache(dragonfly: &deadpool_redis::Pool, pg: &sqlx::PgPool) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT id, base, quote, tick_size, lot_size, min_order_size, max_order_size, \
+         price_precision, qty_precision, price_band_pct, active \
+         FROM pairs WHERE active = true",
+    )
+    .fetch_all(pg)
+    .await?;
+
+    let pairs: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.get::<String, _>("id"),
+                "base": r.get::<String, _>("base"),
+                "quote": r.get::<String, _>("quote"),
+                "tick_size": r.get::<Decimal, _>("tick_size").to_string(),
+                "lot_size": r.get::<Decimal, _>("lot_size").to_string(),
+                "min_order_size": r.get::<Decimal, _>("min_order_size").to_string(),
+                "max_order_size": r.get::<Decimal, _>("max_order_size").to_string(),
+                "price_precision": r.get::<i16, _>("price_precision"),
+                "qty_precision": r.get::<i16, _>("qty_precision"),
+                "price_band_pct": r.get::<Decimal, _>("price_band_pct").to_string(),
+                "active": r.get::<bool, _>("active"),
+            })
+        })
+        .collect();
+
+    let pairs_json = json!({"pairs": pairs});
+    let pairs_str = serde_json::to_string(&pairs_json)?;
+    cache::set_and_publish(dragonfly, "cache:pairs", &pairs_str).await?;
+    tracing::info!(count = pairs.len(), "cache:pairs seeded");
+    Ok(())
 }
 
 // ── Order message format (same as gateway currently pushes to queue) ──────────

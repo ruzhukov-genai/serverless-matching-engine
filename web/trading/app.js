@@ -2,6 +2,9 @@
 'use strict';
 
 const API = window.location.origin;
+// For AWS: WebSocket API is on a separate endpoint (API Gateway WebSocket API).
+// Set via ?ws=wss://xxx.execute-api... or auto-detect from same origin.
+const WS_OVERRIDE = new URLSearchParams(window.location.search).get('ws');
 let currentPair = null;
 let currentPairConfig = null;
 let currentSide = 'buy';
@@ -444,7 +447,7 @@ function prependTrade(trade) {
 // ── WebSocket ─────────────────────────────────────────────────────────────────
 
 function connectWebSockets(pairId) {
-    const wsBase = API.replace(/^https?/, proto => proto === 'https' ? 'wss' : 'ws');
+    const wsBase = WS_OVERRIDE || API.replace(/^https?/, proto => proto === 'https' ? 'wss' : 'ws');
     if (USE_MUX_WS) {
         connectMuxWS(wsBase, pairId);
     } else {
@@ -473,7 +476,9 @@ function connectMuxWS(wsBase, pairId) {
 
     const userId = 'user-1'; // TODO: make configurable
     try {
-        const sock = new WebSocket(`${wsBase}/ws/stream`);
+        // WS_OVERRIDE is already a full URL (wss://xxx/ws); local needs /ws/stream suffix
+        const wsUrl = WS_OVERRIDE ? wsBase : `${wsBase}/ws/stream`;
+        const sock = new WebSocket(wsUrl);
         ws.stream = sock;
         sock.onopen = () => {
             // ── P2 — Update connection status ─────────────────────────────────
