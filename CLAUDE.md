@@ -200,6 +200,16 @@ python3 tools/benchmark.py
 | `AGENTS.md` | → `CLAUDE.md` |
 | `.github/copilot-instructions.md` | → `CLAUDE.md` |
 
+## AWS Deployment
+
+**Infrastructure is SAM nested stacks — NEVER deploy individual stack templates directly.**
+
+- Root stack: `serverless-matching-engine` (deploy via `sam deploy` from repo root)
+- Nested: `BackendStack-7JBC7XEVQNKF`, `NetworkStack-1CC1NUX65RXPV`, `FrontendStack-156KD6ROT0G0S`
+- Individual `infra/stacks/*.yaml` files are NOT standalone — they reference parent parameters/conditions
+- For Lambda code updates without full redeploy: `aws lambda update-function-code`
+- Lambda function names: `serverless-matching-engine-gateway`, `serverless-matching-engine-worker`, `serverless-matching-engine-ws-handler`
+
 ## Don'ts
 
 - Don't use `f64` for prices or quantities
