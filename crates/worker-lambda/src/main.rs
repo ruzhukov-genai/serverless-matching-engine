@@ -310,7 +310,10 @@ async fn process_order(state: &WorkerState, payload: &Value) -> Result<()> {
         pair_keys,
         &lock_asset,
         lock_amount_scaled,
-    ).await.context("Lua EVAL failed")?;
+    ).await.map_err(|e| {
+        tracing::error!(error = %e, pair_id = %order.pair_id, "Lua EVAL failed");
+        anyhow::anyhow!("Lua EVAL failed: {e}")
+    })?;
     let lua_ms = match_start.elapsed().as_millis() as u64;
 
     order.remaining = lua_result.remaining;
