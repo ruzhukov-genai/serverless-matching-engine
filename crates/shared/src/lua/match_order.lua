@@ -86,10 +86,15 @@ local status = "N"
 local trades = {}
 
 -- ── Match loop over resting order candidates ─────────────────────────────────
+-- NOTE: Uses repeat/until true pattern for "continue" since Redis uses Lua 5.1
+-- which lacks goto. `break` inside the repeat block skips to next iteration.
+local match_break = false
 for _, rid in ipairs(resting_ids) do
-    if remaining_i <= 0 then break end
+    if remaining_i <= 0 or match_break then break end
 
-    -- Access order hash directly — Dragonfly (non-cluster) allows undeclared keys in scripts
+    repeat  -- "continue" block: break here = skip to next resting order
+
+    -- Access order hash directly — standalone Redis allows undeclared keys in scripts
     local rkey = 'order:' .. rid
     local rfields = redis.call('HMGET', rkey,
         'price_i', 'remaining_i', 'user_id', 'stp', 'status', 'order_type')
@@ -103,7 +108,7 @@ for _, rid in ipairs(resting_ids) do
 
     -- Skip ghost / already-consumed entries
     if r_status == 'F' or r_status == 'C' or r_remaining_i <= 0 then
-        goto continue
+        break  -- continue
     end
 
     -- ── Price compatibility check ────────────────────────────────────────
@@ -117,6 +122,7 @@ for _, rid in ipairs(resting_ids) do
     end
 
     if not crosses then
+        match_break = true
         break  -- book is sorted by best price; no further matches possible
     end
 
@@ -128,16 +134,18 @@ for _, rid in ipairs(resting_ids) do
         if combined == 'CM' then
             redis.call('ZREM', opp_key, rid)
             redis.call('DEL', rkey)
-            goto continue
+            break  -- continue
         elseif combined == 'CT' then
             status = 'C'
             remaining_i = 0
+            match_break = true
             break
         elseif combined == 'CB' then
             redis.call('ZREM', opp_key, rid)
             redis.call('DEL', rkey)
             status = 'C'
             remaining_i = 0
+            match_break = true
             break
         end
         -- STP=N with same user: fall through and trade
@@ -180,7 +188,7 @@ for _, rid in ipairs(resting_ids) do
             'status', 'PF')
     end
 
-    ::continue::
+    until true  -- end "continue" block
 end
 
 -- ── Apply TIF rules ──────────────────────────────────────────────────────────
