@@ -233,6 +233,9 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             client_order_id: None,
+            received_at: None,
+            matched_at: None,
+            persisted_at: None,
         }
     }
 

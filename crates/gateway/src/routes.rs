@@ -288,6 +288,7 @@ pub async fn create_order(
         "stp_mode": stp_str(stp_mode),
         "client_order_id": req.client_order_id,
         "created_at": now.to_rfc3339(),
+        "received_at": now.to_rfc3339(),
     });
 
     let order_str = serde_json::to_string(&order_json)?;

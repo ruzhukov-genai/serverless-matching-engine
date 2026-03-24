@@ -87,6 +87,14 @@ pub async fn run_migrations(pool: &PgPool) -> Result<()> {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_idempotency ON orders(user_id, client_order_id) WHERE client_order_id IS NOT NULL",
         // Migration 004: Performance indexes
         "CREATE INDEX IF NOT EXISTS idx_orders_user_status_created ON orders(user_id, status, created_at DESC)",
+        // Migration 005: Order lifecycle timestamps (latency instrumentation)
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS received_at TIMESTAMPTZ",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS matched_at TIMESTAMPTZ",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS persisted_at TIMESTAMPTZ",
+        // One-time cleanup: clear old data without lifecycle timestamps.
+        // Uses TRUNCATE CASCADE for speed — safe because old orders have no received_at.
+        // Idempotent: after first run, no rows match the WHERE clause.
+        "DO $$ BEGIN IF EXISTS (SELECT 1 FROM orders WHERE received_at IS NULL LIMIT 1) THEN TRUNCATE orders CASCADE; END IF; END $$",
     ];
 
     for stmt in statements {

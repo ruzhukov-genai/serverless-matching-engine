@@ -204,6 +204,8 @@ struct QueuedOrderMsg {
     client_order_id: Option<String>,
     #[serde(default)]
     created_at: Option<String>,
+    #[serde(default)]
+    received_at: Option<String>,
 }
 
 fn default_gtc() -> String { "GTC".to_string() }
@@ -270,6 +272,11 @@ async fn process_order(state: &WorkerState, payload: &Value) -> Result<()> {
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(Utc::now);
 
+    let received_at = msg.received_at.as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or(created_at);
+
     let now = Utc::now();
     let mut order = Order {
         id: order_id,
@@ -288,6 +295,9 @@ async fn process_order(state: &WorkerState, payload: &Value) -> Result<()> {
         created_at,
         updated_at: now,
         client_order_id: msg.client_order_id,
+        received_at: Some(received_at),
+        matched_at: None,
+        persisted_at: None,
     };
 
     // 1. Validate against in-memory pairs cache (zero DB round-trips)
@@ -330,6 +340,7 @@ async fn process_order(state: &WorkerState, payload: &Value) -> Result<()> {
         anyhow::anyhow!("Lua EVAL failed: {e}")
     })?;
     let lua_ms = match_start.elapsed().as_millis() as u64;
+    order.matched_at = Some(Utc::now());
 
     order.remaining = lua_result.remaining;
     order.status = lua_result.status;
@@ -362,6 +373,8 @@ async fn process_order(state: &WorkerState, payload: &Value) -> Result<()> {
     let persist_start = std::time::Instant::now();
     persist_order(state, &order, &trades, &lua_result.trades).await
         .context("DB persist failed")?;
+    let persisted_at = Utc::now();
+    order.persisted_at = Some(persisted_at);
     let persist_ms = persist_start.elapsed().as_millis() as u64;
 
     // 8. Update cache keys (orderbook, trades, ticker, portfolio)
@@ -430,8 +443,8 @@ async fn persist_order(
 
     // Insert the incoming order
     sqlx::query(
-        "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, created_at, updated_at, client_order_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+        "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, created_at, updated_at, client_order_id, received_at, matched_at, persisted_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW())
          ON CONFLICT DO NOTHING",
     )
     .bind(order.id)
@@ -449,6 +462,8 @@ async fn persist_order(
     .bind(order.created_at)
     .bind(order.updated_at)
     .bind(&order.client_order_id)
+    .bind(order.received_at)
+    .bind(order.matched_at)
     .execute(&mut *tx)
     .await?;
 
@@ -999,6 +1014,9 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             client_order_id: None,
+            received_at: None,
+            matched_at: None,
+            persisted_at: None,
         };
         let result = validate_order(&pairs_cache, &order);
         assert!(result.is_err());
@@ -1032,6 +1050,9 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             client_order_id: None,
+            received_at: None,
+            matched_at: None,
+            persisted_at: None,
         };
         let result = validate_order(&pairs_cache, &order);
         assert!(result.is_err());

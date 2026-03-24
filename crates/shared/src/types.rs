@@ -80,6 +80,18 @@ pub struct Order {
     /// with the same (user_id, client_order_id) return the existing order.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_order_id: Option<String>,
+
+    /// Timestamp when the Gateway Lambda received the order from the client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub received_at: Option<DateTime<Utc>>,
+
+    /// Timestamp when the matching engine completed (Lua EVAL finished).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_at: Option<DateTime<Utc>>,
+
+    /// Timestamp when the order was persisted to the database.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persisted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

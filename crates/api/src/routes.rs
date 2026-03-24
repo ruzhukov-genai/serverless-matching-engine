@@ -118,8 +118,8 @@ async fn process_persist_batch(pg: &sqlx::PgPool, batch: Vec<PersistJob>) -> any
     // 1. INSERT all orders
     for job in &batch {
         sqlx::query(
-            "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, created_at, updated_at, client_order_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+            "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, created_at, updated_at, client_order_id, received_at, matched_at, persisted_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW())
              ON CONFLICT DO NOTHING",
         )
         .bind(job.order.id)
@@ -137,6 +137,8 @@ async fn process_persist_batch(pg: &sqlx::PgPool, batch: Vec<PersistJob>) -> any
         .bind(job.order.created_at)
         .bind(job.order.updated_at)
         .bind(&job.order.client_order_id)
+        .bind(job.order.received_at)
+        .bind(job.order.matched_at)
         .execute(&mut *tx)
         .await?;
     }
@@ -351,8 +353,8 @@ pub fn validate_order_request(
 
 pub async fn insert_order_db(pg: &sqlx::PgPool, order: &Order) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, created_at, updated_at, client_order_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+        "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, created_at, updated_at, client_order_id, received_at, matched_at, persisted_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW())
          ON CONFLICT DO NOTHING",
     )
     .bind(order.id)
@@ -370,6 +372,8 @@ pub async fn insert_order_db(pg: &sqlx::PgPool, order: &Order) -> anyhow::Result
     .bind(order.created_at)
     .bind(order.updated_at)
     .bind(&order.client_order_id)
+    .bind(order.received_at)
+    .bind(order.matched_at)
     .execute(pg)
     .await?;
     Ok(())
@@ -480,6 +484,9 @@ fn _row_to_order(r: &sqlx::postgres::PgRow) -> Order {
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
         client_order_id: r.get("client_order_id"),
+        received_at: r.try_get("received_at").ok().flatten(),
+        matched_at: r.try_get("matched_at").ok().flatten(),
+        persisted_at: r.try_get("persisted_at").ok().flatten(),
     }
 }
 

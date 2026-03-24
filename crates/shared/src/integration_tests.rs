@@ -47,6 +47,9 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             client_order_id: None,
+            received_at: None,
+            matched_at: None,
+            persisted_at: None,
         }
     }
 
@@ -2312,6 +2315,9 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             client_order_id: None,
+            received_at: None,
+            matched_at: None,
+            persisted_at: None,
         };
         let pair_keys = cache::PairKeys::new(pair);
         let result = cache::match_order_lua(&pool, &bid, &pair_keys, "", 0).await.unwrap();
@@ -2495,6 +2501,9 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             client_order_id: None,
+            received_at: None,
+            matched_at: None,
+            persisted_at: None,
         };
 
         cache::save_order_to_book(&pool, &order).await.unwrap();

@@ -432,6 +432,8 @@ struct QueuedOrderMsg {
     client_order_id: Option<String>,
     #[serde(default)]
     created_at: Option<String>,
+    #[serde(default)]
+    received_at: Option<String>,
 }
 
 fn default_gtc() -> String { "GTC".to_string() }
@@ -481,6 +483,11 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .unwrap_or_else(Utc::now);
 
+    let received_at = msg.received_at.as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or(created_at);
+
     let now = Utc::now();
     let mut order = Order {
         id: order_id,
@@ -499,6 +506,9 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
         created_at,
         updated_at: now,
         client_order_id: msg.client_order_id,
+        received_at: Some(received_at),
+        matched_at: None,
+        persisted_at: None,
     };
 
     let parse_us = parse_start.elapsed().as_micros() as u64;
@@ -557,6 +567,7 @@ async fn process_queued_order(state: &AppState, order_str: &str) -> anyhow::Resu
         lock_amount_scaled,
     ).await?;
     let lua_us = match_start.elapsed().as_micros() as u64;
+    order.matched_at = Some(Utc::now());
 
     // Apply Lua result to the incoming order struct
     order.remaining = lua_result.remaining;
@@ -737,6 +748,9 @@ async fn process_cancellation(state: &AppState, cancel_str: &str) -> anyhow::Res
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 client_order_id: None,
+                received_at: None,
+                matched_at: None,
+                persisted_at: None,
             };
             cache::remove_order_from_book(&state.dragonfly, &cancel_order).await?;
 

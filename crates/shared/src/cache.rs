@@ -267,6 +267,9 @@ fn parse_order_from_hmget(values: &[Option<String>]) -> Option<Order> {
         created_at,
         updated_at: created_at, // updated_at not stored in cache; use created_at
         client_order_id: None,  // not stored in cache
+        received_at: None,
+        matched_at: None,
+        persisted_at: None,
     })
 }
 
@@ -654,6 +657,9 @@ pub async fn seed_orderbook_from_pg(pool: &Pool, pg: &sqlx::PgPool) -> Result<()
             created_at,
             updated_at: created_at,
             client_order_id: None,
+            received_at: None,
+            matched_at: None,
+            persisted_at: None,
         };
 
         save_order_to_book(pool, &order).await
@@ -1335,6 +1341,9 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             client_order_id: None,
+            received_at: None,
+            matched_at: None,
+            persisted_at: None,
         }
     }
 
