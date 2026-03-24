@@ -105,6 +105,21 @@ async fn get_state() -> Result<&'static WorkerState> {
     cache::seed_ticker_from_pg(&dragonfly, &pg, &pair_ids).await
         .context("failed to seed ticker cache from PG")?;
 
+    // Lua EVAL smoke test
+    {
+        let mut conn = dragonfly.get().await.context("pool.get for lua test")?;
+        let test_result: redis::Value = redis::cmd("EVAL")
+            .arg("return redis.call('SET','__lua_test','ok')")
+            .arg(0)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "Lua EVAL smoke test FAILED");
+                anyhow::anyhow!("Lua smoke test failed: {e}")
+            })?;
+        tracing::info!(?test_result, "Lua EVAL smoke test passed");
+    }
+
     let state = WorkerState { dragonfly, pg, pairs_cache, pair_keys };
 
     // Ignore error if another invocation raced us (OnceCell guarantees only one wins)

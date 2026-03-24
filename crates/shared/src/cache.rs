@@ -1212,7 +1212,10 @@ pub async fn match_order_lua(
     let raw: redis::Value = invocation
         .invoke_async(&mut *conn)
         .await
-        .context("Lua match_order EVAL")?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Lua match_order EVAL failed (redis error)");
+            anyhow::anyhow!("Lua match_order EVAL: {e}")
+        })?;
 
     // Parse the returned bulk array:
     //   [0] = "OK"  (or "INSUFFICIENT_BALANCE" for balance lock failure)
