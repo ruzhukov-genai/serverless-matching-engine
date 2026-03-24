@@ -597,7 +597,7 @@ pub async fn seed_orderbook_from_pg(pool: &Pool, pg: &sqlx::PgPool) -> Result<()
         let remaining: Decimal = row.get("remaining");
         let status_str: String = row.get("status");
         let stp_str: String = row.get("stp_mode");
-        let version: i32 = row.get("version");
+        let version: i64 = row.get("version");
         let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
 
         let side = match side_str.as_str() {
