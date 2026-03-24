@@ -72,6 +72,38 @@ services:
       timeout: 3s
       retries: 5
 
+  # Valkey — Redis-compatible cache (matches ElastiCache/production Lua 5.1)
+  # Usage: docker compose --profile valkey up -d
+  # Then point apps at redis://127.0.0.1:6380
+  valkey:
+    image: valkey/valkey:8.1-alpine
+    container_name: sme-valkey
+    profiles: ["valkey"]
+    network_mode: host
+    volumes:
+      - valkey-data:/data
+    command: >
+      valkey-server
+      --bind 127.0.0.1
+      --port 6380
+      --maxmemory 1gb
+      --maxmemory-policy allkeys-lru
+      --tcp-keepalive 60
+      --hz 500
+      --save ""
+      --appendonly no
+      --loglevel notice
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1500M
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-h", "127.0.0.1", "-p", "6380", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   # --- Service containers (uncomment when ready) ---
   # Run locally with: cargo run --bin <name>
 
@@ -132,4 +164,5 @@ services:
 
 volumes:
   dragonfly-data:
+  valkey-data:
   postgres-data:
