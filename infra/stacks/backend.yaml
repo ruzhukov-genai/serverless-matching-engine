@@ -369,15 +369,18 @@ Resources:
         - !Ref PrivateSubnetB
 
   ElastiCacheRedis:
-    Type: AWS::ElastiCache::CacheCluster
+    Type: AWS::ElastiCache::ReplicationGroup
+    Condition: UseElastiCache
     Properties:
+      ReplicationGroupDescription: !Sub '${ProjectName} Valkey cache'
+      Engine: valkey
+      EngineVersion: '8.1'
       CacheNodeType: cache.t4g.micro
-      Engine: redis
-      EngineVersion: '7.1'
-      NumCacheNodes: 1
+      NumCacheClusters: 1
       CacheSubnetGroupName: !Ref ElastiCacheSubnetGroup
-      VpcSecurityGroupIds:
+      SecurityGroupIds:
         - !Ref ElastiCacheSecurityGroupId
+      TransitEncryptionEnabled: false
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -432,7 +435,7 @@ Resources:
           # Application settings — CacheMode toggles between EC2 Dragonfly and ElastiCache
           DRAGONFLY_URL: !If
             - UseElastiCache
-            - !Sub 'redis://${ElastiCacheRedis.RedisEndpoint.Address}:6379'
+            - !Sub 'redis://${ElastiCacheRedis.PrimaryEndPoint.Address}:6379'
             - !Sub 'redis://${EC2Instance.PrivateIp}:6379'
           RUST_LOG: info
           # Worker Lambda dispatch
@@ -479,7 +482,7 @@ Resources:
         Variables:
           DRAGONFLY_URL: !If
             - UseElastiCache
-            - !Sub 'redis://${ElastiCacheRedis.RedisEndpoint.Address}:6379'
+            - !Sub 'redis://${ElastiCacheRedis.PrimaryEndPoint.Address}:6379'
             - !Sub 'redis://${EC2Instance.PrivateIp}:6379'
           DATABASE_URL: !Sub 'postgres://sme:${DBPassword}@${RDSInstance.Endpoint.Address}:5432/matching_engine'
           RUST_LOG: info
@@ -585,7 +588,7 @@ Resources:
         Variables:
           DRAGONFLY_URL: !If
             - UseElastiCache
-            - !Sub 'redis://${ElastiCacheRedis.RedisEndpoint.Address}:6379'
+            - !Sub 'redis://${ElastiCacheRedis.PrimaryEndPoint.Address}:6379'
             - !Sub 'redis://${EC2Instance.PrivateIp}:6379'
           RUST_LOG: info
       Tags:
@@ -672,4 +675,4 @@ Outputs:
 
   ElastiCacheEndpoint:
     Description: ElastiCache Redis endpoint address
-    Value: !GetAtt ElastiCacheRedis.RedisEndpoint.Address
+    Value: !GetAtt ElastiCacheRedis.PrimaryEndPoint.Address
