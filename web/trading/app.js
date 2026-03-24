@@ -97,9 +97,12 @@ function selectPair(pair) {
     document.getElementById('orderbook').classList.add('loading');
     document.getElementById('trades').classList.add('loading');
     
-    // Clear DOM maps for new pair
+    // Clear DOM maps AND container contents for new pair
     asksDomMap.clear();
     bidsDomMap.clear();
+    document.getElementById('asks').innerHTML = '';
+    document.getElementById('bids').innerHTML = '';
+    orderbook = { bids: [], asks: [] };
     tradesRenderedCount = 0;
     ordersPage = 0;
 

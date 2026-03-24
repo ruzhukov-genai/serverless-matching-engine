@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html>
+<head><title>Orderbook Integration Tests</title></head>
+<body>
+<!-- Minimal DOM structure matching index.html -->
+<header>
+    <div class="header-left">
+        <span class="logo">⚙ SME</span>
+        <span id="conn-status" class="conn-dot"></span>
+        <div id="pairs-list" class="pairs-bar"></div>
+    </div>
+</header>
+<div id="stats-bar" class="stats-bar">
+    <span id="stat-last" class="stat-value">—</span>
+    <span id="stat-change" class="stat-value">—</span>
+    <span id="stat-high" class="stat-value">—</span>
+    <span id="stat-low" class="stat-value">—</span>
+    <span id="stat-volume" class="stat-value">—</span>
+</div>
+<main>
+    <section id="orderbook">
+        <div class="section-title">Order Book — <span id="current-pair">—</span></div>
+        <div id="asks" class="book-side asks"></div>
+        <div id="spread"><span id="last-price"></span><span id="spread-value">—</span></div>
+        <div id="bids" class="book-side bids"></div>
+    </section>
+    <div class="mid-col">
+        <section id="order-entry">
+            <div class="order-tabs">
+                <button class="tab active" data-side="buy">Buy</button>
+                <button class="tab" data-side="sell">Sell</button>
+            </div>
+            <form id="order-form" autocomplete="off">
+                <select id="order-type"><option value="limit">Limit</option></select>
+                <select id="order-tif"><option value="gtc">GTC</option></select>
+                <div id="tif-group"></div>
+                <div id="price-group"><input id="order-price" type="number"></div>
+                <input id="order-quantity" type="number">
+                <span id="available-balance"></span>
+                <span id="order-total">0.00</span>
+                <button type="submit" id="submit-order" class="btn-buy">Buy</button>
+            </form>
+        </section>
+        <section id="trades">
+            <div id="trades-list"></div>
+        </section>
+    </div>
+    <div class="right-col">
+        <section id="portfolio">
+            <tbody id="portfolio-body"></tbody>
+        </section>
+        <section id="open-orders">
+            <tbody id="orders-body"></tbody>
+            <div id="orders-pagination"></div>
+        </section>
+    </div>
+</main>
+
+<pre id="results" style="font-family:monospace; padding:20px;"></pre>
+
+<script src="config.js"></script>
+<script>
+// Override config to prevent real API/WS calls
+window.SME_CONFIG = { API_URL: 'http://mock', WS_URL: null };
+</script>
+<script src="app.js"></script>
+<script>
+// ── Test harness ──────────────────────────────────────────────────────────────
+const results = document.getElementById('results');
+let passed = 0, failed = 0;
+
+function assert(condition, name) {
+    if (condition) {
+        results.textContent += `  ✅ ${name}\n`;
+        passed++;
+    } else {
+        results.textContent += `  ❌ ${name}\n`;
+        failed++;
+    }
+}
+
+function countDomLevels(containerId) {
+    return document.getElementById(containerId).querySelectorAll('.level').length;
+}
+
+function getPricesInDom(containerId) {
+    const els = document.getElementById(containerId).querySelectorAll('.level');
+    return [...els].map(el => el.querySelector('span')?.textContent || el.textContent);
+}
+
+// ── Test: Switching pairs clears orderbook DOM ───────────────────────────────
+results.textContent += '=== Test: Pair switching clears orderbook ===\n';
+
+// Simulate BTC-USDT orderbook
+orderbook.bids = [
+    { price: 70000, qty: 1.5, priceStr: '70,000.00', qtyStr: '1.50000' },
+    { price: 69000, qty: 2.0, priceStr: '69,000.00', qtyStr: '2.00000' },
+    { price: 68000, qty: 3.0, priceStr: '68,000.00', qtyStr: '3.00000' },
+];
+orderbook.asks = [
+    { price: 71000, qty: 1.0, priceStr: '71,000.00', qtyStr: '1.00000' },
+    { price: 72000, qty: 0.5, priceStr: '72,000.00', qtyStr: '0.50000' },
+];
+
+// Force synchronous render (bypass rAF for testing)
+doRenderOrderbook();
+
+assert(countDomLevels('bids') === 3, 'BTC bids: 3 levels rendered');
+assert(countDomLevels('asks') === 2, 'BTC asks: 2 levels rendered');
+
+// Simulate pair switch (what selectPair does)
+asksDomMap.clear();
+bidsDomMap.clear();
+document.getElementById('asks').innerHTML = '';
+document.getElementById('bids').innerHTML = '';
+orderbook = { bids: [], asks: [] };
+
+assert(countDomLevels('bids') === 0, 'After switch: bids cleared');
+assert(countDomLevels('asks') === 0, 'After switch: asks cleared');
+
+// Now load ETH-USDT orderbook
+orderbook.bids = [
+    { price: 3500, qty: 10, priceStr: '3,500.00', qtyStr: '10.0000' },
+    { price: 3490, qty: 20, priceStr: '3,490.00', qtyStr: '20.0000' },
+];
+orderbook.asks = [
+    { price: 3510, qty: 5, priceStr: '3,510.00', qtyStr: '5.0000' },
+];
+
+doRenderOrderbook();
+
+assert(countDomLevels('bids') === 2, 'ETH bids: 2 levels (not 5)');
+assert(countDomLevels('asks') === 1, 'ETH asks: 1 level (not 3)');
+
+// ── Test: Rapid pair switching doesn't accumulate ────────────────────────────
+results.textContent += '\n=== Test: Rapid pair switching ===\n';
+
+for (let i = 0; i < 5; i++) {
+    // Clear (pair switch)
+    asksDomMap.clear();
+    bidsDomMap.clear();
+    document.getElementById('asks').innerHTML = '';
+    document.getElementById('bids').innerHTML = '';
+    orderbook = { bids: [], asks: [] };
+
+    // Load new data
+    orderbook.bids = [
+        { price: 100 + i, qty: 1, priceStr: `${100+i}.00`, qtyStr: '1.00' },
+    ];
+    orderbook.asks = [
+        { price: 200 + i, qty: 1, priceStr: `${200+i}.00`, qtyStr: '1.00' },
+    ];
+    doRenderOrderbook();
+}
+
+assert(countDomLevels('bids') === 1, 'After 5 rapid switches: exactly 1 bid');
+assert(countDomLevels('asks') === 1, 'After 5 rapid switches: exactly 1 ask');
+
+// ── Test: Same pair re-select doesn't duplicate ──────────────────────────────
+results.textContent += '\n=== Test: Same pair re-select ===\n';
+
+asksDomMap.clear();
+bidsDomMap.clear();
+document.getElementById('asks').innerHTML = '';
+document.getElementById('bids').innerHTML = '';
+orderbook = { bids: [], asks: [] };
+
+orderbook.bids = [
+    { price: 50000, qty: 1, priceStr: '50,000.00', qtyStr: '1.00000' },
+];
+orderbook.asks = [];
+doRenderOrderbook();
+
+assert(countDomLevels('bids') === 1, 'First render: 1 bid');
+
+// Re-select same pair (clear + reload same data)
+asksDomMap.clear();
+bidsDomMap.clear();
+document.getElementById('asks').innerHTML = '';
+document.getElementById('bids').innerHTML = '';
+orderbook = { bids: [], asks: [] };
+
+orderbook.bids = [
+    { price: 50000, qty: 1, priceStr: '50,000.00', qtyStr: '1.00000' },
+];
+orderbook.asks = [];
+doRenderOrderbook();
+
+assert(countDomLevels('bids') === 1, 'Re-select same pair: still 1 bid (not 2)');
+
+// ── Summary ──────────────────────────────────────────────────────────────────
+results.textContent += `\n=== Results: ${passed} passed, ${failed} failed ===\n`;
+document.title = failed === 0 ? 'PASS' : 'FAIL';
+</script>
+</body>
+</html>
