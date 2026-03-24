@@ -52,6 +52,12 @@ Parameters:
     Default: '210352747749.dkr.ecr.us-east-1.amazonaws.com/serverless-matching-engine/sme-ws-handler:latest'
     Description: WebSocket Handler Lambda ECR image URI.
 
+  CacheMode:
+    Type: String
+    Default: 'elasticache'
+    AllowedValues: ['ec2', 'elasticache']
+    Description: 'Cache backend: ec2 (Dragonfly on EC2) or elasticache (for quick rollback set to ec2)'
+
 # ---------------------------------------------------------------------------
 # Resources — Nested CloudFormation stacks (each is a SAM template)
 # ---------------------------------------------------------------------------
@@ -92,8 +98,10 @@ Resources:
         LambdaSecurityGroupId: !GetAtt NetworkStack.Outputs.LambdaSecurityGroupId
         WorkerLambdaSecurityGroupId: !GetAtt NetworkStack.Outputs.WorkerLambdaSecurityGroupId
         RDSSecurityGroupId: !GetAtt NetworkStack.Outputs.RDSSecurityGroupId
+        ElastiCacheSecurityGroupId: !GetAtt NetworkStack.Outputs.ElastiCacheSecurityGroupId
         PublicSubnetB: !GetAtt NetworkStack.Outputs.PublicSubnetB
         WsHandlerImageUri: !Ref WsHandlerImageUri
+        CacheMode: !Ref CacheMode
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -151,3 +159,7 @@ Outputs:
   WebSocketUrl:
     Description: WebSocket API URL for real-time feeds
     Value: !GetAtt BackendStack.Outputs.WebSocketUrl
+
+  ElastiCacheEndpoint:
+    Description: ElastiCache Redis endpoint address
+    Value: !GetAtt BackendStack.Outputs.ElastiCacheEndpoint

@@ -81,6 +81,22 @@ Parameters:
     Type: AWS::EC2::Subnet::Id
     Description: Public subnet B from Network stack (for RDS multi-AZ subnet group).
 
+  ElastiCacheSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: ElastiCache security group ID from Network stack.
+
+  CacheMode:
+    Type: String
+    Default: 'elasticache'
+    AllowedValues: ['ec2', 'elasticache']
+    Description: 'Cache backend: ec2 (Dragonfly on EC2) or elasticache'
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  UseElastiCache: !Equals [!Ref CacheMode, 'elasticache']
+
 # ---------------------------------------------------------------------------
 # Mappings - Amazon Linux 2023 ARM64 AMIs per region
 # ---------------------------------------------------------------------------
@@ -341,6 +357,34 @@ Resources:
           Value: !Ref ProjectName
 
   # =========================================================================
+  # ElastiCache Redis (single-node, non-cluster mode)
+  # Non-cluster mode required: our Lua scripts access keys in different slots (ADR-004)
+  # =========================================================================
+  ElastiCacheSubnetGroup:
+    Condition: UseElastiCache
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: ElastiCache subnet group for SME
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+
+  ElastiCacheRedis:
+    Condition: UseElastiCache
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      CacheNodeType: cache.t4g.micro
+      Engine: redis
+      EngineVersion: '7.1'
+      NumCacheNodes: 1
+      CacheSubnetGroupName: !Ref ElastiCacheSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref ElastiCacheSecurityGroupId
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =========================================================================
   # CloudWatch Log Groups for Lambda
   # =========================================================================
   LambdaLogGroup:
@@ -387,8 +431,11 @@ Resources:
           AWS_LWA_PORT: '3001'
           AWS_LWA_READINESS_CHECK_PATH: '/api/pairs'
           AWS_LWA_PASS_THROUGH_PATH: '/'
-          # Application settings
-          DRAGONFLY_URL: !Sub 'redis://${EC2Instance.PrivateIp}:6379'
+          # Application settings — CacheMode toggles between EC2 Dragonfly and ElastiCache
+          DRAGONFLY_URL: !If
+            - UseElastiCache
+            - !Sub 'redis://${ElastiCacheRedis.RedisEndpoint.Address}:6379'
+            - !Sub 'redis://${EC2Instance.PrivateIp}:6379'
           RUST_LOG: info
           # Worker Lambda dispatch
           ORDER_DISPATCH_MODE: lambda
@@ -432,7 +479,10 @@ Resources:
           - !Ref WorkerLambdaSecurityGroupId
       Environment:
         Variables:
-          DRAGONFLY_URL: !Sub 'redis://${EC2Instance.PrivateIp}:6379'
+          DRAGONFLY_URL: !If
+            - UseElastiCache
+            - !Sub 'redis://${ElastiCacheRedis.RedisEndpoint.Address}:6379'
+            - !Sub 'redis://${EC2Instance.PrivateIp}:6379'
           DATABASE_URL: !Sub 'postgres://sme:${DBPassword}@${RDSInstance.Endpoint.Address}:5432/matching_engine'
           RUST_LOG: info
           WS_API_ENDPOINT: !Sub 'https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/ws'
@@ -535,7 +585,10 @@ Resources:
           - !Ref LambdaSecurityGroupId
       Environment:
         Variables:
-          DRAGONFLY_URL: !Sub 'redis://${EC2Instance.PrivateIp}:6379'
+          DRAGONFLY_URL: !If
+            - UseElastiCache
+            - !Sub 'redis://${ElastiCacheRedis.RedisEndpoint.Address}:6379'
+            - !Sub 'redis://${EC2Instance.PrivateIp}:6379'
           RUST_LOG: info
       Tags:
         Project: !Ref ProjectName
@@ -618,3 +671,7 @@ Outputs:
   RDSPort:
     Description: RDS PostgreSQL port
     Value: !GetAtt RDSInstance.Endpoint.Port
+
+  ElastiCacheEndpoint:
+    Description: ElastiCache Redis endpoint address
+    Value: !GetAtt ElastiCacheRedis.RedisEndpoint.Address

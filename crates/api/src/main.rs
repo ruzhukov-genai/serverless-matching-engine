@@ -108,6 +108,15 @@ async fn main() -> Result<()> {
     tracing::info!("initializing cache keys");
     initialize_cache_keys(&dragonfly, &pg_hot, &pairs_cache).await?;
 
+    // Seed order book ZSETs from PG resting orders — critical on fresh cache (ElastiCache migration)
+    tracing::info!("seeding orderbook from PG resting orders");
+    sme_shared::cache::seed_orderbook_from_pg(&dragonfly, &pg_hot).await?;
+
+    // Seed ticker cache from recent trades in PG
+    tracing::info!("seeding ticker cache from PG");
+    let pair_ids_for_seed: Vec<String> = pairs_cache.keys().cloned().collect();
+    sme_shared::cache::seed_ticker_from_pg(&dragonfly, &pg_hot, &pair_ids_for_seed).await?;
+
     // Spawn background persistence worker — uses dedicated pg_bg pool
     let (persist_tx, persist_rx) = mpsc::channel::<routes::PersistJob>(1000);
     let persist_tx_clone = persist_tx.clone();

@@ -92,9 +92,18 @@ async fn get_state() -> Result<&'static WorkerState> {
     cache::init_balances_from_pg(&dragonfly, &pg).await
         .context("failed to init balance cache")?;
 
+    // Seed order book ZSETs from PG resting orders — critical on fresh cache (ElastiCache migration)
+    cache::seed_orderbook_from_pg(&dragonfly, &pg).await
+        .context("failed to seed orderbook from PG")?;
+
     // Seed cache:pairs on cold start (Gateway reads this for /api/pairs)
     seed_pairs_cache(&dragonfly, &pg).await
         .context("failed to seed cache:pairs")?;
+
+    // Seed ticker cache from recent trades
+    let pair_ids: Vec<String> = pairs_cache.keys().cloned().collect();
+    cache::seed_ticker_from_pg(&dragonfly, &pg, &pair_ids).await
+        .context("failed to seed ticker cache from PG")?;
 
     let state = WorkerState { dragonfly, pg, pairs_cache, pair_keys };
 

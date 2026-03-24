@@ -32,6 +32,7 @@ use deadpool_redis::{Config as DPConfig, Pool, Runtime};
 use deadpool_redis::redis::AsyncCommands;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use serde_json;
 use uuid::Uuid;
 
 use crate::types::{Order, OrderStatus, OrderType, SelfTradePreventionMode, Side, TimeInForce};
@@ -550,6 +551,184 @@ pub async fn init_balances_from_pg(pool: &Pool, pg: &sqlx::PgPool) -> Result<()>
             .context("HSET balance")?;
     }
     tracing::info!(count = rows.len(), "initialized Dragonfly balance keys from PG");
+    Ok(())
+}
+
+/// Seed the order book ZSETs from PG open orders (called at cold start / cache migration).
+///
+/// Queries PG for all GTC orders with status IN ('New', 'PartiallyFilled') and
+/// rebuilds `book:{pair_id}:bids`, `book:{pair_id}:asks`, and `order:{id}` HASHes
+/// in Dragonfly. Safe to call on a fresh (empty) cache — idempotent.
+///
+/// Call this after `init_balances_from_pg()` on cold start so the Lua matching
+/// script finds resting orders when the cache backend is new (e.g. after switching
+/// to a fresh ElastiCache instance).
+pub async fn seed_orderbook_from_pg(pool: &Pool, pg: &sqlx::PgPool) -> Result<()> {
+    use sqlx::Row;
+
+    let rows = sqlx::query(
+        "SELECT id, user_id, pair_id, side, order_type, tif, \
+                price, quantity, remaining, status, stp_mode, \
+                version, created_at \
+         FROM orders \
+         WHERE status IN ('New', 'PartiallyFilled') \
+           AND tif = 'GTC' \
+         ORDER BY created_at ASC",
+    )
+    .fetch_all(pg)
+    .await
+    .context("load resting orders from PG")?;
+
+    let count = rows.len();
+    if count == 0 {
+        tracing::info!("seed_orderbook_from_pg: no resting orders found");
+        return Ok(());
+    }
+
+    for row in &rows {
+        let id: uuid::Uuid = row.get("id");
+        let user_id: String = row.get("user_id");
+        let pair_id: String = row.get("pair_id");
+        let side_str: String = row.get("side");
+        let order_type_str: String = row.get("order_type");
+        let tif_str: String = row.get("tif");
+        let price: Option<Decimal> = row.get("price");
+        let quantity: Decimal = row.get("quantity");
+        let remaining: Decimal = row.get("remaining");
+        let status_str: String = row.get("status");
+        let stp_str: String = row.get("stp_mode");
+        let version: i32 = row.get("version");
+        let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+
+        let side = match side_str.as_str() {
+            "Buy" => crate::types::Side::Buy,
+            "Sell" => crate::types::Side::Sell,
+            s => {
+                tracing::warn!(order_id = %id, side = s, "seed_orderbook_from_pg: unknown side, skipping");
+                continue;
+            }
+        };
+        let order_type = match order_type_str.as_str() {
+            "Limit" => crate::types::OrderType::Limit,
+            "Market" => crate::types::OrderType::Market,
+            s => {
+                tracing::warn!(order_id = %id, order_type = s, "seed_orderbook_from_pg: unknown order_type, skipping");
+                continue;
+            }
+        };
+        let tif = match tif_str.as_str() {
+            "GTC" => crate::types::TimeInForce::GTC,
+            "IOC" => crate::types::TimeInForce::IOC,
+            "FOK" => crate::types::TimeInForce::FOK,
+            s => {
+                tracing::warn!(order_id = %id, tif = s, "seed_orderbook_from_pg: unknown tif, skipping");
+                continue;
+            }
+        };
+        let status = match status_str.as_str() {
+            "New" => crate::types::OrderStatus::New,
+            "PartiallyFilled" => crate::types::OrderStatus::PartiallyFilled,
+            _ => crate::types::OrderStatus::New,
+        };
+        let stp_mode = match stp_str.as_str() {
+            "CancelMaker" => crate::types::SelfTradePreventionMode::CancelMaker,
+            "CancelTaker" => crate::types::SelfTradePreventionMode::CancelTaker,
+            "CancelBoth" => crate::types::SelfTradePreventionMode::CancelBoth,
+            _ => crate::types::SelfTradePreventionMode::None,
+        };
+
+        let order = crate::types::Order {
+            id,
+            user_id,
+            pair_id,
+            side,
+            order_type,
+            tif,
+            price,
+            quantity,
+            remaining,
+            status,
+            stp_mode,
+            version: version as i64,
+            sequence: 0,
+            created_at,
+            updated_at: created_at,
+            client_order_id: None,
+        };
+
+        save_order_to_book(pool, &order).await
+            .with_context(|| format!("seed_orderbook_from_pg: save_order_to_book failed for {}", id))?;
+    }
+
+    tracing::info!(count = count, "seed_orderbook_from_pg: seeded resting orders into cache");
+    Ok(())
+}
+
+/// Seed ticker cache from recent trades in PG (called at cold start / cache migration).
+///
+/// Populates `cache:ticker:{pair}` with last price, 24h high/low/volume derived from
+/// the trades table. Safe to call on an empty cache — idempotent.
+///
+/// Call this alongside `seed_orderbook_from_pg()` on cold start so the Gateway
+/// returns meaningful ticker data even before the first new trade arrives.
+pub async fn seed_ticker_from_pg(
+    pool: &Pool,
+    pg: &sqlx::PgPool,
+    pair_ids: &[String],
+) -> Result<()> {
+    use sqlx::Row;
+
+    for pair_id in pair_ids {
+        let ticker_row = sqlx::query(
+            "SELECT \
+                MAX(price) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') as high_24h, \
+                MIN(price) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') as low_24h, \
+                SUM(quantity) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') as volume_24h \
+             FROM trades WHERE pair_id = $1",
+        )
+        .bind(pair_id)
+        .fetch_optional(pg)
+        .await
+        .context("seed_ticker_from_pg: ticker query failed")?;
+
+        let last_row = sqlx::query(
+            "SELECT price as last_price FROM trades WHERE pair_id = $1 \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(pair_id)
+        .fetch_optional(pg)
+        .await
+        .context("seed_ticker_from_pg: last price query failed")?;
+
+        let last = last_row
+            .and_then(|r| r.get::<Option<Decimal>, _>("last_price"))
+            .map(|v| v.to_string());
+
+        let ticker_json = if let Some(row) = ticker_row {
+            serde_json::json!({
+                "pair": pair_id,
+                "last": last,
+                "high_24h": row.get::<Option<Decimal>, _>("high_24h").map(|v| v.to_string()),
+                "low_24h": row.get::<Option<Decimal>, _>("low_24h").map(|v| v.to_string()),
+                "volume_24h": row.get::<Option<Decimal>, _>("volume_24h").map(|v| v.to_string()),
+            })
+        } else {
+            serde_json::json!({
+                "pair": pair_id,
+                "last": last,
+                "high_24h": null,
+                "low_24h": null,
+                "volume_24h": null,
+            })
+        };
+
+        let ticker_str = serde_json::to_string(&ticker_json)
+            .context("seed_ticker_from_pg: serialize failed")?;
+        set_and_publish(pool, &format!("cache:ticker:{}", pair_id), &ticker_str).await
+            .with_context(|| format!("seed_ticker_from_pg: set_and_publish failed for {}", pair_id))?;
+    }
+
+    tracing::info!(count = pair_ids.len(), "seed_ticker_from_pg: ticker cache seeded from PG");
     Ok(())
 }
 

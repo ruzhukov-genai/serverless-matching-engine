@@ -311,6 +311,79 @@ Resources:
       SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
       Description: PostgreSQL from Worker Lambda
 
+  # ---- ElastiCache Security Group -----------------------------------------
+  ElastiCacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ElastiCache Redis - allows inbound from Lambda SGs and EC2
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 127.0.0.1/32
+          Description: No outbound needed
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-elasticache-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ElastiCache ingress from Gateway Lambda
+  ElastiCacheIngressGateway:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ElastiCacheSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Redis from Gateway Lambda
+
+  # ElastiCache ingress from Worker Lambda
+  ElastiCacheIngressWorker:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ElastiCacheSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
+      Description: Redis from Worker Lambda
+
+  # ElastiCache ingress from EC2 (for rollback/migration scripts)
+  ElastiCacheIngressEC2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ElastiCacheSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref EC2SecurityGroup
+      Description: Redis from EC2 (Dragonfly rollback/migration)
+
+  # ---- Lambda SG egress to ElastiCache (added separately to avoid circular refs) ----
+
+  # Allow Gateway Lambda -> ElastiCache (6379)
+  LambdaEgressElastiCache:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      DestinationSecurityGroupId: !Ref ElastiCacheSecurityGroup
+      Description: Redis on ElastiCache from Gateway Lambda
+
+  # Allow Worker Lambda -> ElastiCache (6379)
+  WorkerLambdaEgressElastiCache:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref WorkerLambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      DestinationSecurityGroupId: !Ref ElastiCacheSecurityGroup
+      Description: Redis on ElastiCache from Worker Lambda
+
   # ---- EC2 ingress rules from Lambda SGs (added separately to avoid circular refs) ----
 
   # Allow Gateway Lambda -> Dragonfly (6379)
@@ -381,3 +454,7 @@ Outputs:
   RDSSecurityGroupId:
     Description: RDS security group ID
     Value: !Ref RDSSecurityGroup
+
+  ElastiCacheSecurityGroupId:
+    Description: ElastiCache security group ID
+    Value: !Ref ElastiCacheSecurityGroup
