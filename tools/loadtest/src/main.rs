@@ -464,7 +464,12 @@ async fn run_scenario(
                     let start = Instant::now();
                     match place_order(&client, &base_url, &body).await {
                         Ok(()) => stats.record(start.elapsed()),
-                        Err(_) => stats.record_error(),
+                        Err(e) => {
+                            if stats.errors.load(std::sync::atomic::Ordering::Relaxed) < 5 {
+                                eprintln!("[loadtest] error: {e:#}");
+                            }
+                            stats.record_error();
+                        }
                     }
                     seq += 1;
                 }
