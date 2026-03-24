@@ -7,3 +7,4 @@ Cargo.lock
 .DS_Store
 .aws-sam/
 tools/__pycache__/
+web/trading/config.js
