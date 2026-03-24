@@ -70,8 +70,33 @@ docs/
 - **Unit tests:** pure in-memory, zero I/O, sub-millisecond — in `engine.rs` test module
 - **Integration tests:** behind `--features integration` flag, require Docker services running
 - Run integration tests with `--test-threads=1` (shared Dragonfly/PG state)
+- **Smoke tests:** `tests/smoke/smoke_test.py` — 10 end-to-end tests (Python + Playwright)
+  - T01-T08: API tests (pairs, limit/market orders, matching, ticker, portfolio, orderbook, pair isolation)
+  - T09-T10: Browser tests via headless Chromium (orderbook rendering, live trade updates)
+  - `--no-browser` flag runs API-only tests (T01-T08) without Playwright
+  - Works against both local Docker and AWS Lambda deployments
+  - Uses pre-seeded users `user-1` (buyer) and `user-2` (seller)
+- **Integration shell tests:** `tests/integration/test_orderbook_pairs.sh` — API + WS pair isolation
 - **Bug workflow:** find bug → write failing test first → fix → see test pass
 - All tests must pass before commit: `cargo test && cargo test --features integration -- --test-threads=1`
+
+```bash
+# Full test suite
+cargo test                                                    # unit tests
+cargo test --features integration -- --test-threads=1         # integration tests
+
+# Smoke tests (local Docker)
+python3 tests/smoke/smoke_test.py
+
+# Smoke tests (AWS)
+python3 tests/smoke/smoke_test.py \
+  --api https://kpvhsf0ub8.execute-api.us-east-1.amazonaws.com \
+  --ws wss://2shnq9yk0c.execute-api.us-east-1.amazonaws.com/ws \
+  --frontend https://d3ux5yer0uv7b5.cloudfront.net
+
+# API-only smoke tests (no Playwright dependency)
+python3 tests/smoke/smoke_test.py --no-browser
+```
 
 ### Concurrency
 - **Matching is atomic via Lua EVAL** — no distributed lock needed (ADR-004)
@@ -142,6 +167,8 @@ python3 tools/benchmark.py
 | `crates/shared/src/lua/match_order.lua` | Atomic Lua matching script |
 | `crates/shared/src/lock.rs` | Distributed locking (SET NX EX + fencing) |
 | `crates/shared/src/integration_tests.rs` | 64 integration tests |
+| `tests/smoke/smoke_test.py` | 10 end-to-end smoke tests (Python + Playwright) |
+| `tests/integration/test_orderbook_pairs.sh` | API + WS pair isolation shell tests |
 
 ### Docs (all paths relative to repo root)
 | Path | Purpose |
