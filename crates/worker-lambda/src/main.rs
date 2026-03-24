@@ -80,6 +80,10 @@ async fn get_state() -> Result<&'static WorkerState> {
         .await
         .context("failed to connect to PostgreSQL")?;
 
+    // Run DB migrations (add columns, create indexes, etc.)
+    sme_shared::db::run_migrations(&pg).await
+        .context("failed to run DB migrations")?;
+
     let pairs_cache = Arc::new(load_pairs_cache(&pg).await?);
     tracing::info!(count = pairs_cache.len(), "pairs cache loaded");
 
@@ -372,6 +376,7 @@ async fn process_order(state: &WorkerState, payload: &Value) -> Result<()> {
     //    has no background worker, so we do it inline — still fast enough)
     let persist_start = std::time::Instant::now();
     persist_order(state, &order, &trades, &lua_result.trades).await
+        .map_err(|e| { tracing::error!(error = %e, order_id = %order.id, "persist_order detail"); e })
         .context("DB persist failed")?;
     let persisted_at = Utc::now();
     order.persisted_at = Some(persisted_at);
