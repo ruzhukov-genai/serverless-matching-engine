@@ -1,10 +1,10 @@
 // SME Trading UI — fully functional client
 'use strict';
 
-const API = window.location.origin;
-// For AWS: WebSocket API is on a separate endpoint (API Gateway WebSocket API).
-// Set via ?ws=wss://xxx.execute-api... or auto-detect from same origin.
-const WS_OVERRIDE = new URLSearchParams(window.location.search).get('ws');
+// Config: injected by config.js (generated at deploy time), with query param override
+const _cfg = window.SME_CONFIG || {};
+const API = _cfg.API_URL || window.location.origin;
+const WS_OVERRIDE = new URLSearchParams(window.location.search).get('ws') || _cfg.WS_URL || null;
 let currentPair = null;
 let currentPairConfig = null;
 let currentSide = 'buy';
