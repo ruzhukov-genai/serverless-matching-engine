@@ -370,7 +370,7 @@ Resources:
       ImageUri: !Ref GatewayImageUri
       Architectures:
         - arm64
-      MemorySize: 1769
+      MemorySize: 512
       Timeout: 30
       ReservedConcurrentExecutions: 500
       Role: !GetAtt LambdaRole.Arn
