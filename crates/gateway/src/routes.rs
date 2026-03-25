@@ -296,30 +296,40 @@ pub async fn create_order(
     // Dispatch order to worker — mode selected by ORDER_DISPATCH_MODE env var
     match s.dispatch_mode {
         crate::DispatchMode::Lambda => {
-            // Async Lambda invoke — must await inline (Lambda freezes runtime after response)
+            // Fire-and-forget Lambda invoke — spawn the SDK call and return 202 immediately.
+            // InvocationType::Event means Lambda service queues the worker invocation;
+            // even if this task gets frozen before completion, the worst case is a missing
+            // log line — the worker runs regardless once Lambda service accepts the event.
             if let Some(ref lambda_client) = s.lambda_client {
+                let client = lambda_client.clone();
+                let arn = s.worker_lambda_arn.clone();
+                let pair_id = req.pair_id.clone();
+                let uid = user_id.clone();
+                let oid = order_id.to_string();
                 let payload = aws_sdk_lambda::primitives::Blob::new(order_str.into_bytes());
                 tracing::info!(
                     order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
-                    arn = %s.worker_lambda_arn, "invoking Worker Lambda"
+                    arn = %s.worker_lambda_arn, "spawning Worker Lambda invoke (fire-and-forget)"
                 );
-                match lambda_client.invoke()
-                    .function_name(&s.worker_lambda_arn)
-                    .invocation_type(aws_sdk_lambda::types::InvocationType::Event)
-                    .payload(payload)
-                    .send()
-                    .await
-                {
-                    Ok(resp) => tracing::info!(
-                        order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
-                        status_code = resp.status_code(),
-                        "order dispatched to Worker Lambda"
-                    ),
-                    Err(e) => tracing::error!(
-                        order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
-                        error = %e, "Worker Lambda invoke failed"
-                    ),
-                }
+                tokio::spawn(async move {
+                    match client.invoke()
+                        .function_name(&arn)
+                        .invocation_type(aws_sdk_lambda::types::InvocationType::Event)
+                        .payload(payload)
+                        .send()
+                        .await
+                    {
+                        Ok(resp) => tracing::info!(
+                            order_id = %oid, pair_id = %pair_id, user_id = %uid,
+                            status_code = resp.status_code(),
+                            "order dispatched to Worker Lambda"
+                        ),
+                        Err(e) => tracing::error!(
+                            order_id = %oid, pair_id = %pair_id, user_id = %uid,
+                            error = %e, "Worker Lambda invoke failed"
+                        ),
+                    }
+                });
             } else {
                 tracing::error!("dispatch_mode=lambda but lambda_client is None");
             }
