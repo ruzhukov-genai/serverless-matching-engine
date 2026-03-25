@@ -256,6 +256,66 @@ async def place_orders(session, stats, client_id, num_clients, deadline):
         seq += 1
         await asyncio.sleep(0.5)
 
+async def seed_liquidity(num_levels=10, orders_per_level=5):
+    """Seed standing bid/ask liquidity around the benchmark's trading prices.
+
+    Two layers:
+    1. Passive depth — bids below 70600, asks above 70800 (never crossed by benchmark).
+       Keeps the order book visually full.
+    2. Active depth — bids at 70600, asks at 70800 (will be consumed by benchmark).
+       Ensures the first wave of benchmark orders finds immediate matches.
+    """
+    bid_base = 70500  # passive bids below benchmark
+    ask_base = 70900  # passive asks above benchmark
+    passive_qty = "0.01000"
+    active_qty  = "0.00100"  # same size as benchmark orders
+    placed = 0
+    errors = 0
+
+    async with aiohttp.ClientSession() as session:
+        # Layer 1: passive depth (won't cross)
+        for level in range(num_levels):
+            bid_price = f"{bid_base - level * 100:.2f}"
+            ask_price = f"{ask_base + level * 100:.2f}"
+            for i in range(orders_per_level):
+                user = f"user-{(i % 10) + 1}"
+                for side, price in [("Buy", bid_price), ("Sell", ask_price)]:
+                    body = {
+                        "user_id": user, "pair_id": PAIR, "side": side,
+                        "order_type": "Limit", "tif": "GTC",
+                        "price": price, "quantity": passive_qty,
+                    }
+                    if RUN_ID:
+                        body["client_order_id"] = f"{RUN_ID}-seed-{side[0]}{level}-{i}"
+                    try:
+                        async with session.post(f"{BASE_URL}/api/orders", json=body) as resp:
+                            if resp.status in (200, 201, 202): placed += 1
+                            else: errors += 1
+                    except: errors += 1
+
+        # Layer 2: active depth that benchmark orders will cross into
+        # Bids at 70600 will be hit by benchmark sells at 70600
+        # Asks at 70800 will be hit by benchmark buys at 70800
+        active_levels = [("Buy", "70600.00"), ("Sell", "70800.00")]
+        for side, price in active_levels:
+            for i in range(20):  # 20 orders per side = 40 crossable resting orders
+                user = f"user-{(i % 10) + 1}"
+                body = {
+                    "user_id": user, "pair_id": PAIR, "side": side,
+                    "order_type": "Limit", "tif": "GTC",
+                    "price": price, "quantity": active_qty,
+                }
+                if RUN_ID:
+                    body["client_order_id"] = f"{RUN_ID}-seed-active-{side[0]}{price}-{i}"
+                try:
+                    async with session.post(f"{BASE_URL}/api/orders", json=body) as resp:
+                        if resp.status in (200, 201, 202): placed += 1
+                        else: errors += 1
+                except: errors += 1
+
+    return placed, errors
+
+
 async def run_client(client_id, num_clients, deadline):
     stats = ClientStats()
     connector = aiohttp.TCPConnector(limit=10, force_close=False)
@@ -305,6 +365,11 @@ async def run_benchmark():
         print(f"\n{'━' * 70}")
         print(f"  ▶ {num_clients} concurrent UI clients — {TEST_DURATION}s")
         print(f"{'━' * 70}")
+
+        # Seed standing liquidity (resting bids/asks that won't immediately cross)
+        seed_placed, seed_errors = await seed_liquidity(num_levels=10, orders_per_level=5)
+        print(f"  📦 Seeded {seed_placed} resting orders ({seed_errors} errors)")
+        await asyncio.sleep(1)  # let worker process seeds
 
         snap_before = server_snapshot()
         db_before = db_stats()
