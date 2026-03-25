@@ -79,6 +79,11 @@ Parameters:
     AllowedValues: ['ec2', 'elasticache']
     Description: 'Cache backend: ec2 (Valkey on EC2) or elasticache'
 
+  ValkeyEndpoint:
+    Type: String
+    Default: 'sme-valkey.rmmdxf.ng.0001.use1.cache.amazonaws.com'
+    Description: 'ElastiCache Valkey endpoint (managed outside CloudFormation)'
+
 # ---------------------------------------------------------------------------
 # Conditions
 # ---------------------------------------------------------------------------
@@ -315,20 +320,8 @@ Resources:
         - !Ref PrivateSubnetA
         - !Ref PrivateSubnetB
 
-  ElastiCacheRedis:
-    Type: AWS::ElastiCache::CacheCluster
-    Condition: UseElastiCache
-    Properties:
-      Engine: redis
-      EngineVersion: '7.1'
-      CacheNodeType: cache.t4g.micro
-      NumCacheNodes: 1
-      CacheSubnetGroupName: !Ref ElastiCacheSubnetGroup
-      VpcSecurityGroupIds:
-        - !Ref ElastiCacheSecurityGroupId
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
+  # ElastiCacheRedis removed — physical resource was replaced with ReplicationGroup
+  # outside CloudFormation. Endpoint is now passed via ValkeyEndpoint parameter.
 
   # =========================================================================
   # CloudWatch Log Groups for Lambda
@@ -383,7 +376,7 @@ Resources:
           # Application settings — CacheMode toggles between EC2 Valkey and ElastiCache
           REDIS_URL: !If
             - UseElastiCache
-            - !Sub 'redis://${ElastiCacheRedis.RedisEndpoint.Address}:6379'
+            - !Sub 'redis://${ValkeyEndpoint}:6379'
             - !Sub 'redis://${EC2Instance.PrivateIp}:6379'
           RUST_LOG: info
           # Worker Lambda dispatch
@@ -433,7 +426,7 @@ Resources:
         Variables:
           REDIS_URL: !If
             - UseElastiCache
-            - !Sub 'redis://${ElastiCacheRedis.RedisEndpoint.Address}:6379'
+            - !Sub 'redis://${ValkeyEndpoint}:6379'
             - !Sub 'redis://${EC2Instance.PrivateIp}:6379'
           DATABASE_URL: !Sub 'postgres://sme:${DBPassword}@${RDSInstance.Endpoint.Address}:5432/matching_engine'
           RUST_LOG: info
@@ -542,7 +535,7 @@ Resources:
         Variables:
           REDIS_URL: !If
             - UseElastiCache
-            - !Sub 'redis://${ElastiCacheRedis.RedisEndpoint.Address}:6379'
+            - !Sub 'redis://${ValkeyEndpoint}:6379'
             - !Sub 'redis://${EC2Instance.PrivateIp}:6379'
           RUST_LOG: info
       Tags:
@@ -629,4 +622,4 @@ Outputs:
 
   ElastiCacheEndpoint:
     Description: ElastiCache Redis endpoint address
-    Value: !GetAtt ElastiCacheRedis.RedisEndpoint.Address
+    Value: !Ref ValkeyEndpoint
