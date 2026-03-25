@@ -3,29 +3,34 @@ set -euo pipefail
 # =============================================================================
 # deploy.sh — Build, deploy, and run post-deploy tasks
 #
+# Uses SAM to build Docker images and deploy the entire stack.
+# sam build: builds Docker images locally (no --use-containers)
+# sam deploy: pushes images to ECR, deploys CloudFormation stack
+#
 # Usage:
-#   tools/deploy.sh                    # Full deploy (build + sam deploy + migrations)
-#   tools/deploy.sh --skip-build       # Deploy with existing images
-#   tools/deploy.sh --migrate-only     # Just run migrations (no deploy)
+#   tools/deploy.sh                    # Full deploy (sam build + deploy + migrations)
+#   tools/deploy.sh --skip-build       # Deploy without rebuilding images
+#   tools/deploy.sh --migrate-only     # Just run migrations (no build/deploy)
+#   tools/deploy.sh --build-only       # Just build (no deploy)
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$PROJECT_ROOT"
+INFRA_DIR="$PROJECT_ROOT/infra"
 
 STACK_NAME="serverless-matching-engine"
 REGION="${AWS_REGION:-us-east-1}"
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null)
-ECR_BASE="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${STACK_NAME}"
 WORKER_LAMBDA="${STACK_NAME}-worker"
 
 SKIP_BUILD=false
 MIGRATE_ONLY=false
+BUILD_ONLY=false
 
 for arg in "$@"; do
     case $arg in
-        --skip-build)   SKIP_BUILD=true ;;
-        --migrate-only) MIGRATE_ONLY=true ;;
+        --skip-build)    SKIP_BUILD=true ;;
+        --migrate-only)  MIGRATE_ONLY=true ;;
+        --build-only)    BUILD_ONLY=true ;;
     esac
 done
 
@@ -53,7 +58,6 @@ invoke_manage() {
     body=$(cat "$tmpfile")
     rm -f "$tmpfile"
 
-    # Check for FunctionError in the response body
     if echo "$body" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('status')=='ok' else 1)" 2>/dev/null; then
         log "  ✓ ${cmd} complete"
     else
@@ -73,34 +77,28 @@ if $MIGRATE_ONLY; then
     exit 0
 fi
 
-# ── Build Docker images ─────────────────────────────────────────────
+# ── SAM Build ────────────────────────────────────────────────────────
 if ! $SKIP_BUILD; then
-    log "Building worker Lambda image..."
-    DOCKER_BUILDKIT=1 docker build --provenance=false \
-        -f infra/Dockerfile.worker -t sme-worker:latest .
+    log "Building with SAM (Docker images, no containers)..."
+    cd "$INFRA_DIR"
+    sam build --parallel
+    log "Build complete."
+fi
 
-    log "Building gateway Lambda image..."
-    DOCKER_BUILDKIT=1 docker build --provenance=false \
-        -f infra/Dockerfile.gateway -t sme-gateway:latest .
-
-    # Push to ECR
-    log "Logging into ECR..."
-    aws ecr get-login-password --region "$REGION" | \
-        docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com" 2>/dev/null
-
-    log "Pushing worker image..."
-    docker tag sme-worker:latest "${ECR_BASE}/sme-worker:latest"
-    docker push "${ECR_BASE}/sme-worker:latest"
-
-    log "Pushing gateway image..."
-    docker tag sme-gateway:latest "${ECR_BASE}/sme-gateway:latest"
-    docker push "${ECR_BASE}/sme-gateway:latest"
+if $BUILD_ONLY; then
+    log "Build only — skipping deploy."
+    exit 0
 fi
 
 # ── SAM Deploy ───────────────────────────────────────────────────────
-# log "Running sam deploy..."
-# cd infra && sam deploy --no-confirm-changeset && cd ..
-log "NOTE: sam deploy skipped — run manually if stack changes are needed"
+log "Deploying with SAM..."
+cd "$INFRA_DIR"
+sam deploy \
+    --no-confirm-changeset \
+    --no-fail-on-empty-changeset \
+    --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+    --resolve-image-repos \
+    --resolve-s3
 
 # ── Post-deploy: Run migrations ─────────────────────────────────────
 run_migrations

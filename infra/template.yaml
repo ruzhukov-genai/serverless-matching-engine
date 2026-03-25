@@ -47,10 +47,7 @@ Parameters:
     Default: ''
     Description: ACM certificate ARN for custom domain (us-east-1).
 
-  WsHandlerImageUri:
-    Type: String
-    Default: '210352747749.dkr.ecr.us-east-1.amazonaws.com/serverless-matching-engine/sme-ws-handler:latest'
-    Description: WebSocket Handler Lambda ECR image URI.
+  # WsHandlerImageUri removed — SAM builds Docker images via Metadata blocks.
 
   CacheMode:
     Type: String
@@ -100,7 +97,7 @@ Resources:
         RDSSecurityGroupId: !GetAtt NetworkStack.Outputs.RDSSecurityGroupId
         ElastiCacheSecurityGroupId: !GetAtt NetworkStack.Outputs.ElastiCacheSecurityGroupId
         PublicSubnetB: !GetAtt NetworkStack.Outputs.PublicSubnetB
-        WsHandlerImageUri: !Ref WsHandlerImageUri
+        # WsHandlerImageUri removed — SAM builds Docker images via Metadata blocks
         CacheMode: !Ref CacheMode
       Tags:
         - Key: Project

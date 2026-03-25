@@ -29,20 +29,8 @@ Parameters:
     Default: '*'
     Description: CORS allowed origin for API Gateway. Use your CloudFront URL in production.
 
-  GatewayImageUri:
-    Type: String
-    Default: '210352747749.dkr.ecr.us-east-1.amazonaws.com/serverless-matching-engine/sme-gateway:latest'
-    Description: Gateway Lambda ECR image URI
-
-  WorkerImageUri:
-    Type: String
-    Default: '210352747749.dkr.ecr.us-east-1.amazonaws.com/serverless-matching-engine/sme-worker:latest'
-    Description: Worker Lambda ECR image URI
-
-  WsHandlerImageUri:
-    Type: String
-    Default: '210352747749.dkr.ecr.us-east-1.amazonaws.com/serverless-matching-engine/sme-ws-handler:latest'
-    Description: WebSocket Handler Lambda ECR image URI
+  # ImageUri parameters removed — SAM builds Docker images via Metadata blocks.
+  # sam build creates ECR images; sam deploy pushes and updates Lambda.
 
   # Network inputs (passed from root template via nested stack outputs)
   VpcId:
@@ -367,11 +355,14 @@ Resources:
   GatewayLambda:
     Type: AWS::Serverless::Function
     DependsOn: LambdaLogGroup
+    Metadata:
+      DockerTag: latest
+      DockerContext: ../..
+      Dockerfile: infra/Dockerfile.gateway
     Properties:
       FunctionName: !Sub '${ProjectName}-gateway'
       Description: sme-gateway HTTP handler via AWS Lambda Web Adapter (zero code changes)
       PackageType: Image
-      ImageUri: !Ref GatewayImageUri
       Architectures:
         - x86_64
       MemorySize: 512
@@ -419,11 +410,14 @@ Resources:
   WorkerLambda:
     Type: AWS::Serverless::Function
     DependsOn: WorkerLambdaLogGroup
+    Metadata:
+      DockerTag: latest
+      DockerContext: ../..
+      Dockerfile: infra/Dockerfile.worker
     Properties:
       FunctionName: !Sub '${ProjectName}-worker'
       Description: sme-worker-lambda - order matching, PG persistence, cache updates
       PackageType: Image
-      ImageUri: !Ref WorkerImageUri
       Architectures:
         - x86_64
       # 1024MB: needs headroom for PG + Valkey connection pools and match logic
@@ -527,11 +521,14 @@ Resources:
   WsHandlerLambda:
     Type: AWS::Serverless::Function
     DependsOn: WsHandlerLambdaLogGroup
+    Metadata:
+      DockerTag: latest
+      DockerContext: ../..
+      Dockerfile: infra/Dockerfile.ws-handler
     Properties:
       FunctionName: !Sub '${ProjectName}-ws-handler'
       Description: sme-ws-handler - API GW WebSocket event handler (connect/disconnect/subscribe)
       PackageType: Image
-      ImageUri: !Ref WsHandlerImageUri
       Architectures:
         - x86_64
       MemorySize: 256

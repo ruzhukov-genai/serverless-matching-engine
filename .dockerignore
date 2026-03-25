@@ -1,0 +1,16 @@
+.git
+.gitignore
+target/debug
+target/*/deps
+target/*/build
+.aws-sam
+infra/.aws-sam
+.idea
+*.swp
+*.swo
+.DS_Store
+node_modules
+*.log
+.vscode
+coverage
+tmp
