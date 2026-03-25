@@ -50,7 +50,8 @@ RUN cargo build --release --package sme-ws-handler
 FROM public.ecr.aws/lambda/provided:al2023-x86_64 AS runtime
 
 # Copy compiled bootstrap binary
-COPY --from=builder --chmod=755 /build/target/release/bootstrap /var/runtime/bootstrap
+COPY --from=builder /build/target/release/bootstrap /var/runtime/bootstrap
+RUN chmod 755 /var/runtime/bootstrap
 
 ENV RUST_LOG=info
 

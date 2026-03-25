@@ -55,7 +55,8 @@ RUN cargo build --release --package sme-worker-lambda && \
 FROM public.ecr.aws/lambda/provided:al2023-x86_64 AS runtime
 
 # Copy compiled bootstrap binary from builder
-COPY --from=builder --chmod=755 /build/target/release/bootstrap /var/runtime/bootstrap
+COPY --from=builder /build/target/release/bootstrap /var/runtime/bootstrap
+RUN chmod 755 /var/runtime/bootstrap
 
 # Copy migration files (used by manage:run_migrations command)
 COPY migrations/ /var/runtime/migrations/
