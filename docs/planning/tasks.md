@@ -7,8 +7,8 @@ All phases complete. ✅
 ## Phase 5 — Observability & Metrics ✅
 
 - [x] **5.1** Instrument matching path with timing (lock_wait_ms, match_ms, cache_write_ms, total_ms)
-- [x] **5.2** Write metrics to Dragonfly (metrics.rs: latency, lock_wait, orders, trades)
-- [x] **5.3** Wire dashboard API to real Dragonfly metrics
+- [x] **5.2** Write metrics to Valkey (metrics.rs: latency, lock_wait, orders, trades)
+- [x] **5.3** Wire dashboard API to real Valkey metrics
 - [x] **5.4** Dashboard JS polls live endpoints (no more placeholders)
 - [x] **5.5** Write audit events (ORDER_CREATED, TRADE_EXECUTED, ORDER_CANCELLED)
 - [x] **5.6** Audit log viewer verified with real data
@@ -33,7 +33,7 @@ All phases complete. ✅
 - [x] **7.2** Worker Lambda implementation (async order processing)
 - [x] **7.3** SAM template structure (network + backend + frontend stacks)
 - [x] **7.4** Docker ARM64 cross-compilation for Lambda containers
-- [x] **7.5** EC2 infrastructure (PostgreSQL + Dragonfly, no sme-api binary)
+- [x] **7.5** EC2 infrastructure (PostgreSQL + Valkey, no sme-api binary)
 - [x] **7.6** CloudFront distribution with S3 + API origins
 - [x] **7.7** End-to-end deployment automation
 - [x] **7.8** Update documentation to reflect Lambda architecture

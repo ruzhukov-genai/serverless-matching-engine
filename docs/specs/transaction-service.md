@@ -11,7 +11,7 @@
 
 ## Trigger
 
-- Consumes from Dragonfly Stream: `stream:transactions`
+- Consumes from Valkey Stream: `stream:transactions`
 
 ## Trade Processing
 

@@ -2,32 +2,13 @@
 
 ## Overview
 
-Single SAM stack (`serverless-matching-engine`) with 3 nested `AWS::CloudFormation::Stack` substacks.
-All templates use `Transform: AWS::Serverless-2016-10-31`.
+Fully serverless architecture using AWS managed services. No EC2 instances needed.
 
 ```
 template.yaml (root)
 ├── stacks/network.yaml   — VPC, subnets, route tables, IGW, security groups
-├── stacks/backend.yaml   — EC2, Lambda ×2 (gateway + worker), API Gateway
+├── stacks/backend.yaml   — Lambda ×2 (gateway + worker), RDS, ElastiCache, API Gateway
 └── stacks/frontend.yaml  — S3 bucket, CloudFront, OAC
-```
-
-## Deploy
-
-```bash
-cd infra
-sam build --use-buildkit
-sam deploy \
-  --stack-name serverless-matching-engine \
-  --resolve-s3 \
-  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
-  --no-confirm-changeset \
-  --parameter-overrides KeyPairName=sme-ec2-key DBPassword=<password>
-```
-
-After deploy, upload frontend:
-```bash
-aws s3 sync web/trading/ s3://<FrontendBucketName>/ --delete
 ```
 
 ## Architecture Diagram
@@ -35,156 +16,224 @@ aws s3 sync web/trading/ s3://<FrontendBucketName>/ --delete
 ```
                     ┌──────────────────────────┐
                     │       CloudFront          │
-                    │   (Frontend S3 Origin)    │
+                    │   d3ux5yer0uv7b5          │
                     └──────────┬───────────────┘
                                │
          ┌─────────────────────┴─────────────────────┐
-         │              API Gateway (HTTP)            │
-         │   /{proxy+} → Gateway Lambda               │
+         │         API Gateway (HTTP + WebSocket)      │
+         │   HTTP: kpvhsf0ub8  WS: 2shnq9yk0c         │
          └─────────────────────┬─────────────────────┘
                                │
               ┌────────────────┴────────────────┐
               │     Gateway Lambda (arm64)       │
-              │  Rust binary via Lambda Web      │
-              │  Adapter (lambda-adapter)        │
-              │  Reads Dragonfly cache, serves   │
+              │  512MB, Rust + Lambda Web Adapter│
+              │  Reads Valkey cache, serves      │
               │  REST + WebSocket, dispatches    │
               │  orders to Worker Lambda         │
               └────────────────┬────────────────┘
-                               │ (Lambda invoke)
+                               │ (async Lambda invoke)
               ┌────────────────┴────────────────┐
-              │     Worker Lambda (arm64)        │
-              │  Rust binary, processes single   │
-              │  order: lock balance (PG),       │
-              │  Lua EVAL match (Dragonfly),     │
-              │  persist trades (PG),            │
+              │     Worker Lambda (x86_64)       │
+              │  1024MB, native Rust runtime     │
+              │  Lua EVAL match (Valkey),        │
+              │  persist trades (PG via Proxy),  │
               │  update cache                    │
-              └────────────────┬────────────────┘
-                               │
-              ┌────────────────┴────────────────┐
-              │        EC2 (t4g.micro, arm64)    │
-              │   ┌───────────┐ ┌─────────────┐ │
-              │   │ PostgreSQL│ │  Dragonfly   │ │
-              │   │  (5432)   │ │   (6379)     │ │
-              │   └───────────┘ └─────────────┘ │
-              └─────────────────────────────────┘
+              └────────┬───────────┬────────────┘
+                       │           │
+          ┌────────────┴──┐  ┌────┴──────────────┐
+          │ ElastiCache    │  │  RDS PostgreSQL    │
+          │ Valkey 8.1     │  │  db.t4g.small      │
+          │ cache.t4g.micro│  │  via RDS Proxy     │
+          └───────────────┘  └────────────────────┘
 ```
+
+## Infrastructure Components
+
+### ElastiCache Valkey (cache.t4g.micro)
+- **Engine:** Valkey 8.1.0
+- **Node type:** cache.t4g.micro (2 vCPU, 0.5GB)
+- **Cluster:** `sme-valkey-001`
+- **Purpose:** Order book cache (sorted sets), Lua atomic matching, balance cache,
+  pub/sub for real-time feeds, metrics storage
+- **Endpoint:** `sme-valkey.rmmdxf.ng.0001.use1.cache.amazonaws.com:6379`
+
+### RDS PostgreSQL (db.t4g.small)
+- **Engine:** PostgreSQL 16.6
+- **Instance:** `serverless-matching-engine-pg`
+- **Max connections:** ~52
+- **Purpose:** Durable persistence for orders, trades, balances, audit log
+
+### RDS Proxy
+- **Name:** `sme-proxy-v2`
+- **Purpose:** Connection pooling for Lambda burst scaling
+- **Endpoint:** `sme-proxy-v2.proxy-cp3apgpybbhw.us-east-1.rds.amazonaws.com`
+- **Key benefit:** Prevents connection stampede when 40+ Lambdas cold-start simultaneously
+
+### Gateway Lambda
+- **Architecture:** arm64
+- **Memory:** 512 MB
+- **Timeout:** 30s
+- **Handler:** Lambda Web Adapter (runs Rust HTTP server on port 3001)
+- **Env vars:** `REDIS_URL`, `ORDER_DISPATCH_MODE=lambda`, `WORKER_LAMBDA_ARN`
+- **VPC:** Private subnets A+B
+- **Key insight:** Uses `lambda-adapter` extension to run a standard axum HTTP server
+
+### Worker Lambda
+- **Architecture:** x86_64
+- **Memory:** 1024 MB
+- **Timeout:** 30s
+- **Handler:** `bootstrap` (native Rust Lambda runtime via `lambda_runtime` crate)
+- **Env vars:** `DATABASE_URL` (RDS Proxy endpoint), `REDIS_URL` (ElastiCache)
+- **VPC:** Private subnets A+B
+- **Pool config:** PG max_connections(1), min_connections(0), connect_lazy()
+- **Valkey pool:** 2 connections
+
+### API Gateway
+- **HTTP API:** `kpvhsf0ub8` — REST proxy to Gateway Lambda
+- **WebSocket API:** `2shnq9yk0c` — Real-time orderbook and trade feeds
+
+### CloudFront + S3
+- **Distribution:** `d3ux5yer0uv7b5.cloudfront.net`
+- **S3 origin:** Static frontend files (trading UI, dashboard)
+- **API origin:** Proxies to API Gateway for `/api/*` paths
 
 ## Network Layout
 
 - **VPC:** 10.0.0.0/16
-- **Public Subnet A:** 10.0.1.0/24 (us-east-1a) — EC2 lives here
-- **Private Subnet A:** 10.0.2.0/24 (us-east-1a) — Lambda ENIs
-- **Private Subnet B:** 10.0.3.0/24 (us-east-1b) — Lambda ENIs (AZ redundancy)
+- **Private Subnet A:** 10.0.2.0/24 (us-east-1a) — Lambda ENIs, ElastiCache, RDS
+- **Private Subnet B:** 10.0.3.0/24 (us-east-1b) — Lambda ENIs (AZ redundancy), RDS
 
-Lambda functions are VPC-attached to reach EC2's Dragonfly/PG on private IPs.
+Lambda functions are VPC-attached to reach ElastiCache and RDS on private IPs.
 
-## Security Groups
+## Deploy Process
 
-| SG | Inbound | Purpose |
-|----|---------|---------|
-| EC2 SG | 22 (SSH from SSHCidr), 5432 + 6379 (from Lambda SGs) | EC2 access |
-| Lambda SG | None inbound | Gateway Lambda outbound to EC2 |
-| Worker Lambda SG | None inbound | Worker Lambda outbound to EC2 |
+### Primary: tools/deploy.sh
+```bash
+tools/deploy.sh                    # Build + push Docker images + run migrations
+tools/deploy.sh --migrate-only     # Just run migrations (no build/deploy)
+tools/deploy.sh --skip-build       # Deploy with existing images + migrations
+```
 
-## Lambda Functions
+### Manual Lambda Update
+```bash
+# Build worker
+DOCKER_BUILDKIT=1 docker build --provenance=false -f infra/Dockerfile.worker -t sme-worker:latest .
 
-### Gateway Lambda
-- **Runtime:** Docker image (ECR), arm64
-- **Memory:** 512 MB
-- **Timeout:** 900s (WebSocket support)
-- **Handler:** Lambda Web Adapter (runs Rust HTTP server on port 3001)
-- **Env vars:** `DRAGONFLY_URL`, `ORDER_DISPATCH_MODE=lambda`, `WORKER_LAMBDA_ARN`
-- **VPC:** Private subnets A+B, Lambda SG
-- **Key insight:** Uses `lambda-adapter` extension to run a standard HTTP server as a Lambda function. SAM builds via `Dockerfile.gateway`.
+# Push to ECR
+ECR=210352747749.dkr.ecr.us-east-1.amazonaws.com/serverless-matching-engine/sme-worker
+docker tag sme-worker:latest $ECR:latest
+docker push $ECR:latest
 
-### Worker Lambda
-- **Runtime:** Docker image (ECR), arm64
-- **Memory:** 512 MB
-- **Timeout:** 30s
-- **Handler:** `bootstrap` (native Rust Lambda runtime via `lambda_runtime` crate)
-- **Env vars:** `DATABASE_URL`, `DRAGONFLY_URL`
-- **VPC:** Private subnets A+B, Worker Lambda SG
+# Update Lambda
+python3 -c "
+import boto3
+client = boto3.client('lambda', region_name='us-east-1')
+client.update_function_code(
+    FunctionName='serverless-matching-engine-worker',
+    ImageUri='$ECR:latest',
+    Architectures=['x86_64']
+)
+"
+```
 
-## EC2 Instance
+### Full Stack Deploy (infrastructure changes)
+```bash
+cd infra
+sam build --use-buildkit
+sam deploy --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
+```
 
-- **Type:** t4g.micro (arm64, 1 vCPU, 1 GB RAM)
-- **AMI:** Amazon Linux 2023 (latest arm64)
-- **Services:** PostgreSQL 16, Dragonfly 1.28.2
-- **IAM Role:** SSM managed instance (for remote management via `aws ssm send-command`)
+## Manage Commands
 
-### EC2 UserData Bootstrap
+Worker Lambda accepts manage commands via direct invocation:
 
-The UserData script in `stacks/backend.yaml` installs PG + Dragonfly, creates the schema,
-seeds data, and configures networking. Key gotchas captured below.
+```json
+{"manage": {"command": "run_migrations"}}
+{"manage": {"command": "reset_all"}}
+{"manage": {"command": "reset_balances"}}
+{"manage": {"command": "truncate_orders"}}
+{"manage": {"command": "exec_sql", "sql": "ALTER TABLE ..."}}
+{"manage": {"command": "query", "sql": "SELECT count(*) as cnt FROM orders"}}
+```
 
-## Gotchas & Lessons Learned
+**Lightweight commands** (run_migrations, exec_sql, query) use a standalone PG connection — no Valkey needed.
+**Stateful commands** (reset_all, reset_balances, truncate_orders) initialize full worker state with Valkey.
 
-### SAM Nested Stacks
-- Use `AWS::CloudFormation::Stack` (not `AWS::Serverless::Application`) for nested stacks
-- Each substack must have `Transform: AWS::Serverless-2016-10-31` to use `AWS::Serverless::Function`
-- SAM processes the transform in all templates during `sam build`
-- Deploy needs `CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND`
-- `CAPABILITY_NAMED_IAM` is required when nested stacks create IAM roles with custom names
+```bash
+aws lambda invoke --function-name serverless-matching-engine-worker \
+  --invocation-type RequestResponse \
+  --payload '{"manage":{"command":"run_migrations"}}' /tmp/out.json
+```
 
-### Docker Build (arm64 on x86_64)
-- SAM's `docker build` passes `--platform linux/arm64` which breaks cross-compile Dockerfiles
-- The Dockerfiles use multi-stage: `FROM --platform=linux/amd64` for builder, `FROM --platform=linux/arm64` for runtime
-- `sam build --use-buildkit` enables BuildKit which handles this correctly
-- QEMU binfmt is NOT needed — the builder stage compiles natively on amd64, only the final runtime stage is arm64
+## Migrations
 
-### Amazon Linux 2023 — curl-minimal Conflict
-- AL2023 ships `curl-minimal` which conflicts with full `curl` package
-- **Fix:** Use `dnf install -y --allowerasing` in UserData
-- Without this, the entire UserData script fails silently and no services get installed
+- **Format:** `migrations/YYYYMMDDHHMMSS_description.sql`
+- **Runner:** sqlx built-in migrator (`_sqlx_migrations` tracking table)
+- **Each file** has `-- migration:` and `-- depends-on:` comment headers
+- **Embedded** in Worker Lambda Docker image at `/var/runtime/migrations/`
+- **Create new:** `tools/new_migration.sh "add_user_roles"`
+- **Run:** `tools/deploy.sh --migrate-only` or `manage:run_migrations`
 
-### Dragonfly on t4g.micro
-- Dragonfly v1.28.2 auto-detects 2 threads but requires 256MB per thread (512MB total)
-- t4g.micro has 1GB RAM but with PG running, only ~400MB free
-- **Fix:** `--proactor_threads=1` in Dragonfly config + `--maxmemory=256mb`
-- Without this: Dragonfly exits with "2 threads, so 512MB required. Exiting..."
+## Performance (Benchmark: c=40, 60s)
 
-### PostgreSQL listen_addresses
-- Default PG installs with `listen_addresses = 'localhost'`
-- Lambda functions connect via EC2's private IP, not localhost
-- **Fix:** `sed -i "s/^#listen_addresses.*/listen_addresses = '*'/" postgresql.conf`
-- Also need pg_hba.conf entry: `host matching_engine sme 10.0.0.0/8 md5`
-- And `GRANT ALL PRIVILEGES ON ALL TABLES/SEQUENCES IN SCHEMA public TO sme`
+| Metric | Value |
+|--------|-------|
+| Client dispatch rate | 558 orders/sec |
+| Client latency p50/p95/p99 | 71 / 83 / 111 ms |
+| Worker Lua EVAL p50 | 1-2ms |
+| Worker persist p50 | 860ms |
+| Worker total p50 | 2,894ms |
+| Cold start (init) | ~1s |
+| Errors | 0 |
+| Timeouts | 0 |
 
-### Dragonfly Cache Seeding
-- Gateway Lambda warms cache from Dragonfly on cold start (reads `cache:pairs` key)
-- New EC2 instance = empty Dragonfly = gateway returns empty pairs
-- **Fix:** Seed `cache:pairs` key + `version:{pair_id}` keys after Dragonfly starts
-- After seeding, force Gateway Lambda cold start (update any env var)
-- On AL2023, redis CLI package is `redis6` and binary is `redis6-cli` (not `redis-cli`)
-
-### Lambda Cold Starts After Config Changes
-- Lambda keeps warm execution environments that cache the initial state
-- After changing EC2 config (PG listen_addresses, Dragonfly data), existing Lambda instances won't see changes
-- **Fix:** Update any Lambda env var (e.g. add `CACHE_REFRESH=<timestamp>`) to force new execution environments
-
-### CloudFormation Stack Deletion
-- VPC-attached Lambda ENI cleanup takes 5-15 minutes during stack deletion
-- S3 buckets with versioning enabled must have ALL versions + delete markers removed before deletion
-- If a stack delete fails on S3 bucket, manually empty it then retry with `--retain-resources`
-
-## Endpoints (Production)
+## Endpoints
 
 | Endpoint | URL |
 |----------|-----|
-| API Gateway | `https://<api-id>.execute-api.us-east-1.amazonaws.com` |
-| CloudFront | `https://<dist-id>.cloudfront.net` |
-| EC2 SSH | `ssh -i ~/.ssh/sme-ec2-key.pem ec2-user@<elastic-ip>` |
-| EC2 SSM | `aws ssm send-command --instance-ids <id> ...` |
-
-Check `aws cloudformation describe-stacks --stack-name serverless-matching-engine --query 'Stacks[0].Outputs'` for current values.
+| HTTP API | `https://kpvhsf0ub8.execute-api.us-east-1.amazonaws.com` |
+| WebSocket | `wss://2shnq9yk0c.execute-api.us-east-1.amazonaws.com/ws` |
+| CloudFront | `https://d3ux5yer0uv7b5.cloudfront.net` |
+| Trading UI | `https://d3ux5yer0uv7b5.cloudfront.net/trading/` |
 
 ## Cost Estimate (idle)
 
-- EC2 t4g.micro: ~$6/mo (free tier eligible)
-- Lambda: $0 idle (pay per invocation)
-- API Gateway: $0 idle
-- CloudFront: ~$0 (minimal traffic)
-- S3: ~$0.03/mo
-- ECR: ~$0.10/mo (2 images)
-- **Total idle:** ~$6-7/mo
+| Service | Monthly |
+|---------|---------|
+| RDS db.t4g.small | ~$24 |
+| ElastiCache cache.t4g.micro | ~$9 |
+| RDS Proxy | ~$22 |
+| Lambda | $0 (pay per use) |
+| API Gateway | $0 (pay per use) |
+| CloudFront | ~$0 |
+| S3 + ECR | ~$0.15 |
+| **Total idle** | **~$55/mo** |
+
+## Gotchas & Lessons Learned
+
+### Lambda + RDS Proxy
+- `connect_lazy()` is essential — `connect()` blocks on TCP handshake; 40+ concurrent Lambdas all blocking = proxy exhaustion
+- PG pool `max_connections(1)` for worker Lambda — one Lambda = one order = one connection
+- RDS Proxy SG rules need both inbound (from Lambda) AND outbound (to RDS + Secrets Manager)
+
+### Docker Builds
+- `--provenance=false` required — attestation manifests create OCI index format Lambda rejects
+- Worker: native x86_64 build (no cross-compile). Gateway: still arm64.
+- Docker build caches break when Cargo.toml deps change — full rebuild ~5-8 min
+
+### Lambda Container Recycling
+- `update-function-code` doesn't immediately replace warm instances
+- Change any env var via `update-function-configuration` to force all containers to recycle
+
+### CloudWatch Logs
+- `filter-log-events` has 30-60s lag after Lambda finishes
+- Use `describe-log-streams` + `get-log-events` on specific streams for real-time data
+
+### Migrations
+- Old `_sqlx_migrations` table from numbered migrations was dropped and recreated with timestamped versions
+- All existing migrations are idempotent (IF NOT EXISTS / IF EXISTS)
+- Manage command runs migrations BEFORE worker state init (no Valkey dependency)
+
+### Trade FK Constraints
+- Dropped via migration 005 — concurrent Lambdas match against each other's orders not yet persisted to PG
+- Referential integrity guaranteed by Lua matching engine in Valkey (atomic operations)

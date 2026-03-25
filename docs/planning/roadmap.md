@@ -3,8 +3,8 @@
 Prove the stateless matching pattern works — correctness first, then performance.
 
 ## Phase 1 — Skeleton + Locking ✅ DONE
-- [x] Docker Compose (Dragonfly + PostgreSQL)
-- [x] Dragonfly client + connection pool (`deadpool-redis`)
+- [x] Docker Compose (Valkey + PostgreSQL)
+- [x] Valkey client + connection pool (`deadpool-redis`)
 - [x] PostgreSQL pool (`sqlx`) + migrations
 - [x] Order Book Locking (SET NX EX, backoff + jitter, fencing tokens)
 - [x] Lock tests: acquire, release, TTL expiry, contention, owner-only release
@@ -36,8 +36,8 @@ Prove the stateless matching pattern works — correctness first, then performan
 
 ## Phase 5 — Observability & Metrics ✅ DONE
 - [x] Instrument matching path: lock_wait_ms, match_ms, cache_write_ms, total_ms
-- [x] Dragonfly metrics: latency samples, lock_wait samples, order/trade counters
-- [x] Dashboard API wired to real Dragonfly metrics (no more placeholders)
+- [x] Valkey metrics: latency samples, lock_wait samples, order/trade counters
+- [x] Dashboard API wired to real Valkey metrics (no more placeholders)
 - [x] Dashboard JS polls live endpoints (KPI, throughput, latency, locks, audit)
 - [x] Audit events: ORDER_CREATED, TRADE_EXECUTED, ORDER_CANCELLED written to DB
 - [x] Audit log viewer shows real events
@@ -54,7 +54,7 @@ Prove the stateless matching pattern works — correctness first, then performan
 ## Phase 7 — AWS Deployment ✅ DONE
 - [x] Gateway Lambda (HTTP/WS server, stateless reads from cache)
 - [x] Worker Lambda (individual order processing, async invoked)
-- [x] EC2 backend (PostgreSQL + Dragonfly only, no sme-api binary)
+- [x] EC2 backend (PostgreSQL + Valkey only, no sme-api binary)
 - [x] SAM infrastructure as code (3 nested stacks: network, backend, frontend)
 - [x] CloudFront distribution with S3 frontend + API origins
 - [x] Docker cross-compilation for ARM64 Lambda containers

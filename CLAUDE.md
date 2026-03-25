@@ -6,13 +6,13 @@ It defines project conventions, architecture, and workflow rules.
 ## Project
 
 **Serverless Matching Engine** — a stateless order matching engine in Rust.
-Dragonfly (Redis-compatible) for distributed locking/caching, PostgreSQL for persistence.
+Valkey (Redis-compatible) for distributed locking/caching, PostgreSQL for persistence.
 
 ## Architecture
 
 ```
 crates/
-  gateway/      → stateless HTTP/WS gateway (port 3001), reads Dragonfly cache
+  gateway/      → stateless HTTP/WS gateway (port 3001), reads Valkey cache
   worker-lambda/ → Worker Lambda (processes individual orders)
   api/          → local dev worker (BRPOP queue consumer), matching, PG writes
   shared/       → types, config, cache (sorted sets + Lua matching), DB, engine
@@ -22,7 +22,7 @@ crates/
 infra/
   template.yaml → Root SAM template with nested stacks
   stacks/       → Network, backend, frontend CloudFormation stacks
-  Dockerfile.*  → Lambda container builds (ARM64 cross-compile)
+  Dockerfile.*  → Lambda container builds (gateway: ARM64, worker: x86_64)
 web/
   trading/      → vanilla HTML/CSS/JS trading UI
   dashboard/    → vanilla HTML/CSS/JS admin dashboard
@@ -32,19 +32,19 @@ docs/
 
 **Core flow (gateway → worker Lambda):**
 `POST /api/orders` → gateway validates → async invoke Worker Lambda → 202 Accepted
-→ Worker Lambda → lock balance (PG) → Lua EVAL match (Dragonfly) → persist trades (PG) → update cache
+→ Worker Lambda → lock balance (PG) → Lua EVAL match (Valkey) → persist trades (PG) → update cache
 
 **Legacy flow (local dev):**
 `POST /api/orders` → gateway validates → `LPUSH queue:orders:{pair_id}` → 202 Accepted
-→ worker BRPOP → lock balance (PG) → Lua EVAL match (Dragonfly) → async persist (PG) → update cache
+→ worker BRPOP → lock balance (PG) → Lua EVAL match (Valkey) → async persist (PG) → update cache
 
 **Key design constraints (see ADRs):**
 - Workers MUST be stateless — future Lambda deployment (ADR-001)
 - Only dictionary-style rarely-changing data may be cached in worker RAM
-- Dragonfly is the primary cache layer; PG is persistence
+- Valkey is the primary cache layer; PG is persistence
 - Gateway uses shared cache broadcasts for reads (ADR-002)
 - DB persistence is off the hot path (ADR-003)
-- Matching is atomic Lua in Dragonfly (ADR-004)
+- Matching is atomic Lua in Valkey (ADR-004)
 - Per-pair queues with bounded concurrency, sem=3 (ADR-005)
 
 ## Stack
@@ -52,7 +52,7 @@ docs/
 - **Language:** Rust 2024 edition, toolchain 1.94+
 - **Runtime:** tokio 1 (async)
 - **HTTP:** axum
-- **Cache:** Dragonfly via `deadpool-redis` / `redis` crate
+- **Cache:** Valkey (ElastiCache) via `deadpool-redis` / `redis` crate
 - **DB:** PostgreSQL via `sqlx` (runtime, NOT compile-time macros)
 - **Decimals:** `rust_decimal::Decimal` for ALL monetary values — never `f64`
 - **Frontend:** vanilla HTML/CSS/JS — NO external CDN/library dependencies
@@ -69,7 +69,7 @@ docs/
 ### Testing
 - **Unit tests:** pure in-memory, zero I/O, sub-millisecond — in `engine.rs` test module
 - **Integration tests:** behind `--features integration` flag, require Docker services running
-- Run integration tests with `--test-threads=1` (shared Dragonfly/PG state)
+- Run integration tests with `--test-threads=1` (shared Valkey/PG state)
 - **Smoke tests:** `tests/smoke/smoke_test.py` — 10 end-to-end tests (Python + Playwright)
   - T01-T08: API tests (pairs, limit/market orders, matching, ticker, portfolio, orderbook, pair isolation)
   - T09-T10: Browser tests via headless Chromium (orderbook rendering, live trade updates)
@@ -157,13 +157,13 @@ cargo test --features integration -- --test-threads=1         # integration (nee
 
 # Run worker (queue consumer, matching, PG writes)
 DATABASE_URL=postgres://sme:sme_dev@localhost:5432/matching_engine \
-DRAGONFLY_URL=redis://localhost:6379 \
+REDIS_URL=redis://localhost:6379 \
 RUST_LOG=info \
 ./target/release/sme-api
 
-# Run gateway (HTTP/WS, reads Dragonfly, serves UI)
+# Run gateway (HTTP/WS, reads Valkey, serves UI)
 PORT=3001 \
-DRAGONFLY_URL=redis://localhost:6379 \
+REDIS_URL=redis://localhost:6379 \
 RUST_LOG=info \
 ./target/release/sme-gateway
 
@@ -216,8 +216,12 @@ python3 tools/benchmark.py
 | `infra/stacks/network.yaml` | VPC, subnets, security groups |
 | `infra/stacks/backend.yaml` | EC2, Lambda ×2, API Gateway, UserData |
 | `infra/stacks/frontend.yaml` | S3, CloudFront, OAC |
-| `infra/Dockerfile.gateway` | Gateway Lambda Docker build (cross-compile arm64) |
-| `infra/Dockerfile.worker` | Worker Lambda Docker build (cross-compile arm64) |
+| `infra/Dockerfile.gateway` | Gateway Lambda Docker build (arm64) |
+| `infra/Dockerfile.worker` | Worker Lambda Docker build (x86_64) |
+| `tools/deploy.sh` | Build + push + deploy + run_migrations |
+| `tools/bench_aws.py` | AWS benchmark script with warmup |
+| `tools/new_migration.sh` | Create timestamped migration file |
+| `migrations/*.sql` | Timestamped SQL migrations (YYYYMMDDHHMMSS format) |
 
 ### Symlinks
 | Path | Target |
@@ -232,8 +236,44 @@ python3 tools/benchmark.py
 - Root stack: `serverless-matching-engine` (deploy via `sam deploy` from repo root)
 - Nested: `BackendStack-7JBC7XEVQNKF`, `NetworkStack-1CC1NUX65RXPV`, `FrontendStack-156KD6ROT0G0S`
 - Individual `infra/stacks/*.yaml` files are NOT standalone — they reference parent parameters/conditions
-- For Lambda code updates without full redeploy: `aws lambda update-function-code`
 - Lambda function names: `serverless-matching-engine-gateway`, `serverless-matching-engine-worker`, `serverless-matching-engine-ws-handler`
+
+### Deploy Process
+```bash
+tools/deploy.sh                         # Build + push + deploy + run_migrations
+tools/deploy.sh --migrate-only          # Just run migrations
+tools/deploy.sh --skip-build            # Deploy with existing images
+```
+
+### Manage Commands (Worker Lambda)
+All admin operations via direct invocation:
+```json
+{"manage": {"command": "run_migrations"}}
+{"manage": {"command": "reset_all"}}
+{"manage": {"command": "reset_balances"}}
+{"manage": {"command": "truncate_orders"}}
+{"manage": {"command": "exec_sql", "sql": "..."}}
+{"manage": {"command": "query", "sql": "..."}}
+```
+
+### Migrations
+- Format: `migrations/YYYYMMDDHHMMSS_description.sql`
+- Each file has `-- migration:` and `-- depends-on:` comment headers
+- Uses sqlx built-in migrator (`_sqlx_migrations` table)
+- Embedded in Docker image, run via `manage:run_migrations` after deploy
+- Create new: `tools/new_migration.sh "description"`
+
+### AWS Infrastructure
+| Component | Service | Spec |
+|-----------|---------|------|
+| Cache | ElastiCache Valkey | `cache.t4g.micro`, Valkey 8.1 |
+| Database | RDS PostgreSQL | `db.t4g.small`, PG 16.6 |
+| Connection Pool | RDS Proxy | `sme-proxy-v2` |
+| Gateway | Lambda (arm64) | 512MB, Lambda Web Adapter |
+| Worker | Lambda (x86_64) | 1024MB, native Rust runtime |
+| Frontend | CloudFront + S3 | `d3ux5yer0uv7b5.cloudfront.net` |
+| HTTP API | API Gateway | `kpvhsf0ub8` |
+| WebSocket | API Gateway WS | `2shnq9yk0c` |
 
 ## Don'ts
 

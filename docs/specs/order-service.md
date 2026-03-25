@@ -7,12 +7,12 @@
 - Manage the full order lifecycle (create, modify, cancel)
 - Validate orders against pair configuration (tick/lot size, price bands, min/max)
 - Persist orders to PostgreSQL
-- Publish orders to Dragonfly Streams for matching
+- Publish orders to Valkey Streams for matching
 - Dispatch stat update triggers
 
 ## Trigger
 
-- Consumes from Dragonfly Stream: `stream:orders`
+- Consumes from Valkey Stream: `stream:orders`
 - Or receives requests via API (`crates/api`)
 
 ## Order Validation

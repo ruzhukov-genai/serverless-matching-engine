@@ -5,9 +5,9 @@
 ## Order Book Locking
 
 Organizes concurrent access and preserves message sequence per order book.
-Uses Dragonfly (Redis-compatible) distributed locking.
+Uses Valkey (Redis-compatible) distributed locking.
 
-### Dragonfly Keys
+### Valkey Keys
 
 | Key | Type | Purpose |
 |-----|------|---------|
@@ -18,7 +18,7 @@ Uses Dragonfly (Redis-compatible) distributed locking.
 ### Algorithm
 
 ```
-1. Receive message from Dragonfly Stream
+1. Receive message from Valkey Stream
 2. RPUSH book:{pair_id}:queue {message}
 3. Obtain Lock:
    a. res = SET book:{pair_id}:lock {worker_id} NX EX 1
@@ -43,10 +43,10 @@ Uses Dragonfly (Redis-compatible) distributed locking.
 ### Notes
 
 - `{worker_id}` must be unique per lock holder to prevent accidental release
-- Single-node Dragonfly weakness: mitigated via RedLock post-migration
+- Single-node Valkey weakness: mitigated via RedLock post-migration
 - Lock TTL (1 second) ensures crashed workers do not permanently block a pair
 
 ### TODO
 
 - [ ] Instrument: lock wait time, contention rate, lock duration
-- [ ] RedLock implementation plan (multi-node Dragonfly)
+- [ ] RedLock implementation plan (multi-node Valkey)

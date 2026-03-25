@@ -1,331 +1,78 @@
-# Worker Lambda Implementation Guide
+# Worker Lambda
 
 ## Overview
 
-The Serverless Matching Engine has been migrated from EC2 BRPOP-based order processing to **direct AWS Lambda invocation** for fully serverless architecture.
+The Worker Lambda (`crates/worker-lambda/`) processes individual orders as a stateless Rust binary
+running on AWS Lambda (x86_64, 1024MB, 30s timeout).
 
-### Architecture Change
-
-**Before (EC2 worker):**
+### Order Flow
 ```
-POST /api/orders 
-  → Gateway Lambda validates 
-  → LPUSH queue:orders:{pair_id} to Dragonfly 
-  → 202 Accepted to client
-  → EC2 sme-api BRPOP loop (long-lived process) 
-  → lock balance → Lua EVAL match → persist to PG → update cache
-```
-
-**After (Worker Lambda):**
-```
-POST /api/orders 
-  → Gateway Lambda validates 
-  → async invoke Worker Lambda (InvocationType: Event, ~5ms) 
-  → 202 Accepted to client
-  → Worker Lambda (stateless, scales to 0 when idle)
-  → lock balance → Lua EVAL match → persist to PG → update cache
+Gateway Lambda → async invoke → Worker Lambda
+  1. Parse order JSON from Lambda event
+  2. Load pairs cache (from Valkey, cached after first cold start)
+  3. Lock balance in PostgreSQL (atomic row-level lock)
+  4. Execute matching via Lua EVAL in Valkey (atomic)
+  5. Persist trades + updated orders to PostgreSQL (batch INSERT)
+  6. Update cache keys (orderbook, trades, ticker, portfolio)
+  7. Return success/failure to Lambda runtime
 ```
 
-**Benefits:**
-- ✅ Fully serverless (no EC2 worker process needed)
-- ✅ Low latency (5ms vs 50-100ms SQS)
-- ✅ Automatic scaling (Lambda scales based on invoke rate)
-- ✅ Zero cost when idle (no reserved concurrency)
-- ✅ Built-in retry (Lambda retries twice on failure)
+### Cold Start Optimization
+- PG pool: `max_connections(1)`, `min_connections(0)`, `connect_lazy()` — no blocking TCP on init
+- Valkey pool: 2 connections
+- Cache seed: skipped if `cache:pairs` already exists (first Lambda seeds, others skip)
+- Cold start time: ~1s (init 54ms + first PG connection)
 
-## Code Structure
+## Manage Commands
 
-### New Crate: `crates/worker-lambda/`
+All admin operations via direct Lambda invocation with `{"manage": {"command": "..."}}`:
 
-The Worker Lambda implementation is a new Rust crate (`sme-worker-lambda`) that:
+| Command | Description | Needs Valkey? |
+|---------|-------------|:---:|
+| `run_migrations` | Run pending SQL migrations | No |
+| `exec_sql` | Execute arbitrary DDL/DML | No |
+| `query` | Run SELECT, return `cnt` column | No |
+| `reset_all` | Truncate orders + reset balances + sync cache | Yes |
+| `reset_balances` | Reset 10 test users to initial balances | Yes |
+| `truncate_orders` | Truncate orders + clear orderbook cache | Yes |
 
-1. **Receives** order JSON via Lambda event (same format as Dragonfly LPUSH payload)
-2. **Parses** order and validates using in-memory pairs cache
-3. **Locks balance** in PostgreSQL (atomic row-level lock)
-4. **Executes matching** via Lua EVAL in Dragonfly (atomic)
-5. **Persists** trades and updated order status to PostgreSQL
-6. **Updates cache** (orderbook, trades, ticker, portfolio keys)
-7. **Returns** success/failure to Lambda runtime (retried on failure)
+Lightweight commands use a standalone PG connection (run before `get_state()`).
+Stateful commands initialize full worker state (PG + Valkey).
 
-**Key files:**
-- `crates/worker-lambda/src/main.rs` — Lambda handler (858 lines)
-- `crates/worker-lambda/Cargo.toml` — Dependencies (lambda_runtime, aws SDK, etc)
-- `infra/Dockerfile.worker` — ARM64 Docker build for Lambda custom runtime
-- `infra/stacks/backend.yaml` — SAM backend stack with Worker Lambda resource
-
-### Gateway Lambda Changes
-
-The Gateway Lambda (`crates/gateway/src/routes.rs`) now has two dispatch modes:
-
-**Environment variable: `ORDER_DISPATCH_MODE` (default: `"queue"`)**
-
-- **`queue`** (default, local dev) — LPUSH to Dragonfly queue (backward compatible)
-- **`lambda`** (AWS production) — async invoke Worker Lambda via boto3
-
-**Environment variable: `WORKER_LAMBDA_ARN`**
-- ARN of the Worker Lambda function (set by CloudFormation)
-
-**Code location:** `crates/gateway/src/routes.rs`, `submit_order()` function
-
-```rust
-// Dispatch order to worker — mode selected by ORDER_DISPATCH_MODE env var
-match s.dispatch_mode {
-    DispatchMode::Lambda => {
-        // Async Lambda invoke (fire-and-forget) — returns immediately
-        if let Some(ref lambda_client) = s.lambda_client {
-            let _ = lambda_client.invoke()
-                .function_name(&s.worker_lambda_arn)
-                .invocation_type(aws_sdk_lambda::types::InvocationType::Event)
-                .payload(aws_sdk_lambda::primitives::Blob::new(payload))
-                .send()
-                .await;
-        }
-    }
-    DispatchMode::Queue => {
-        // LPUSH to Dragonfly queue (existing behavior)
-        // ...
-    }
-}
-```
-
-## Deployment Steps
-
-### 1. Build and Push Worker Lambda Docker Image
-
-**Option A: Automated (recommended)**
-```bash
-cd ~/projects/serverless-matching-engine
-./infra/deploy-worker.sh
-```
-
-This script:
-- Authenticates with ECR
-- Builds ARM64 Docker image (15-20 min on first build)
-- Pushes to ECR
-- Updates CloudFormation stack
-
-**Option B: Manual**
-```bash
-SAM handles Docker building and ECR push automatically. See updated deployment process in infra/README.md.
-```
-
-### 2. Monitor CloudFormation Deployment
+## Deployment
 
 ```bash
-aws cloudformation describe-stack-events \
-  --stack-name serverless-matching-engine-backend \
-  --region us-east-1 \
-  --query 'StackEvents[0:10]'
+# Automated
+tools/deploy.sh
+
+# Manual
+DOCKER_BUILDKIT=1 docker build --provenance=false -f infra/Dockerfile.worker -t sme-worker:latest .
+docker tag sme-worker:latest <ECR_URI>:latest
+docker push <ECR_URI>:latest
+# Then update Lambda code via boto3 or AWS CLI
 ```
-
-Wait for `UPDATE_COMPLETE` (typically 5-10 minutes).
-
-### 3. Test Order Flow
-
-```bash
-# Get API URL from CloudFront distribution
-CLOUDFRONT_URL=$(aws cloudformation describe-stacks \
-  --stack-name serverless-matching-engine-frontend \
-  --query 'Stacks[0].Outputs[?OutputKey==`CloudFrontUrl`].OutputValue' \
-  --output text)
-
-# Submit an order
-curl -X POST ${CLOUDFRONT_URL}/api/orders \
-  -H "Content-Type: application/json" \
-  -d '{
-    "user_id": "user-1",
-    "pair_id": "BTC-USDT",
-    "side": "Buy",
-    "order_type": "Limit",
-    "tif": "GTC",
-    "price": "70000",
-    "quantity": "0.001"
-  }'
-
-# Response: 202 Accepted (order queued for Worker Lambda processing)
-
-# Check order status (via Gateway snapshot cache)
-curl ${CLOUDFRONT_URL}/api/snapshot/BTC-USDT
-```
-
-### 4. Verify Worker Lambda Logs
-
-```bash
-# View Worker Lambda logs
-aws logs tail /aws/lambda/serverless-matching-engine-worker --follow --region us-east-1
-```
-
-Expected log entries:
-- `handler: received order {order_id}`
-- `lock_balance: locked {amount} for {user_id}`
-- `match_order_lua: {trade_count} trades executed`
-- `persist: inserted {trade_count} trades to db`
-- `cache_update: updated orderbook, trades, ticker, portfolio`
 
 ## Configuration
 
-### Environment Variables
+| Variable | Value | Source |
+|----------|-------|--------|
+| `REDIS_URL` | `redis://sme-valkey...cache.amazonaws.com:6379` | ElastiCache endpoint |
+| `DATABASE_URL` | `postgres://...proxy...rds.amazonaws.com:5432/matching_engine` | RDS Proxy endpoint |
+| `RUST_LOG` | `info` | CloudFormation |
 
-Set by CloudFormation in the Worker Lambda function:
+## Performance (c=40 benchmark, 2026-03-25)
 
-| Variable | Example | Source |
-|----------|---------|--------|
-| `DRAGONFLY_URL` | `redis://10.0.1.197:6379` | EC2 private IP |
-| `DATABASE_URL` | `postgres://sme:password@10.0.1.197:5432/matching_engine` | EC2 private IP + credentials |
-| `RUST_LOG` | `info` | CloudFormation parameter |
+| Metric | Value |
+|--------|-------|
+| Lua EVAL (p50) | 1-2ms |
+| PG persist (p50) | 860ms |
+| Worker total (p50) | 2,894ms |
+| Cold start | ~1s |
+| Timeouts | 0 |
 
-### Gateway Lambda Configuration
-
-| Variable | Example | Set by |
-|----------|---------|--------|
-| `ORDER_DISPATCH_MODE` | `lambda` | CloudFormation |
-| `WORKER_LAMBDA_ARN` | `arn:aws:lambda:us-east-1:210352747749:function:serverless-matching-engine-worker` | CloudFormation |
-
-## Architecture Decisions
-
-This implementation follows the existing Architecture Decision Records (ADRs):
-
-- **ADR-001: Stateless Workers** ✅ — Worker Lambda is inherently stateless
-- **ADR-003: Async DB Persistence** ✅ — Worker persists synchronously but asynchronously from client perspective
-- **ADR-004: Lua Atomic Matching** ✅ — Uses same `cache::match_order_lua()` function
-- **ADR-005: Per-Pair Queue Consumers** — Superseded by direct Lambda invoke (no queue batching needed)
-
-## Performance Characteristics
-
-### Latency
-
-| Stage | Time | Notes |
-|-------|------|-------|
-| Cold start (first request) | ~43ms | Lambda container startup + Dragonfly/PG pool init |
-| Warm invoke | ~5ms | Lambda invoke overhead only |
-| Order processing (hot) | ~15-20ms | Validation + lock + Lua + PG persist |
-| **Total (client perspective)** | **5ms** | Gateway returns 202 immediately (async) |
-
-### Throughput
-
-- **Concurrent Lambda invocations:** Scales to account limit (1000 default)
-- **Orders per second:** Limited by API Gateway (1000 RPS after optimization) and Dragonfly serialization (~100 Lua EVALs/sec per pair)
-- **No reserved concurrency:** Scales to zero when idle (cost: $0.10 per million invocations)
-
-### Cost
-
-- **Gateway Lambda:** $0.20 per million requests
-- **Worker Lambda:** $0.10 per million invocations (for invocations only, not execution time)
-- **Total messaging cost:** $0.30 per million orders (~negligible)
-
-## Troubleshooting
-
-### Worker Lambda Not Processing Orders
-
-**Check logs:**
-```bash
-aws logs tail /aws/lambda/serverless-matching-engine-worker --follow --region us-east-1
-```
-
-**Common issues:**
-1. **DRAGONFLY_URL unreachable** — Worker Lambda private subnets cannot reach EC2 Dragonfly
-   - Verify security group allows Worker → EC2 (port 6379)
-   - Verify EC2 is running and Dragonfly is listening: `netstat -tlnp | grep 6379`
-
-2. **DATABASE_URL unreachable** — Worker Lambda cannot connect to PostgreSQL
-   - Verify security group allows Worker → EC2 (port 5432)
-   - Verify EC2 PostgreSQL is running: `systemctl status postgresql`
-
-3. **Lua match failure** — Order validation passed but Lua EVAL failed
-   - Check Dragonfly logs on EC2: `journalctl -u dragonfly -f`
-   - Verify cache:pairs key is populated
-
-### Slow Order Processing
-
-**Check CloudWatch metrics:**
-```bash
-aws cloudwatch get-metric-statistics \
-  --namespace AWS/Lambda \
-  --metric-name Duration \
-  --dimensions Name=FunctionName,Value=serverless-matching-engine-worker \
-  --start-time 2026-03-21T00:00:00Z \
-  --end-time 2026-03-21T23:59:59Z \
-  --period 300 \
-  --statistics Average,Maximum,Minimum \
-  --region us-east-1
-```
-
-**Typical baseline:**
-- Average: 15-20ms
-- p95: 30-50ms
-- p99: 100-150ms (GC)
-
-If higher, check:
-1. EC2 CPU/memory utilization
-2. Dragonfly memory pressure (check lua_ms in logs)
-3. PostgreSQL connection pool contention (check pg_stat_activity)
-
-## Local Development
-
-### Run with Queue Mode (backward compatible)
-
-Gateway Lambda stays in `ORDER_DISPATCH_MODE=queue` by default.
-
-**Start EC2 sme-api worker locally:**
-```bash
-# Terminal 1: Start local Dragonfly
-docker run -p 6379:6379 docker.io/erezsh/dragonfly
-
-# Terminal 2: Start local PostgreSQL (or use RDS)
-docker run -p 5432:5432 -e POSTGRES_PASSWORD=sme_prod_9b43c1802d8440e9666be882d925d933 postgres:16
-
-# Terminal 3: Start sme-api worker
-cd ~/projects/serverless-matching-engine
-RUST_LOG=info \
-  DRAGONFLY_URL=redis://127.0.0.1:6379 \
-  DATABASE_URL=postgres://sme:sme_prod_9b43c1802d8440e9666be882d925d933@127.0.0.1:5432/matching_engine \
-  cargo run --package sme-api
-
-# Terminal 4: Start gateway (in queue mode, no Lambda)
-cd ~/projects/serverless-matching-engine
-RUST_LOG=info \
-  DRAGONFLY_URL=redis://127.0.0.1:6379 \
-  DATABASE_URL=postgres://sme:sme_prod_9b43c1802d8440e9666be882d925d933@127.0.0.1:5432/matching_engine \
-  ORDER_DISPATCH_MODE=queue \
-  cargo run --package sme-gateway
-```
-
-### Test Worker Lambda Locally
-
-**Option 1: Use AWS SAM to invoke locally**
-```bash
-sam local invoke WorkerLambda --event test-order.json
-```
-
-**Option 2: Invoke via Lambda testing console**
-- AWS Console → Lambda → serverless-matching-engine-worker → Test → Create test event
-- Paste order JSON and click "Test"
-
-**Sample test event:**
-```json
-{
-  "id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
-  "user_id": "user-1",
-  "pair_id": "BTC-USDT",
-  "side": "Buy",
-  "order_type": "Limit",
-  "tif": "GTC",
-  "price": "70000",
-  "quantity": "0.001",
-  "created_at": "2026-03-21T23:00:00Z"
-}
-```
-
-## Future Enhancements
-
-1. **Worker Lambda Provisioned Concurrency** — keep container warm for <5ms cold starts
-2. **Dead-Letter Queue** — route failed orders to SQS DLQ for manual review
-3. **Order Pipeline Observability** — emit structured logs per order for tracing
-4. **Worker Lambda Auto-scaling** — adjust memory/timeout based on workload metrics
-5. **Lua script versioning** — separate Lua script version from Gateway/Worker code versions
+**Remaining bottleneck:** PG row-level lock contention on `balances` table UPDATE.
+40 Lambdas competing to update the same 10 test users' balance rows.
 
 ---
 
-**Last updated:** 2026-03-22
-**Author:** Claw Opus
-**Status:** ✅ Deployed and working
+**Last updated:** 2026-03-25

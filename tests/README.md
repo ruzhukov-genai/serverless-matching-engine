@@ -1,6 +1,6 @@
 # Tests
 
-Note: Integration tests require local Docker services (PostgreSQL + Dragonfly), not AWS.
+Note: Integration tests require local Docker services (PostgreSQL + Valkey), not AWS.
 
 ## Test Categories
 
