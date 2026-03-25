@@ -23,7 +23,7 @@ use once_cell::sync::OnceCell;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::Row;
+use sqlx::{Row, QueryBuilder, Postgres};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -471,40 +471,45 @@ async fn persist_order(
     .execute(&mut *tx)
     .await?;
 
-    // Insert all trades and aggregate balance deltas
+    // Batch insert all trades and aggregate balance deltas
     let mut balance_deltas: HashMap<(String, String), (Decimal, Decimal)> = HashMap::new();
 
-    for trade in trades {
-        sqlx::query(
-            "INSERT INTO trades (id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, created_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING",
-        )
-        .bind(trade.id)
-        .bind(&trade.pair_id)
-        .bind(trade.buy_order_id)
-        .bind(trade.sell_order_id)
-        .bind(&trade.buyer_id)
-        .bind(&trade.seller_id)
-        .bind(trade.price)
-        .bind(trade.quantity)
-        .bind(trade.created_at)
-        .execute(&mut *tx)
-        .await?;
+    if !trades.is_empty() {
+        // Build batched trades INSERT using QueryBuilder
+        let mut trade_query = QueryBuilder::<Postgres>::new(
+            "INSERT INTO trades (id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, created_at)"
+        );
+        trade_query.push_values(trades, |mut b, trade| {
+            b.push_bind(trade.id)
+             .push_bind(&trade.pair_id)
+             .push_bind(trade.buy_order_id)
+             .push_bind(trade.sell_order_id)
+             .push_bind(&trade.buyer_id)
+             .push_bind(&trade.seller_id)
+             .push_bind(trade.price)
+             .push_bind(trade.quantity)
+             .push_bind(trade.created_at);
+        });
+        trade_query.push(" ON CONFLICT DO NOTHING");
+        trade_query.build().execute(&mut *tx).await?;
 
-        let (base, quote) = parse_pair_id(&trade.pair_id)?;
-        let cost = trade.price * trade.quantity;
+        // Aggregate balance deltas
+        for trade in trades {
+            let (base, quote) = parse_pair_id(&trade.pair_id)?;
+            let cost = trade.price * trade.quantity;
 
-        // buyer: locked -= cost, available += qty (base)
-        balance_deltas.entry((trade.buyer_id.clone(), quote.clone()))
-            .or_insert((Decimal::ZERO, Decimal::ZERO)).0 += cost;
-        balance_deltas.entry((trade.buyer_id.clone(), base.clone()))
-            .or_insert((Decimal::ZERO, Decimal::ZERO)).1 += trade.quantity;
+            // buyer: locked -= cost, available += qty (base)
+            balance_deltas.entry((trade.buyer_id.clone(), quote.clone()))
+                .or_insert((Decimal::ZERO, Decimal::ZERO)).0 += cost;
+            balance_deltas.entry((trade.buyer_id.clone(), base.clone()))
+                .or_insert((Decimal::ZERO, Decimal::ZERO)).1 += trade.quantity;
 
-        // seller: locked -= qty (base), available += cost
-        balance_deltas.entry((trade.seller_id.clone(), base.clone()))
-            .or_insert((Decimal::ZERO, Decimal::ZERO)).0 += trade.quantity;
-        balance_deltas.entry((trade.seller_id.clone(), quote.clone()))
-            .or_insert((Decimal::ZERO, Decimal::ZERO)).1 += cost;
+            // seller: locked -= qty (base), available += cost
+            balance_deltas.entry((trade.seller_id.clone(), base.clone()))
+                .or_insert((Decimal::ZERO, Decimal::ZERO)).0 += trade.quantity;
+            balance_deltas.entry((trade.seller_id.clone(), quote.clone()))
+                .or_insert((Decimal::ZERO, Decimal::ZERO)).1 += cost;
+        }
     }
 
     // Apply balance deltas (sorted for consistent lock ordering = no deadlock)
@@ -526,24 +531,25 @@ async fn persist_order(
         .await?;
     }
 
-    // Update resting orders after Lua fill
+    // Batch update resting orders after Lua fill
     let now = Utc::now();
-    for lt in lua_trades {
-        sqlx::query(
-            "UPDATE orders
-             SET remaining   = GREATEST(remaining - $1, 0),
-                 status      = CASE WHEN GREATEST(remaining - $1, 0) = 0
-                                    THEN 'Filled' ELSE 'PartiallyFilled' END,
-                 version     = version + 1,
-                 updated_at  = $2
-             WHERE id = $3
-               AND status IN ('New', 'PartiallyFilled')",
-        )
-        .bind(lt.quantity)
-        .bind(now)
-        .bind(lt.resting_order_id)
-        .execute(&mut *tx)
-        .await?;
+    if !lua_trades.is_empty() {
+        // Build batched resting order updates using CTE
+        let mut updates_query = QueryBuilder::<Postgres>::new(
+            "WITH updates(order_id, fill_qty) AS ("
+        );
+        updates_query.push_values(lua_trades, |mut b, lt| {
+            b.push_bind(lt.resting_order_id)
+             .push_bind(lt.quantity);
+        });
+        updates_query.push(") UPDATE orders o SET ")
+                     .push("remaining = GREATEST(o.remaining - u.fill_qty, 0), ")
+                     .push("status = CASE WHEN GREATEST(o.remaining - u.fill_qty, 0) = 0 THEN 'Filled' ELSE 'PartiallyFilled' END, ")
+                     .push("version = o.version + 1, ")
+                     .push("updated_at = ")
+                     .push_bind(now)
+                     .push(" FROM updates u WHERE o.id = u.order_id AND o.status IN ('New', 'PartiallyFilled')");
+        updates_query.build().execute(&mut *tx).await?;
     }
 
     // Update incoming order's remaining + status
@@ -581,31 +587,56 @@ async fn persist_order(
 
     tx.commit().await?;
 
-    // Audit events — fire-and-forget outside main transaction
-    let _ = sqlx::query("INSERT INTO audit_log (pair_id, event_type, payload) VALUES ($1, $2, $3)")
-        .bind(&order.pair_id)
-        .bind("ORDER_CREATED")
-        .bind(json!({
-            "order_id": order.id.to_string(),
-            "user_id": order.user_id,
-            "side": side_str(order.side),
-            "order_type": order_type_str(order.order_type),
-            "price": order.price.map(|v| v.to_string()),
-            "quantity": order.quantity.to_string(),
-        }))
-        .execute(&state.pg)
-        .await;
+    // Batch audit events — fire-and-forget outside main transaction
+    if !trades.is_empty() {
+        // Build batch audit log INSERT for order + trades
+        let mut audit_values = vec![
+            (order.pair_id.clone(), "ORDER_CREATED".to_string(), json!({
+                "order_id": order.id.to_string(),
+                "user_id": order.user_id,
+                "side": side_str(order.side),
+                "order_type": order_type_str(order.order_type),
+                "price": order.price.map(|v| v.to_string()),
+                "quantity": order.quantity.to_string(),
+            }))
+        ];
 
-    for trade in trades {
+        for trade in trades {
+            audit_values.push((
+                trade.pair_id.clone(),
+                "TRADE_EXECUTED".to_string(),
+                json!({
+                    "trade_id": trade.id.to_string(),
+                    "buy_order_id": trade.buy_order_id.to_string(),
+                    "sell_order_id": trade.sell_order_id.to_string(),
+                    "price": trade.price.to_string(),
+                    "quantity": trade.quantity.to_string(),
+                })
+            ));
+        }
+
+        let mut audit_query = QueryBuilder::<Postgres>::new(
+            "INSERT INTO audit_log (pair_id, event_type, payload)"
+        );
+        audit_query.push_values(&audit_values, |mut b, (pair_id, event_type, payload)| {
+            b.push_bind(pair_id)
+             .push_bind(event_type)
+             .push_bind(payload);
+        });
+
+        let _ = audit_query.build().execute(&state.pg).await;
+    } else {
+        // Just the order creation audit event
         let _ = sqlx::query("INSERT INTO audit_log (pair_id, event_type, payload) VALUES ($1, $2, $3)")
-            .bind(&trade.pair_id)
-            .bind("TRADE_EXECUTED")
+            .bind(&order.pair_id)
+            .bind("ORDER_CREATED")
             .bind(json!({
-                "trade_id": trade.id.to_string(),
-                "buy_order_id": trade.buy_order_id.to_string(),
-                "sell_order_id": trade.sell_order_id.to_string(),
-                "price": trade.price.to_string(),
-                "quantity": trade.quantity.to_string(),
+                "order_id": order.id.to_string(),
+                "user_id": order.user_id,
+                "side": side_str(order.side),
+                "order_type": order_type_str(order.order_type),
+                "price": order.price.map(|v| v.to_string()),
+                "quantity": order.quantity.to_string(),
             }))
             .execute(&state.pg)
             .await;
