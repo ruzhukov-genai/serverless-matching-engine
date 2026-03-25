@@ -71,7 +71,7 @@ async fn get_state() -> Result<&'static WorkerState> {
         .context("failed to create Dragonfly pool")?;
 
     let pg = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(1)
         .min_connections(1)
         .acquire_timeout(Duration::from_secs(10))
         .idle_timeout(Duration::from_secs(60))
