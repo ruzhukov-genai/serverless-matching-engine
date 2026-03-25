@@ -86,10 +86,15 @@ class Config:
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
+def _timeout(cfg: Config) -> int:
+    """Longer timeout for AWS (Lambda cold starts can take 15s+)."""
+    return 30 if cfg.is_aws else 10
+
+
 def api_get(cfg: Config, path: str) -> dict:
     url = f"{cfg.api_url}{path}"
     req = urllib.request.Request(url)
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with urllib.request.urlopen(req, timeout=_timeout(cfg)) as resp:
         return json.loads(resp.read())
 
 
@@ -98,7 +103,7 @@ def api_post(cfg: Config, path: str, body: dict) -> dict:
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=_timeout(cfg)) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return {"error": e.code, "message": e.read().decode() if e.fp else ""}
@@ -108,7 +113,7 @@ def api_delete(cfg: Config, path: str) -> dict:
     url = f"{cfg.api_url}{path}"
     req = urllib.request.Request(url, method="DELETE")
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=_timeout(cfg)) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError:
         return {}
