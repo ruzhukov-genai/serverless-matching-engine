@@ -330,11 +330,55 @@ Resources:
       DestinationSecurityGroupId: !Ref ElastiCacheSecurityGroup
       Description: Valkey on ElastiCache from Worker Lambda
 
-  # NOTE: VPC Endpoints (Lambda + STS) created manually via CLI.
-  # AWS::EC2::VpcEndpoint resource type not available for this account.
-  # vpce-059c2ada825ef5139 = com.amazonaws.lambda (private DNS enabled)
-  # vpce-0bc14a9dd7223dd82 = com.amazonaws.sts (private DNS enabled)
-  # SG: sg-07b746213feab29ee (allows HTTPS from Lambda + Worker SGs)
+  # =========================================================================
+  # VPC Endpoints — allow Lambda (in private subnets) to call AWS services
+  # =========================================================================
+
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${ProjectName} VPC Endpoint SG — allows HTTPS from Lambda SGs'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: HTTPS from Gateway Lambda
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
+          Description: HTTPS from Worker Lambda
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpce-sg'
+
+  LambdaVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.lambda'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  StsVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sts'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
 
 # ---------------------------------------------------------------------------
 # Outputs

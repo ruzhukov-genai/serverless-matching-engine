@@ -99,14 +99,7 @@ Resources:
                   - ecr:GetDownloadUrlForLayer
                   - ecr:BatchGetImage
                 Resource: '*'
-        - PolicyName: InvokeWorkerLambda
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - lambda:InvokeFunction
-                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-worker'
+        # InvokeWorkerLambda policy removed — gateway uses queue dispatch (ADR-007)
         - PolicyName: ManageWebSocketConnections
           PolicyDocument:
             Version: '2012-10-17'
@@ -245,9 +238,8 @@ Resources:
           # Cache: ElastiCache Valkey
           REDIS_URL: !Sub 'redis://${ValkeyCache.PrimaryEndPoint.Address}:6379'
           RUST_LOG: info
-          # Worker Lambda dispatch
-          ORDER_DISPATCH_MODE: lambda
-          WORKER_LAMBDA_ARN: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-worker'
+          # Worker dispatch: queue mode — gateway LPUSH to Valkey, worker drains on schedule (ADR-007)
+          ORDER_DISPATCH_MODE: queue
       Tags:
         Project: !Ref ProjectName
 
@@ -297,6 +289,29 @@ Resources:
           WS_API_ENDPOINT: !Sub 'https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/ws'
       Tags:
         Project: !Ref ProjectName
+
+  # =========================================================================
+  # EventBridge Schedule — drain order queues every 1 minute (ADR-007)
+  # Worker Lambda processes all queued orders in a single invocation.
+  # =========================================================================
+  WorkerDrainScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-worker-drain'
+      Description: Drain Valkey order queues every 1 minute
+      ScheduleExpression: 'rate(1 minute)'
+      State: ENABLED
+      Targets:
+        - Id: WorkerLambdaDrain
+          Arn: !GetAtt WorkerLambda.Arn
+
+  WorkerDrainSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WorkerLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WorkerDrainScheduleRule.Arn
 
   # =========================================================================
   # WebSocket API for real-time feeds (ADR-006)

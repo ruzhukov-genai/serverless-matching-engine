@@ -1,10 +1,14 @@
-//! Worker Lambda — processes a single order from a Lambda event payload.
+//! Worker Lambda — processes orders via queue drain or direct invocation.
 //!
-//! Invoked asynchronously (InvocationType::Event) by the Gateway Lambda.
-//! Payload: the same order JSON that the gateway currently pushes to queue:orders:{pair_id}.
+//! Two modes (ADR-007):
+//!   1. **Queue drain** (primary): Invoked by EventBridge schedule (rate(1 minute)).
+//!      RPOP from all `queue:orders:{pair_id}` queues, process up to 50 orders per invocation.
+//!      Gateway pushes to Valkey queue (LPUSH) and returns 202 immediately.
+//!   2. **Direct invoke** (legacy): Single order in Lambda event payload.
+//!      Used when `ORDER_DISPATCH_MODE=lambda` in gateway.
 //!
-//! Flow:
-//!   1. Parse order from event payload
+//! Flow per order:
+//!   1. Parse order JSON (from queue or payload)
 //!   2. Validate using pairs_cache (loaded once, cached across warm starts)
 //!   3. Lock balance + match via Lua EVAL (atomic, ADR-004)
 //!   4. Persist to PG synchronously (simpler than mpsc in Lambda)
@@ -238,6 +242,25 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, LambdaError> {
         return handle_manage(command, manage).await;
     }
 
+    // ── Queue drain mode (ADR-007) ───────────────────────────────────
+    // EventBridge scheduled event: {"source": "aws.events", ...}
+    // Or explicit: {"drain_queue": true}
+    // Drains all pair queues, processes orders in batch.
+    let is_scheduled = payload.get("source")
+        .and_then(|v| v.as_str())
+        .map_or(false, |s| s == "aws.events");
+    let is_drain = payload.get("drain_queue")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if is_scheduled || is_drain {
+        let state = get_state().await?;
+        let result = drain_order_queues(state).await?;
+        return Ok(result);
+    }
+
+    // ── Direct invoke mode (legacy) ──────────────────────────────────
+    // Single order in payload — invoked by gateway in lambda dispatch mode.
     let state = get_state().await?;
 
     if let Err(e) = process_order(state, &payload).await {
@@ -367,6 +390,99 @@ async fn standalone_pg() -> Result<sqlx::PgPool, LambdaError> {
         .connect(&database_url)
         .await
         .map_err(|e| LambdaError::from(format!("PG connect failed: {e}")))
+}
+
+/// Queue drain mode (ADR-007): RPOP from all pair queues, process each order.
+/// Called by EventBridge schedule or explicit {"drain_queue": true}.
+/// Drains up to MAX_DRAIN_BATCH orders per invocation across all pairs.
+const MAX_DRAIN_BATCH: usize = 50;
+const PAIRS: &[&str] = &["BTC-USDT", "ETH-USDT", "SOL-USDT"];
+
+async fn drain_order_queues(state: &WorkerState) -> Result<Value, LambdaError> {
+    use deadpool_redis::redis::AsyncCommands;
+
+    let drain_start = std::time::Instant::now();
+    let mut total_orders = 0usize;
+    let mut total_errors = 0usize;
+
+    let mut conn = state.redis.get().await
+        .map_err(|e| LambdaError::from(format!("redis pool get failed: {e}")))?;
+
+    // Drain from each pair queue
+    for pair_id in PAIRS {
+        let queue_key = format!("queue:orders:{pair_id}");
+        let mut pair_count = 0usize;
+
+        // RPOP up to MAX_DRAIN_BATCH orders (non-blocking)
+        while total_orders + pair_count < MAX_DRAIN_BATCH {
+            let item: Option<String> = conn.rpop(&queue_key, None).await.unwrap_or(None);
+            match item {
+                Some(order_str) => {
+                    let payload: Value = match serde_json::from_str(&order_str) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::error!(error = %e, queue = %queue_key, "failed to parse queued order JSON");
+                            total_errors += 1;
+                            continue;
+                        }
+                    };
+                    if let Err(e) = process_order(state, &payload).await {
+                        tracing::error!(error = %e, queue = %queue_key, "failed to process queued order");
+                        total_errors += 1;
+                    }
+                    pair_count += 1;
+                }
+                None => break, // queue empty for this pair
+            }
+        }
+
+        if pair_count > 0 {
+            tracing::info!(pair_id = %pair_id, count = pair_count, "drained orders from queue");
+        }
+        total_orders += pair_count;
+    }
+
+    // Also drain the legacy fallback queue
+    let legacy_key = "queue:orders";
+    while total_orders < MAX_DRAIN_BATCH {
+        let item: Option<String> = conn.rpop(legacy_key, None).await.unwrap_or(None);
+        match item {
+            Some(order_str) => {
+                let payload: Value = match serde_json::from_str(&order_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to parse legacy queue order JSON");
+                        total_errors += 1;
+                        continue;
+                    }
+                };
+                if let Err(e) = process_order(state, &payload).await {
+                    tracing::error!(error = %e, "failed to process legacy queue order");
+                    total_errors += 1;
+                }
+                total_orders += 1;
+            }
+            None => break,
+        }
+    }
+
+    let drain_ms = drain_start.elapsed().as_millis() as u64;
+    if total_orders > 0 {
+        tracing::info!(
+            orders = total_orders,
+            errors = total_errors,
+            drain_ms = drain_ms,
+            "queue drain complete"
+        );
+    }
+
+    Ok(json!({
+        "status": "ok",
+        "mode": "drain_queue",
+        "orders_processed": total_orders,
+        "errors": total_errors,
+        "drain_ms": drain_ms
+    }))
 }
 
 /// Core order processing logic — extracted from sme-api worker.rs process_queued_order().
