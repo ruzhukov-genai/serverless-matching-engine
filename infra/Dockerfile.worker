@@ -66,6 +66,12 @@ FROM public.ecr.aws/lambda/provided:al2023-x86_64 AS runtime
 # Copy compiled bootstrap binary from builder
 COPY --from=builder --chmod=755 /build/target/release/bootstrap /var/runtime/bootstrap
 
+# Copy migration files (used by manage:run_migrations command)
+COPY migrations/ /var/runtime/migrations/
+
+# Set working directory to /var/runtime so migrations/ is found at ./migrations
+WORKDIR /var/runtime
+
 # Default environment (override in CloudFormation)
 ENV RUST_LOG=info
 

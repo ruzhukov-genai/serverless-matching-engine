@@ -227,13 +227,23 @@ fn default_user_id() -> String { "user-1".to_string() }
 // ── Lambda handler ────────────────────────────────────────────────────────────
 
 async fn handler(event: LambdaEvent<Value>) -> Result<Value, LambdaError> {
-    let state = get_state().await?;
     let payload = event.payload;
 
-    // Admin commands (invoked directly, not through gateway)
+    // ── Manage commands ──────────────────────────────────────────────
+    // Direct Lambda invocation with: {"manage": {"command": "run_migrations"}}
+    // Runs BEFORE get_state() so migrations can be applied on fresh deploy.
+    if let Some(manage) = payload.get("manage") {
+        let command = manage.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        return handle_manage(command, manage).await;
+    }
+
+    // Legacy admin commands (backward-compat)
     if let Some(action) = payload.get("action").and_then(|v| v.as_str()) {
+        let state = get_state().await?;
         return handle_admin(state, action, &payload).await;
     }
+
+    let state = get_state().await?;
 
     if let Err(e) = process_order(state, &payload).await {
         tracing::error!(error = %e, "order processing failed");
@@ -241,6 +251,49 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, LambdaError> {
     }
 
     Ok(json!({"status": "ok"}))
+}
+
+/// Handle manage commands — invoked directly after deploy.
+/// These run with a standalone PG connection (not through get_state)
+/// so they can execute before normal worker initialization.
+async fn handle_manage(command: &str, args: &Value) -> Result<Value, LambdaError> {
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| LambdaError::from("DATABASE_URL env var required"))?;
+
+    match command {
+        "run_migrations" => {
+            tracing::info!("manage: running migrations");
+            let pg = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(Duration::from_secs(30))
+                .connect(&database_url)
+                .await
+                .map_err(|e| LambdaError::from(format!("PG connect failed: {e}")))?;
+
+            sme_shared::db::run_migrations(&pg).await
+                .map_err(|e| LambdaError::from(format!("migrations failed: {e}")))?;
+
+            tracing::info!("manage: migrations complete");
+            Ok(json!({"status": "ok", "command": "run_migrations"}))
+        }
+        "exec_sql" => {
+            let sql = args.get("sql").and_then(|v| v.as_str())
+                .ok_or_else(|| LambdaError::from("sql argument required"))?;
+            tracing::info!(sql = sql, "manage: exec_sql");
+            let pg = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(Duration::from_secs(30))
+                .connect(&database_url)
+                .await
+                .map_err(|e| LambdaError::from(format!("PG connect failed: {e}")))?;
+
+            let result = sqlx::query(sql).execute(&pg).await
+                .map_err(|e| LambdaError::from(format!("exec_sql failed: {e}")))?;
+
+            Ok(json!({"status": "ok", "command": "exec_sql", "rows_affected": result.rows_affected()}))
+        }
+        _ => Err(LambdaError::from(format!("unknown manage command: {command}")))
+    }
 }
 
 /// Handle admin commands invoked directly (not through gateway).
