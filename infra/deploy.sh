@@ -2,8 +2,8 @@
 # =============================================================================
 # deploy.sh — Build, push, and deploy the SME stack
 #
-# Uses docker buildx for cross-compile (arm64 on amd64), pushes to ECR,
-# then deploys the CloudFormation stack via SAM CLI.
+# Docker images built with buildx (amd64), pushed to ECR.
+# SAM packages nested templates to S3, then deploys the root stack.
 #
 # Usage:
 #   ./deploy.sh              # Full build + push + deploy
@@ -25,7 +25,9 @@ GATEWAY_URI="${ECR_BASE}/${GATEWAY_REPO}:latest"
 WORKER_URI="${ECR_BASE}/${WORKER_REPO}:latest"
 WS_HANDLER_URI="${ECR_BASE}/${WS_HANDLER_REPO}:latest"
 
-STACK_NAME="serverless-matching-engine-backend"
+STACK_NAME="serverless-matching-engine"
+SAM_S3_BUCKET="aws-sam-cli-managed-default-samclisourcebucket-8bkl7rethcbl"
+SAM_S3_PREFIX="serverless-matching-engine"
 
 SKIP_BUILD=false
 DEPLOY_ONLY=false
@@ -38,7 +40,7 @@ done
 
 # ── Step 1: Build Docker images ───────────────────────────────────────────
 if [[ "$SKIP_BUILD" == false && "$DEPLOY_ONLY" == false ]]; then
-  echo "=== Step 1/3: Building Docker images (amd64) ==="
+  echo "=== Step 1/6: Building Docker images (amd64) ==="
 
   echo "→ Building gateway..."
   docker buildx build \
@@ -69,7 +71,7 @@ fi
 
 # ── Step 2: Push to ECR ──────────────────────────────────────────────────
 if [[ "$DEPLOY_ONLY" == false ]]; then
-  echo "=== Step 2/3: Pushing images to ECR ==="
+  echo "=== Step 2/6: Pushing images to ECR ==="
 
   aws ecr get-login-password --region "${REGION}" | \
     docker login --username AWS --password-stdin "${ECR_BASE}"
@@ -92,20 +94,29 @@ if [[ "$DEPLOY_ONLY" == false ]]; then
   echo "=== Images pushed ==="
 fi
 
-# ── Step 3: SAM deploy (CloudFormation stack update) ──────────────────────
-echo "=== Step 3/3: Deploying stack ==="
+# ── Step 3: SAM package (upload nested templates to S3) ───────────────────
+echo "=== Step 3/6: Packaging nested templates ==="
 cd "${INFRA_DIR}"
 
-aws cloudformation deploy \
+sam package \
   --template-file template.yaml \
+  --output-template-file packaged.yaml \
+  --s3-bucket "${SAM_S3_BUCKET}" \
+  --s3-prefix "${SAM_S3_PREFIX}" \
+  --region "${REGION}" \
+  --image-repository "${ECR_BASE}/${GATEWAY_REPO}"
+
+# ── Step 4: Deploy packaged stack ─────────────────────────────────────────
+echo "=== Step 4/6: Deploying stack ==="
+
+aws cloudformation deploy \
+  --template-file packaged.yaml \
   --stack-name "${STACK_NAME}" \
   --region "${REGION}" \
-  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
   --parameter-overrides \
     "KeyPairName=GmindRZKeyPair" \
     "DBPassword=sme_prod_9b43c1802d8440e9666be882d925d933" \
-    "GatewayImageUri=${GATEWAY_URI}" \
-    "WorkerImageUri=${WORKER_URI}" \
   --no-fail-on-empty-changeset
 
 echo ""
@@ -118,7 +129,7 @@ aws cloudformation describe-stacks \
   --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
   --output table
 
-# ── Step 4: Generate frontend config.js from stack outputs ────────────────────
+# ── Step 5: Generate frontend config.js from stack outputs ────────────────────
 echo "=== Generating frontend config.js ==="
 
 API_URL=$(aws cloudformation describe-stacks \
@@ -153,7 +164,7 @@ CFGEOF
 echo "  API_URL: (same origin via CloudFront)"
 echo "  WS_URL:  ${WS_URL}"
 
-# ── Step 5: Upload frontend to S3 + invalidate CloudFront ────────────────────
+# ── Step 6: Upload frontend to S3 + invalidate CloudFront ────────────────────
 if [[ -n "${BUCKET}" ]]; then
   echo "=== Uploading frontend to S3 ==="
   aws s3 sync "${PROJECT_ROOT}/web/trading/" "s3://${BUCKET}/" --exclude "*.md" --delete
