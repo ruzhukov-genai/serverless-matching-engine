@@ -230,17 +230,12 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, LambdaError> {
     let payload = event.payload;
 
     // ── Manage commands ──────────────────────────────────────────────
-    // Direct Lambda invocation with: {"manage": {"command": "run_migrations"}}
-    // Runs BEFORE get_state() so migrations can be applied on fresh deploy.
+    // Direct Lambda invocation: {"manage": {"command": "<cmd>", ...args}}
+    // Lightweight commands (run_migrations, exec_sql) use standalone PG.
+    // Stateful commands (reset_all, etc.) initialize full worker state.
     if let Some(manage) = payload.get("manage") {
         let command = manage.get("command").and_then(|v| v.as_str()).unwrap_or("");
         return handle_manage(command, manage).await;
-    }
-
-    // Legacy admin commands (backward-compat)
-    if let Some(action) = payload.get("action").and_then(|v| v.as_str()) {
-        let state = get_state().await?;
-        return handle_admin(state, action, &payload).await;
     }
 
     let state = get_state().await?;
@@ -253,26 +248,19 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, LambdaError> {
     Ok(json!({"status": "ok"}))
 }
 
-/// Handle manage commands — invoked directly after deploy.
-/// These run with a standalone PG connection (not through get_state)
-/// so they can execute before normal worker initialization.
+/// Handle manage commands — direct Lambda invocation for admin operations.
+///
+/// Lightweight commands (run_migrations, exec_sql) use a standalone PG connection
+/// so they can run before full worker initialization.
+/// Stateful commands (reset_all, etc.) call get_state() for Dragonfly access.
 async fn handle_manage(command: &str, args: &Value) -> Result<Value, LambdaError> {
-    let database_url = std::env::var("DATABASE_URL")
-        .map_err(|_| LambdaError::from("DATABASE_URL env var required"))?;
-
     match command {
+        // ── Lightweight (standalone PG, no Dragonfly) ────────────────
         "run_migrations" => {
             tracing::info!("manage: running migrations");
-            let pg = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(1)
-                .acquire_timeout(Duration::from_secs(30))
-                .connect(&database_url)
-                .await
-                .map_err(|e| LambdaError::from(format!("PG connect failed: {e}")))?;
-
+            let pg = standalone_pg().await?;
             sme_shared::db::run_migrations(&pg).await
                 .map_err(|e| LambdaError::from(format!("migrations failed: {e}")))?;
-
             tracing::info!("manage: migrations complete");
             Ok(json!({"status": "ok", "command": "run_migrations"}))
         }
@@ -280,114 +268,105 @@ async fn handle_manage(command: &str, args: &Value) -> Result<Value, LambdaError
             let sql = args.get("sql").and_then(|v| v.as_str())
                 .ok_or_else(|| LambdaError::from("sql argument required"))?;
             tracing::info!(sql = sql, "manage: exec_sql");
-            let pg = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(1)
-                .acquire_timeout(Duration::from_secs(30))
-                .connect(&database_url)
-                .await
-                .map_err(|e| LambdaError::from(format!("PG connect failed: {e}")))?;
-
+            let pg = standalone_pg().await?;
             let result = sqlx::query(sql).execute(&pg).await
                 .map_err(|e| LambdaError::from(format!("exec_sql failed: {e}")))?;
-
             Ok(json!({"status": "ok", "command": "exec_sql", "rows_affected": result.rows_affected()}))
+        }
+        "query" => {
+            let sql = args.get("sql").and_then(|v| v.as_str())
+                .unwrap_or("SELECT count(*) as cnt FROM orders");
+            let pg = standalone_pg().await?;
+            let row = sqlx::query(sql).fetch_one(&pg).await
+                .map_err(|e| LambdaError::from(e.to_string()))?;
+            let cnt: i64 = row.try_get("cnt").unwrap_or(0);
+            Ok(json!({"status": "ok", "command": "query", "result": cnt}))
+        }
+
+        // ── Stateful (needs Dragonfly + PG via get_state) ────────────
+        "reset_balances" => {
+            let state = get_state().await?;
+            tracing::info!("manage: resetting balances");
+            for i in 1..=10 {
+                let user = format!("user-{}", i);
+                sqlx::query(
+                    "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'BTC', 10, 0)
+                     ON CONFLICT (user_id, asset) DO UPDATE SET available = 10, locked = 0"
+                ).bind(&user).execute(&state.pg).await.map_err(|e| LambdaError::from(e.to_string()))?;
+                sqlx::query(
+                    "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'USDT', 1000000, 0)
+                     ON CONFLICT (user_id, asset) DO UPDATE SET available = 1000000, locked = 0"
+                ).bind(&user).execute(&state.pg).await.map_err(|e| LambdaError::from(e.to_string()))?;
+            }
+            cache::init_balances_from_pg(&state.dragonfly, &state.pg).await
+                .map_err(|e| LambdaError::from(e.to_string()))?;
+            tracing::info!("manage: balances reset for 10 users");
+            Ok(json!({"status": "ok", "command": "reset_balances", "users": 10}))
+        }
+        "truncate_orders" => {
+            let state = get_state().await?;
+            tracing::info!("manage: truncating orders and trades");
+            sqlx::query("TRUNCATE orders CASCADE").execute(&state.pg).await
+                .map_err(|e| LambdaError::from(e.to_string()))?;
+            let mut conn = state.dragonfly.get().await
+                .map_err(|e| LambdaError::from(e.to_string()))?;
+            for pair in state.pairs_cache.keys() {
+                let _: () = redis::cmd("DEL")
+                    .arg(format!("orderbook:{}:bids", pair))
+                    .arg(format!("orderbook:{}:asks", pair))
+                    .arg(format!("version:{}", pair))
+                    .query_async(&mut *conn).await
+                    .unwrap_or(());
+            }
+            tracing::info!("manage: orders truncated, book cache cleared");
+            Ok(json!({"status": "ok", "command": "truncate_orders"}))
+        }
+        "reset_all" => {
+            let state = get_state().await?;
+            tracing::info!("manage: full reset");
+            sqlx::query("TRUNCATE orders CASCADE").execute(&state.pg).await
+                .map_err(|e| LambdaError::from(e.to_string()))?;
+            for i in 1..=10 {
+                let user = format!("user-{}", i);
+                sqlx::query(
+                    "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'BTC', 10, 0)
+                     ON CONFLICT (user_id, asset) DO UPDATE SET available = 10, locked = 0"
+                ).bind(&user).execute(&state.pg).await.map_err(|e| LambdaError::from(e.to_string()))?;
+                sqlx::query(
+                    "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'USDT', 1000000, 0)
+                     ON CONFLICT (user_id, asset) DO UPDATE SET available = 1000000, locked = 0"
+                ).bind(&user).execute(&state.pg).await.map_err(|e| LambdaError::from(e.to_string()))?;
+            }
+            cache::init_balances_from_pg(&state.dragonfly, &state.pg).await
+                .map_err(|e| LambdaError::from(e.to_string()))?;
+            let mut conn = state.dragonfly.get().await
+                .map_err(|e| LambdaError::from(e.to_string()))?;
+            for pair in state.pairs_cache.keys() {
+                let _: () = redis::cmd("DEL")
+                    .arg(format!("orderbook:{}:bids", pair))
+                    .arg(format!("orderbook:{}:asks", pair))
+                    .arg(format!("version:{}", pair))
+                    .query_async(&mut *conn).await
+                    .unwrap_or(());
+            }
+            tracing::info!("manage: full reset complete");
+            Ok(json!({"status": "ok", "command": "reset_all", "users": 10}))
         }
         _ => Err(LambdaError::from(format!("unknown manage command: {command}")))
     }
 }
 
-/// Handle admin commands invoked directly (not through gateway).
-async fn handle_admin(state: &WorkerState, action: &str, _payload: &Value) -> Result<Value, LambdaError> {
-    match action {
-        "reset_balances" => {
-            tracing::info!("admin: resetting balances");
-            for i in 1..=10 {
-                let user = format!("user-{}", i);
-                sqlx::query(
-                    "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'BTC', 10, 0)
-                     ON CONFLICT (user_id, asset) DO UPDATE SET available = 10, locked = 0"
-                ).bind(&user).execute(&state.pg).await.map_err(|e| LambdaError::from(e.to_string()))?;
-
-                sqlx::query(
-                    "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'USDT', 1000000, 0)
-                     ON CONFLICT (user_id, asset) DO UPDATE SET available = 1000000, locked = 0"
-                ).bind(&user).execute(&state.pg).await.map_err(|e| LambdaError::from(e.to_string()))?;
-            }
-            // Re-sync balance cache in Dragonfly
-            cache::init_balances_from_pg(&state.dragonfly, &state.pg).await
-                .map_err(|e| LambdaError::from(e.to_string()))?;
-            tracing::info!("admin: balances reset for 10 users");
-            Ok(json!({"status": "ok", "action": "reset_balances", "users": 10}))
-        }
-        "truncate_orders" => {
-            tracing::info!("admin: truncating orders and trades");
-            sqlx::query("TRUNCATE orders CASCADE").execute(&state.pg).await
-                .map_err(|e| LambdaError::from(e.to_string()))?;
-            // Clear Dragonfly order book cache
-            let mut conn = state.dragonfly.get().await
-                .map_err(|e| LambdaError::from(e.to_string()))?;
-            for pair in state.pairs_cache.keys() {
-                let _: () = redis::cmd("DEL")
-                    .arg(format!("orderbook:{}:bids", pair))
-                    .arg(format!("orderbook:{}:asks", pair))
-                    .arg(format!("version:{}", pair))
-                    .query_async(&mut *conn).await
-                    .unwrap_or(());
-            }
-            tracing::info!("admin: orders truncated, book cache cleared");
-            Ok(json!({"status": "ok", "action": "truncate_orders"}))
-        }
-        "reset_all" => {
-            // Truncate orders + reset balances in one shot
-            sqlx::query("TRUNCATE orders CASCADE").execute(&state.pg).await
-                .map_err(|e| LambdaError::from(e.to_string()))?;
-            for i in 1..=10 {
-                let user = format!("user-{}", i);
-                sqlx::query(
-                    "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'BTC', 10, 0)
-                     ON CONFLICT (user_id, asset) DO UPDATE SET available = 10, locked = 0"
-                ).bind(&user).execute(&state.pg).await.map_err(|e| LambdaError::from(e.to_string()))?;
-                sqlx::query(
-                    "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'USDT', 1000000, 0)
-                     ON CONFLICT (user_id, asset) DO UPDATE SET available = 1000000, locked = 0"
-                ).bind(&user).execute(&state.pg).await.map_err(|e| LambdaError::from(e.to_string()))?;
-            }
-            // Sync caches
-            cache::init_balances_from_pg(&state.dragonfly, &state.pg).await
-                .map_err(|e| LambdaError::from(e.to_string()))?;
-            let mut conn = state.dragonfly.get().await
-                .map_err(|e| LambdaError::from(e.to_string()))?;
-            for pair in state.pairs_cache.keys() {
-                let _: () = redis::cmd("DEL")
-                    .arg(format!("orderbook:{}:bids", pair))
-                    .arg(format!("orderbook:{}:asks", pair))
-                    .arg(format!("version:{}", pair))
-                    .query_async(&mut *conn).await
-                    .unwrap_or(());
-            }
-            tracing::info!("admin: full reset complete (orders truncated, balances reset)");
-            Ok(json!({"status": "ok", "action": "reset_all", "users": 10}))
-        }
-        "query" => {
-            // Run a simple query and return results (for debugging)
-            let sql = _payload.get("sql").and_then(|v| v.as_str()).unwrap_or("SELECT count(*) as cnt FROM orders");
-            let row = sqlx::query(sql).fetch_one(&state.pg).await
-                .map_err(|e| LambdaError::from(e.to_string()))?;
-            let cnt: i64 = row.try_get("cnt").unwrap_or(0);
-            Ok(json!({"status": "ok", "result": cnt}))
-        }
-        "exec" => {
-            // Execute DDL or DML statement (no result set expected)
-            let sql = _payload.get("sql").and_then(|v| v.as_str())
-                .ok_or_else(|| LambdaError::from("sql field required"))?;
-            let result = sqlx::query(sql).execute(&state.pg).await
-                .map_err(|e| LambdaError::from(e.to_string()))?;
-            Ok(json!({"status": "ok", "rows_affected": result.rows_affected()}))
-        }
-        _ => {
-            Err(LambdaError::from(format!("unknown admin action: {}", action)))
-        }
-    }
+/// Create a standalone PG pool (1 connection) for lightweight manage commands.
+/// Doesn't require Dragonfly or full worker state.
+async fn standalone_pg() -> Result<sqlx::PgPool, LambdaError> {
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| LambdaError::from("DATABASE_URL env var required"))?;
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(30))
+        .connect(&database_url)
+        .await
+        .map_err(|e| LambdaError::from(format!("PG connect failed: {e}")))
 }
 
 /// Core order processing logic — extracted from sme-api worker.rs process_queued_order().

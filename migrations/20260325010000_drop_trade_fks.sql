@@ -1,3 +1,5 @@
+-- migration: 20260325010000_drop_trade_fks
+-- depends-on: 20260325000000_lifecycle_timestamps
 -- Drop foreign key constraints on trades table.
 -- Referential integrity is guaranteed by the Lua matching engine (atomic Dragonfly operations).
 -- FKs cause persist failures when concurrent Lambdas match against each other's orders

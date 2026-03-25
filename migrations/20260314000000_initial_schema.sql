@@ -1,3 +1,5 @@
+-- migration: 20260314000000_initial_schema
+-- depends-on: none
 -- Initial schema: pairs, orders, trades, balances, audit_log with basic indexes
 
 CREATE TABLE IF NOT EXISTS pairs (
