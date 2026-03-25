@@ -325,6 +325,7 @@ Resources:
       EngineVersion: '8.1'
       CacheNodeType: cache.t4g.micro
       NumCacheClusters: 1
+      AutomaticFailoverEnabled: false
       CacheSubnetGroupName: !Ref ElastiCacheSubnetGroup
       SecurityGroupIds:
         - !Ref ElastiCacheSecurityGroupId
