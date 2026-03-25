@@ -114,9 +114,13 @@ def api_delete(cfg: Config, path: str) -> dict:
         return {}
 
 
+_smoke_seq = 0
 def place_order(cfg, user, pair, side, order_type, qty, price=None, tif="GTC"):
+    global _smoke_seq
+    _smoke_seq += 1
     body = {"user_id": user, "pair_id": pair, "side": side,
-            "order_type": order_type, "quantity": qty, "tif": tif}
+            "order_type": order_type, "quantity": qty, "tif": tif,
+            "client_order_id": f"smoke-{int(time.time())}-{_smoke_seq}"}
     if price:
         body["price"] = price
     return api_post(cfg, "/api/orders", body)

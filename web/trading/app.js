@@ -831,6 +831,7 @@ async function submitOrder() {
         order_type: typeCapital,
         quantity:   quantity,
         tif:        tif.toUpperCase(),
+        client_order_id: `web-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
     };
     if (orderType === 'limit') body.price = price;
 

@@ -24,6 +24,9 @@ CLIENT_COUNTS = [1, 5, 10, 25, 50, 100]
 # Connection mode: "rest" = legacy (8 REST polls + 3 WS), "ws" = mux WS + snapshot
 CONN_MODE = "rest"
 
+# Run ID prefix for client_order_id tagging — set via --run-id or auto-generated
+RUN_ID = None
+
 @dataclass
 class LatencyBucket:
     name: str
@@ -229,7 +232,7 @@ async def fetch_snapshot(session, stats, pair_id):
     except:
         stats.rest(ep).record_error()
 
-async def place_orders(session, stats, client_id, deadline):
+async def place_orders(session, stats, client_id, num_clients, deadline):
     seq = 0
     while time.monotonic() < deadline:
         pattern = seq % 4
@@ -240,6 +243,8 @@ async def place_orders(session, stats, client_id, deadline):
         else:              side, price, tif = "Sell", "70600.00", "GTC"
         body = {"user_id": user, "pair_id": PAIR, "side": side,
                 "order_type": "Limit", "tif": tif, "price": price, "quantity": "0.00100"}
+        if RUN_ID:
+            body["client_order_id"] = f"{RUN_ID}-n{num_clients}-c{client_id}-{seq}"
         t0 = time.monotonic()
         try:
             async with session.post(f"{BASE_URL}/api/orders", json=body) as resp:
@@ -251,7 +256,7 @@ async def place_orders(session, stats, client_id, deadline):
         seq += 1
         await asyncio.sleep(0.5)
 
-async def run_client(client_id, deadline):
+async def run_client(client_id, num_clients, deadline):
     stats = ClientStats()
     connector = aiohttp.TCPConnector(limit=10, force_close=False)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -263,7 +268,7 @@ async def run_client(client_id, deadline):
             await fetch_snapshot(session, stats, PAIR)
             tasks = [
                 asyncio.create_task(mux_ws_client(session, stats, PAIR, user_id, deadline)),
-                asyncio.create_task(place_orders(session, stats, client_id, deadline)),
+                asyncio.create_task(place_orders(session, stats, client_id, num_clients, deadline)),
             ]
         else:
             # Legacy mode: 8 REST polls + 3 separate WS + orders
@@ -272,7 +277,7 @@ async def run_client(client_id, deadline):
                 asyncio.create_task(ws_client(session, stats, f"/ws/orderbook/{PAIR}", deadline)),
                 asyncio.create_task(ws_client(session, stats, f"/ws/trades/{PAIR}", deadline)),
                 asyncio.create_task(ws_client(session, stats, f"/ws/orders/{user_id}", deadline)),
-                asyncio.create_task(place_orders(session, stats, client_id, deadline)),
+                asyncio.create_task(place_orders(session, stats, client_id, num_clients, deadline)),
             ]
         await asyncio.gather(*tasks, return_exceptions=True)
     return stats
@@ -286,6 +291,7 @@ async def run_benchmark():
     print("╠════════════════════════════════════════════════════════════════════╣")
     print(f"║  Server:   {BASE_URL:<55}║")
     print(f"║  Mode:     {mode_label:<55}║")
+    print(f"║  Run ID:   {RUN_ID:<55}║")
     print(f"║  Duration: {TEST_DURATION}s per level, clients: {CLIENT_COUNTS!s:<27}║")
     print("╚════════════════════════════════════════════════════════════════════╝")
 
@@ -314,7 +320,7 @@ async def run_benchmark():
                 server_samples.append(server_snapshot())
 
         sampler = asyncio.create_task(sample_server())
-        tasks = [run_client(i, deadline) for i in range(num_clients)]
+        tasks = [run_client(i, num_clients, deadline) for i in range(num_clients)]
         client_stats = await asyncio.gather(*tasks)
         await sampler
 
@@ -438,6 +444,8 @@ if __name__ == "__main__":
     parser.add_argument("--ws", action="store_true", help="WS-only mode: snapshot + mux WS (fewer TCP connections)")
     parser.add_argument("--duration", type=int, default=TEST_DURATION, help="Seconds per client level")
     parser.add_argument("--clients", type=str, default=None, help="Comma-separated client counts (e.g. '1,10,50,100')")
+    parser.add_argument("--run-id", type=str, default=None,
+                        help="Run ID prefix for client_order_id (default: auto-generated bench-YYYYMMDD-HHMM)")
     args = parser.parse_args()
 
     if args.ws:
@@ -446,5 +454,9 @@ if __name__ == "__main__":
         TEST_DURATION = args.duration
     if args.clients:
         CLIENT_COUNTS = [int(x.strip()) for x in args.clients.split(",")]
+
+    # Auto-generate RUN_ID if not provided
+    from datetime import datetime
+    RUN_ID = args.run_id or f"bench-{datetime.utcnow().strftime('%Y%m%d-%H%M')}"
 
     asyncio.run(run_benchmark())
