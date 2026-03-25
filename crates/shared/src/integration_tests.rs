@@ -400,7 +400,7 @@ mod tests {
     #[tokio::test]
     async fn db_connection_and_migrations() {
         let pool = pg_pool().await;
-        db::run_migrations(&pool).await.expect("migrations should succeed");
+        db::run_migrations_embedded(&pool).await.expect("migrations should succeed");
 
         // Verify tables exist
         let row = sqlx::query("SELECT COUNT(*) as cnt FROM pairs")
@@ -412,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn db_insert_and_read_order() {
         let pool = pg_pool().await;
-        db::run_migrations(&pool).await.unwrap();
+        db::run_migrations_embedded(&pool).await.unwrap();
 
         let order_id = Uuid::new_v4();
         sqlx::query(
@@ -438,7 +438,7 @@ mod tests {
     #[tokio::test]
     async fn db_insert_trade_with_fk() {
         let pool = pg_pool().await;
-        db::run_migrations(&pool).await.unwrap();
+        db::run_migrations_embedded(&pool).await.unwrap();
 
         let buy_id = Uuid::new_v4();
         let sell_id = Uuid::new_v4();
@@ -476,7 +476,7 @@ mod tests {
     #[tokio::test]
     async fn db_trade_idempotent() {
         let pool = pg_pool().await;
-        db::run_migrations(&pool).await.unwrap();
+        db::run_migrations_embedded(&pool).await.unwrap();
 
         let buy_id = Uuid::new_v4();
         let sell_id = Uuid::new_v4();
@@ -509,7 +509,7 @@ mod tests {
     #[tokio::test]
     async fn db_balance_update() {
         let pool = pg_pool().await;
-        db::run_migrations(&pool).await.unwrap();
+        db::run_migrations_embedded(&pool).await.unwrap();
 
         let test_user = format!("test-bal-{}", Uuid::new_v4().to_string().split('-').next().unwrap());
 
@@ -1509,7 +1509,7 @@ mod tests {
 
         let df = redis_pool().await;
         let pg = pg_pool().await;
-        db::run_migrations(&pg).await.unwrap();
+        db::run_migrations_embedded(&pg).await.unwrap();
         let (pair, buyer, seller) = setup_balance_test(&pg, "FULL").await;
         cleanup_pair(&df, &pair).await;
 
@@ -1565,7 +1565,7 @@ mod tests {
 
         let df = redis_pool().await;
         let pg = pg_pool().await;
-        db::run_migrations(&pg).await.unwrap();
+        db::run_migrations_embedded(&pg).await.unwrap();
         let (pair, buyer, seller) = setup_balance_test(&pg, "PARTIAL").await;
         cleanup_pair(&df, &pair).await;
 
@@ -1620,7 +1620,7 @@ mod tests {
 
         let df = redis_pool().await;
         let pg = pg_pool().await;
-        db::run_migrations(&pg).await.unwrap();
+        db::run_migrations_embedded(&pg).await.unwrap();
 
         let pair = "BAL-MULTI";
         let buyer = "buyer-MULTI";
@@ -1718,7 +1718,7 @@ mod tests {
 
         let df = redis_pool().await;
         let pg = pg_pool().await;
-        db::run_migrations(&pg).await.unwrap();
+        db::run_migrations_embedded(&pg).await.unwrap();
 
         let pair = "BAL-RACE-2B";
         cleanup_pair(&df, pair).await;
@@ -1819,7 +1819,7 @@ mod tests {
 
         let df = redis_pool().await;
         let pg = pg_pool().await;
-        db::run_migrations(&pg).await.unwrap();
+        db::run_migrations_embedded(&pg).await.unwrap();
 
         let pair = "BAL-RACE-2S";
         cleanup_pair(&df, pair).await;
@@ -1910,7 +1910,7 @@ mod tests {
 
         let df = redis_pool().await;
         let pg = pg_pool().await;
-        db::run_migrations(&pg).await.unwrap();
+        db::run_migrations_embedded(&pg).await.unwrap();
 
         let pair = "BAL-SEQ";
         cleanup_pair(&df, pair).await;
@@ -1987,7 +1987,7 @@ mod tests {
     async fn idempotency_duplicate_client_order_id_blocked_by_db() {
         // Two orders with the same (user_id, client_order_id) — DB unique constraint
         let pg = pg_pool().await;
-        db::run_migrations(&pg).await.unwrap();
+        db::run_migrations_embedded(&pg).await.unwrap();
 
         let user = "idem-user-1";
         let coid = format!("coid-{}", Uuid::new_v4().to_string().split('-').next().unwrap());
@@ -2029,7 +2029,7 @@ mod tests {
     async fn idempotency_different_users_same_client_order_id_ok() {
         // Different users can use the same client_order_id
         let pg = pg_pool().await;
-        db::run_migrations(&pg).await.unwrap();
+        db::run_migrations_embedded(&pg).await.unwrap();
 
         let coid = format!("shared-{}", Uuid::new_v4().to_string().split('-').next().unwrap());
         let id1 = Uuid::new_v4();
@@ -2058,7 +2058,7 @@ mod tests {
     async fn idempotency_null_client_order_id_allows_duplicates() {
         // Without client_order_id, multiple orders from same user are allowed
         let pg = pg_pool().await;
-        db::run_migrations(&pg).await.unwrap();
+        db::run_migrations_embedded(&pg).await.unwrap();
 
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
@@ -2346,7 +2346,7 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_all_orders() {
         let pg = pg_pool().await;
-        db::run_migrations(&pg).await.unwrap();
+        db::run_migrations_embedded(&pg).await.unwrap();
 
         // Unique user to avoid cross-test interference
         let user = format!("cancel-all-{}", Uuid::new_v4().to_string().split('-').next().unwrap());
@@ -2420,7 +2420,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_orders_pagination() {
         let pg = pg_pool().await;
-        db::run_migrations(&pg).await.unwrap();
+        db::run_migrations_embedded(&pg).await.unwrap();
 
         let user = format!("pagination-{}", Uuid::new_v4().to_string().split('-').next().unwrap());
 
@@ -2539,7 +2539,7 @@ mod tests {
         use std::collections::HashMap;
 
         let pg = pg_pool().await;
-        db::run_migrations(&pg).await.unwrap();
+        db::run_migrations_embedded(&pg).await.unwrap();
 
         let buyer  = format!("dl-buyer-{}", Uuid::new_v4().to_string().split('-').next().unwrap());
         let seller = format!("dl-sell-{}", Uuid::new_v4().to_string().split('-').next().unwrap());
@@ -2603,5 +2603,616 @@ mod tests {
         for u in [&buyer, &seller] {
             sqlx::query("DELETE FROM balances WHERE user_id = $1").bind(u).execute(&pg).await.unwrap();
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 1. LIFECYCLE TIMESTAMPS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Columns exist and can be written/read back.
+    #[tokio::test]
+    async fn lifecycle_timestamps_columns_exist_and_persist() {
+        let pg = pg_pool().await;
+        db::run_migrations_embedded(&pg).await.unwrap();
+
+        let id = Uuid::new_v4();
+        let received = Utc::now() - chrono::Duration::milliseconds(30);
+        let matched  = received + chrono::Duration::milliseconds(8);
+
+        sqlx::query(
+            "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, received_at, matched_at, persisted_at)
+             VALUES ($1, 'lc-user', 'BTC-USDT', 'Buy', 'Limit', 'GTC', 50000, 1, 1, 'New', $2, $3, NOW())"
+        )
+        .bind(id).bind(received).bind(matched)
+        .execute(&pg).await.unwrap();
+
+        let row = sqlx::query("SELECT received_at, matched_at, persisted_at FROM orders WHERE id = $1")
+            .bind(id).fetch_one(&pg).await.unwrap();
+
+        let ra: Option<chrono::DateTime<Utc>> = row.get("received_at");
+        let ma: Option<chrono::DateTime<Utc>> = row.get("matched_at");
+        let pa: Option<chrono::DateTime<Utc>> = row.get("persisted_at");
+
+        assert!(ra.is_some(), "received_at must be set");
+        assert!(ma.is_some(), "matched_at must be set");
+        assert!(pa.is_some(), "persisted_at must be set via NOW()");
+
+        sqlx::query("DELETE FROM orders WHERE id = $1").bind(id).execute(&pg).await.unwrap();
+    }
+
+    /// Verify ordering: received_at <= matched_at <= persisted_at.
+    #[tokio::test]
+    async fn lifecycle_timestamps_ordering_invariant() {
+        let pg = pg_pool().await;
+        db::run_migrations_embedded(&pg).await.unwrap();
+
+        let id = Uuid::new_v4();
+        let received = Utc::now() - chrono::Duration::milliseconds(20);
+        let matched  = received + chrono::Duration::milliseconds(8);
+
+        sqlx::query(
+            "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, received_at, matched_at, persisted_at)
+             VALUES ($1, 'lc-ord', 'BTC-USDT', 'Sell', 'Limit', 'GTC', 50000, 1, 0, 'Filled', $2, $3, NOW())"
+        )
+        .bind(id).bind(received).bind(matched)
+        .execute(&pg).await.unwrap();
+
+        let row = sqlx::query("SELECT received_at, matched_at, persisted_at FROM orders WHERE id = $1")
+            .bind(id).fetch_one(&pg).await.unwrap();
+
+        let ra: chrono::DateTime<Utc> = row.get::<Option<_>, _>("received_at").unwrap();
+        let ma: chrono::DateTime<Utc> = row.get::<Option<_>, _>("matched_at").unwrap();
+        let pa: chrono::DateTime<Utc> = row.get::<Option<_>, _>("persisted_at").unwrap();
+
+        assert!(ra <= ma, "received_at must be <= matched_at");
+        assert!(ma <= pa, "matched_at must be <= persisted_at");
+
+        sqlx::query("DELETE FROM orders WHERE id = $1").bind(id).execute(&pg).await.unwrap();
+    }
+
+    /// Lifecycle timestamps are nullable (pending orders don't have them yet).
+    #[tokio::test]
+    async fn lifecycle_timestamps_nullable_for_pending_order() {
+        let pg = pg_pool().await;
+        db::run_migrations_embedded(&pg).await.unwrap();
+
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status)
+             VALUES ($1, 'lc-null', 'BTC-USDT', 'Buy', 'Limit', 'GTC', 50000, 1, 1, 'New')"
+        )
+        .bind(id).execute(&pg).await.unwrap();
+
+        let row = sqlx::query("SELECT received_at, matched_at, persisted_at FROM orders WHERE id = $1")
+            .bind(id).fetch_one(&pg).await.unwrap();
+
+        let ra: Option<chrono::DateTime<Utc>> = row.get("received_at");
+        let ma: Option<chrono::DateTime<Utc>> = row.get("matched_at");
+        let pa: Option<chrono::DateTime<Utc>> = row.get("persisted_at");
+
+        assert!(ra.is_none(), "received_at must be NULL for pending order");
+        assert!(ma.is_none(), "matched_at must be NULL for pending order");
+        assert!(pa.is_none(), "persisted_at must be NULL when not set");
+
+        sqlx::query("DELETE FROM orders WHERE id = $1").bind(id).execute(&pg).await.unwrap();
+    }
+
+    /// percentile_cont latency query (from CLAUDE.md) works correctly.
+    #[tokio::test]
+    async fn lifecycle_timestamps_percentile_cont_latency() {
+        let pg = pg_pool().await;
+        db::run_migrations_embedded(&pg).await.unwrap();
+
+        let user = format!("pct-{}", &Uuid::new_v4().to_string()[..8]);
+        let mut ids: Vec<Uuid> = Vec::new();
+
+        // Insert 5 orders with match latencies: 10ms, 20ms, 30ms, 40ms, 50ms
+        for ms in [10i64, 20, 30, 40, 50] {
+            let id = Uuid::new_v4();
+            let recv    = Utc::now() - chrono::Duration::milliseconds(200);
+            let matched = recv + chrono::Duration::milliseconds(ms);
+            let persist = matched + chrono::Duration::milliseconds(5);
+            sqlx::query(
+                "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, received_at, matched_at, persisted_at)
+                 VALUES ($1, $2, 'BTC-USDT', 'Buy', 'Limit', 'GTC', 50000, 1, 1, 'New', $3, $4, $5)"
+            )
+            .bind(id).bind(&user).bind(recv).bind(matched).bind(persist)
+            .execute(&pg).await.unwrap();
+            ids.push(id);
+        }
+
+        let row = sqlx::query(
+            "SELECT
+               percentile_cont(0.5)  WITHIN GROUP (ORDER BY extract(epoch from matched_at - received_at) * 1000) as p50,
+               percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch from matched_at - received_at) * 1000) as p95,
+               percentile_cont(0.99) WITHIN GROUP (ORDER BY extract(epoch from matched_at - received_at) * 1000) as p99
+             FROM orders
+             WHERE received_at IS NOT NULL AND user_id = $1"
+        )
+        .bind(&user).fetch_one(&pg).await.unwrap();
+
+        let p50: f64 = row.get("p50");
+        let p95: f64 = row.get("p95");
+        let p99: f64 = row.get("p99");
+
+        // p50 of [10,20,30,40,50] = 30ms
+        assert!((p50 - 30.0).abs() < 2.0, "p50 should be ~30ms, got {p50}");
+        assert!(p95 >= p50, "p95 ({p95}) must be >= p50 ({p50})");
+        assert!(p99 >= p95, "p99 ({p99}) must be >= p95 ({p95})");
+
+        for id in ids {
+            sqlx::query("DELETE FROM orders WHERE id = $1").bind(id).execute(&pg).await.unwrap();
+        }
+    }
+
+    /// avg latency breakdown query from CLAUDE.md returns expected values.
+    #[tokio::test]
+    async fn lifecycle_timestamps_avg_latency_breakdown() {
+        let pg = pg_pool().await;
+        db::run_migrations_embedded(&pg).await.unwrap();
+
+        let user = format!("avg-{}", &Uuid::new_v4().to_string()[..8]);
+        let mut ids: Vec<Uuid> = Vec::new();
+
+        // 4 orders: match latency = 10ms each, persist offset = 5ms after match
+        for _ in 0..4 {
+            let id = Uuid::new_v4();
+            let recv    = Utc::now() - chrono::Duration::milliseconds(100);
+            let matched = recv + chrono::Duration::milliseconds(10);
+            let persist = matched + chrono::Duration::milliseconds(5);
+            sqlx::query(
+                "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, received_at, matched_at, persisted_at)
+                 VALUES ($1, $2, 'BTC-USDT', 'Buy', 'Limit', 'GTC', 50000, 1, 0, 'Filled', $3, $4, $5)"
+            )
+            .bind(id).bind(&user).bind(recv).bind(matched).bind(persist)
+            .execute(&pg).await.unwrap();
+            ids.push(id);
+        }
+
+        let row = sqlx::query(
+            "SELECT
+               count(*) as orders,
+               avg(extract(epoch from matched_at - received_at) * 1000)::int as avg_match_ms,
+               avg(extract(epoch from persisted_at - matched_at) * 1000)::int as avg_persist_ms,
+               avg(extract(epoch from persisted_at - received_at) * 1000)::int as avg_total_ms
+             FROM orders
+             WHERE received_at IS NOT NULL AND user_id = $1"
+        )
+        .bind(&user).fetch_one(&pg).await.unwrap();
+
+        let order_count: i64 = row.get("orders");
+        let avg_match:   i32 = row.get("avg_match_ms");
+        let avg_persist: i32 = row.get("avg_persist_ms");
+        let avg_total:   i32 = row.get("avg_total_ms");
+
+        assert_eq!(order_count, 4);
+        assert!((avg_match - 10).abs() <= 1,  "avg_match_ms should be ~10ms,  got {avg_match}");
+        assert!((avg_persist - 5).abs() <= 1, "avg_persist_ms should be ~5ms, got {avg_persist}");
+        assert!((avg_total - 15).abs() <= 1,  "avg_total_ms should be ~15ms,  got {avg_total}");
+
+        for id in ids {
+            sqlx::query("DELETE FROM orders WHERE id = $1").bind(id).execute(&pg).await.unwrap();
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 2. client_order_id PREFIX FILTERING
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Insert orders with bench-, web-, smoke- prefixes; LIKE filtering returns correct counts.
+    #[tokio::test]
+    async fn client_order_id_prefix_filtering_counts() {
+        let pg = pg_pool().await;
+        db::run_migrations_embedded(&pg).await.unwrap();
+
+        let user = format!("pfx-{}", &Uuid::new_v4().to_string()[..8]);
+
+        // bench-: 3 orders, web-: 2 orders, smoke-: 1 order
+        let coids = [
+            "bench-aaa", "bench-bbb", "bench-ccc",
+            "web-aaa", "web-bbb",
+            "smoke-aaa",
+        ];
+        for coid in &coids {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, client_order_id)
+                 VALUES ($1, $2, 'BTC-USDT', 'Buy', 'Limit', 'GTC', 50000, 1, 1, 'New', $3)
+                 ON CONFLICT DO NOTHING"
+            )
+            .bind(id).bind(&user).bind(*coid)
+            .execute(&pg).await.unwrap();
+        }
+
+        let bench_cnt: i64 = sqlx::query("SELECT COUNT(*) as cnt FROM orders WHERE user_id = $1 AND client_order_id LIKE 'bench-%'")
+            .bind(&user).fetch_one(&pg).await.unwrap().get("cnt");
+        assert_eq!(bench_cnt, 3, "should find 3 bench- orders");
+
+        let web_cnt: i64 = sqlx::query("SELECT COUNT(*) as cnt FROM orders WHERE user_id = $1 AND client_order_id LIKE 'web-%'")
+            .bind(&user).fetch_one(&pg).await.unwrap().get("cnt");
+        assert_eq!(web_cnt, 2, "should find 2 web- orders");
+
+        let smoke_cnt: i64 = sqlx::query("SELECT COUNT(*) as cnt FROM orders WHERE user_id = $1 AND client_order_id LIKE 'smoke-%'")
+            .bind(&user).fetch_one(&pg).await.unwrap().get("cnt");
+        assert_eq!(smoke_cnt, 1, "should find 1 smoke- order");
+
+        let total_cnt: i64 = sqlx::query("SELECT COUNT(*) as cnt FROM orders WHERE user_id = $1 AND client_order_id IS NOT NULL")
+            .bind(&user).fetch_one(&pg).await.unwrap().get("cnt");
+        assert_eq!(total_cnt, 6, "total across all prefixes must be 6");
+
+        sqlx::query("DELETE FROM orders WHERE user_id = $1").bind(&user).execute(&pg).await.unwrap();
+    }
+
+    /// Idempotency: same (user_id, client_order_id) is rejected on second insert.
+    #[tokio::test]
+    async fn client_order_id_idempotency_same_user_rejected() {
+        let pg = pg_pool().await;
+        db::run_migrations_embedded(&pg).await.unwrap();
+
+        let user = format!("idem2-{}", &Uuid::new_v4().to_string()[..8]);
+        let coid = "bench-idem-001";
+        let id1  = Uuid::new_v4();
+        let id2  = Uuid::new_v4();
+
+        let r1 = sqlx::query(
+            "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, client_order_id)
+             VALUES ($1, $2, 'BTC-USDT', 'Buy', 'Limit', 'GTC', 50000, 1, 1, 'New', $3)
+             ON CONFLICT DO NOTHING"
+        )
+        .bind(id1).bind(&user).bind(coid)
+        .execute(&pg).await.unwrap().rows_affected();
+        assert_eq!(r1, 1, "first insert must succeed");
+
+        let r2 = sqlx::query(
+            "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, client_order_id)
+             VALUES ($1, $2, 'BTC-USDT', 'Buy', 'Limit', 'GTC', 50000, 1, 1, 'New', $3)
+             ON CONFLICT DO NOTHING"
+        )
+        .bind(id2).bind(&user).bind(coid)
+        .execute(&pg).await.unwrap().rows_affected();
+        assert_eq!(r2, 0, "duplicate (user, client_order_id) must be rejected");
+
+        let found: Uuid = sqlx::query("SELECT id FROM orders WHERE user_id = $1 AND client_order_id = $2")
+            .bind(&user).bind(coid).fetch_one(&pg).await.unwrap().get("id");
+        assert_eq!(found, id1, "original order must be returned");
+
+        sqlx::query("DELETE FROM orders WHERE user_id = $1").bind(&user).execute(&pg).await.unwrap();
+    }
+
+    /// Different users can share the same client_order_id prefix without collision.
+    #[tokio::test]
+    async fn client_order_id_prefix_different_users_no_collision() {
+        let pg = pg_pool().await;
+        db::run_migrations_embedded(&pg).await.unwrap();
+
+        let coid   = "bench-shared-001";
+        let user_a = format!("pfx-ua-{}", &Uuid::new_v4().to_string()[..8]);
+        let user_b = format!("pfx-ub-{}", &Uuid::new_v4().to_string()[..8]);
+        let id_a   = Uuid::new_v4();
+        let id_b   = Uuid::new_v4();
+
+        for (id, user) in [(&id_a, &user_a), (&id_b, &user_b)] {
+            let r = sqlx::query(
+                "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, client_order_id)
+                 VALUES ($1, $2, 'BTC-USDT', 'Buy', 'Limit', 'GTC', 50000, 1, 1, 'New', $3)
+                 ON CONFLICT DO NOTHING"
+            )
+            .bind(id).bind(user).bind(coid)
+            .execute(&pg).await.unwrap().rows_affected();
+            assert_eq!(r, 1, "each user's insert must succeed");
+        }
+
+        let cnt: i64 = sqlx::query("SELECT COUNT(*) as cnt FROM orders WHERE client_order_id = $1 AND user_id IN ($2, $3)")
+            .bind(coid).bind(&user_a).bind(&user_b)
+            .fetch_one(&pg).await.unwrap().get("cnt");
+        assert_eq!(cnt, 2, "both users' orders must exist");
+
+        // Per-user LIKE filtering is independent
+        let cnt_a: i64 = sqlx::query("SELECT COUNT(*) as cnt FROM orders WHERE user_id = $1 AND client_order_id LIKE 'bench-%'")
+            .bind(&user_a).fetch_one(&pg).await.unwrap().get("cnt");
+        assert_eq!(cnt_a, 1);
+        let cnt_b: i64 = sqlx::query("SELECT COUNT(*) as cnt FROM orders WHERE user_id = $1 AND client_order_id LIKE 'bench-%'")
+            .bind(&user_b).fetch_one(&pg).await.unwrap().get("cnt");
+        assert_eq!(cnt_b, 1);
+
+        sqlx::query("DELETE FROM orders WHERE id IN ($1, $2)").bind(id_a).bind(id_b).execute(&pg).await.unwrap();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 3. BATCH PERSIST CORRECTNESS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// 3 orders in a batch (2 with trades, 1 resting): verify orders + trades inserted,
+    /// balance deltas correctly aggregated (mirrors process_persist_batch logic).
+    #[tokio::test]
+    async fn batch_persist_three_orders_two_with_trades() {
+        use std::collections::HashMap;
+
+        let pg = pg_pool().await;
+        db::run_migrations_embedded(&pg).await.unwrap();
+
+        let tag     = &Uuid::new_v4().to_string()[..8];
+        let buyer1  = format!("bp-b1-{tag}");
+        let seller1 = format!("bp-s1-{tag}");
+        let buyer2  = format!("bp-b2-{tag}");
+        let seller2 = format!("bp-s2-{tag}");
+        let rester  = format!("bp-rt-{tag}");
+
+        // Setup balances (locked > 0 to simulate pre-locked funds)
+        for u in [&buyer1, &seller1, &buyer2, &seller2, &rester] {
+            sqlx::query("DELETE FROM balances WHERE user_id = $1").bind(u).execute(&pg).await.unwrap();
+            sqlx::query(
+                "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'BTC', 100, 10), ($1, 'USDT', 1000000, 100000)"
+            ).bind(u).execute(&pg).await.unwrap();
+        }
+
+        let now       = Utc::now();
+        let order1_id = Uuid::new_v4();
+        let order2_id = Uuid::new_v4();
+        let order3_id = Uuid::new_v4();
+        let trade1_id = Uuid::new_v4();
+        let trade2_id = Uuid::new_v4();
+
+        // Trade1: buyer1 buys 1 BTC @ 50000 from seller1
+        let t1_qty   = dec!(1);
+        let t1_price = dec!(50000);
+        let t1_cost  = t1_price * t1_qty;
+
+        // Trade2: buyer2 buys 2 BTC @ 49000 from seller2
+        let t2_qty   = dec!(2);
+        let t2_price = dec!(49000);
+        let t2_cost  = t2_price * t2_qty;
+
+        // --- Mirror process_persist_batch in one transaction ---
+        let mut tx = pg.begin().await.unwrap();
+
+        // Step 1: INSERT all 3 orders
+        for (id, user, side, status, remaining) in [
+            (order1_id, &buyer1,  "Buy", "Filled", dec!(0)),
+            (order2_id, &buyer2,  "Buy", "Filled", dec!(0)),
+            (order3_id, &rester,  "Buy", "New",    dec!(1)),
+        ] {
+            sqlx::query(
+                "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, received_at, matched_at, persisted_at)
+                 VALUES ($1, $2, 'BTC-USDT', $3, 'Limit', 'GTC', 50000, 1, $4, $5, $6, $6, NOW())
+                 ON CONFLICT DO NOTHING"
+            )
+            .bind(id).bind(user).bind(side).bind(remaining).bind(status).bind(now)
+            .execute(&mut *tx).await.unwrap();
+        }
+
+        // Step 2: INSERT trades
+        sqlx::query(
+            "INSERT INTO trades (id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, created_at)
+             VALUES ($1, 'BTC-USDT', $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING"
+        )
+        .bind(trade1_id).bind(order1_id).bind(Uuid::new_v4())
+        .bind(&buyer1).bind(&seller1).bind(t1_price).bind(t1_qty).bind(now)
+        .execute(&mut *tx).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO trades (id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, created_at)
+             VALUES ($1, 'BTC-USDT', $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING"
+        )
+        .bind(trade2_id).bind(order2_id).bind(Uuid::new_v4())
+        .bind(&buyer2).bind(&seller2).bind(t2_price).bind(t2_qty).bind(now)
+        .execute(&mut *tx).await.unwrap();
+
+        // Step 3: Aggregate balance deltas across both trades (mirrors process_persist_batch)
+        let mut deltas: HashMap<(String, String), (Decimal, Decimal)> = HashMap::new();
+        for (buyer_id, seller_id, qty, cost) in [
+            (&buyer1, &seller1, t1_qty, t1_cost),
+            (&buyer2, &seller2, t2_qty, t2_cost),
+        ] {
+            deltas.entry((buyer_id.clone(),  "USDT".to_string())).or_insert((Decimal::ZERO, Decimal::ZERO)).0 += cost;
+            deltas.entry((buyer_id.clone(),  "BTC".to_string())).or_insert((Decimal::ZERO, Decimal::ZERO)).1  += qty;
+            deltas.entry((seller_id.clone(), "BTC".to_string())).or_insert((Decimal::ZERO, Decimal::ZERO)).0  += qty;
+            deltas.entry((seller_id.clone(), "USDT".to_string())).or_insert((Decimal::ZERO, Decimal::ZERO)).1 += cost;
+        }
+
+        let mut sorted: Vec<_> = deltas.iter().collect();
+        sorted.sort_by_key(|((uid, asset), _)| (uid.as_str(), asset.as_str()));
+
+        for ((user_id, asset), (locked_dec, avail_inc)) in &sorted {
+            sqlx::query(
+                "INSERT INTO balances (user_id, asset, available, locked) VALUES ($3, $4, $2, 0)
+                 ON CONFLICT (user_id, asset) DO UPDATE
+                   SET locked    = GREATEST(balances.locked - $1, 0),
+                       available = balances.available + $2"
+            )
+            .bind(locked_dec).bind(avail_inc).bind(user_id.as_str()).bind(asset.as_str())
+            .execute(&mut *tx).await.unwrap();
+        }
+
+        tx.commit().await.unwrap();
+
+        // ── Assertions ────────────────────────────────────────────────────
+
+        // All 3 orders inserted
+        let cnt: i64 = sqlx::query("SELECT COUNT(*) as cnt FROM orders WHERE id IN ($1, $2, $3)")
+            .bind(order1_id).bind(order2_id).bind(order3_id)
+            .fetch_one(&pg).await.unwrap().get("cnt");
+        assert_eq!(cnt, 3, "all 3 orders must be inserted");
+
+        // Both trades inserted
+        let tcnt: i64 = sqlx::query("SELECT COUNT(*) as cnt FROM trades WHERE id IN ($1, $2)")
+            .bind(trade1_id).bind(trade2_id)
+            .fetch_one(&pg).await.unwrap().get("cnt");
+        assert_eq!(tcnt, 2, "both trades must be inserted");
+
+        // order3 (rester) has persisted_at set by NOW() in INSERT
+        let pa: Option<chrono::DateTime<Utc>> = sqlx::query("SELECT persisted_at FROM orders WHERE id = $1")
+            .bind(order3_id).fetch_one(&pg).await.unwrap().get("persisted_at");
+        assert!(pa.is_some(), "persisted_at must be set by NOW() in INSERT");
+
+        // Balance deltas: buyer1 gained 1 BTC, locked USDT reduced by 50000
+        let (b1_btc_avail, _): (Decimal, Decimal) = {
+            let r = sqlx::query("SELECT available, locked FROM balances WHERE user_id = $1 AND asset = 'BTC'")
+                .bind(&buyer1).fetch_one(&pg).await.unwrap();
+            (r.get("available"), r.get("locked"))
+        };
+        assert_eq!(b1_btc_avail, dec!(101), "buyer1 must have 100 + 1 BTC");
+
+        // buyer2 gained 2 BTC
+        let b2_btc_avail: Decimal = sqlx::query("SELECT available FROM balances WHERE user_id = $1 AND asset = 'BTC'")
+            .bind(&buyer2).fetch_one(&pg).await.unwrap().get("available");
+        assert_eq!(b2_btc_avail, dec!(102), "buyer2 must have 100 + 2 BTC");
+
+        // seller1 gained 50000 USDT
+        let s1_usdt_avail: Decimal = sqlx::query("SELECT available FROM balances WHERE user_id = $1 AND asset = 'USDT'")
+            .bind(&seller1).fetch_one(&pg).await.unwrap().get("available");
+        assert_eq!(s1_usdt_avail, dec!(1050000), "seller1 must have 1M + 50K USDT");
+
+        // seller2 gained 98000 USDT (2 * 49000)
+        let s2_usdt_avail: Decimal = sqlx::query("SELECT available FROM balances WHERE user_id = $1 AND asset = 'USDT'")
+            .bind(&seller2).fetch_one(&pg).await.unwrap().get("available");
+        assert_eq!(s2_usdt_avail, dec!(1098000), "seller2 must have 1M + 98K USDT");
+
+        // rester's balance must be unchanged
+        let rt_btc: Decimal = sqlx::query("SELECT available FROM balances WHERE user_id = $1 AND asset = 'BTC'")
+            .bind(&rester).fetch_one(&pg).await.unwrap().get("available");
+        assert_eq!(rt_btc, dec!(100), "rester BTC must be unchanged");
+
+        // Cleanup
+        sqlx::query("DELETE FROM orders WHERE id IN ($1, $2, $3)").bind(order1_id).bind(order2_id).bind(order3_id).execute(&pg).await.unwrap();
+        sqlx::query("DELETE FROM trades WHERE id IN ($1, $2)").bind(trade1_id).bind(trade2_id).execute(&pg).await.unwrap();
+        for u in [&buyer1, &seller1, &buyer2, &seller2, &rester] {
+            sqlx::query("DELETE FROM balances WHERE user_id = $1").bind(u).execute(&pg).await.unwrap();
+        }
+    }
+
+    /// Batch with no trades (orders only) — only orders table is written, balances unchanged.
+    #[tokio::test]
+    async fn batch_persist_orders_only_no_trades() {
+        let pg = pg_pool().await;
+        db::run_migrations_embedded(&pg).await.unwrap();
+
+        let tag  = &Uuid::new_v4().to_string()[..8];
+        let user = format!("bp-nt-{tag}");
+        sqlx::query("DELETE FROM balances WHERE user_id = $1").bind(&user).execute(&pg).await.unwrap();
+        sqlx::query("INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'BTC', 50, 0), ($1, 'USDT', 500000, 0)")
+            .bind(&user).execute(&pg).await.unwrap();
+
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let now = Utc::now();
+
+        let mut tx = pg.begin().await.unwrap();
+        for id in [id1, id2] {
+            sqlx::query(
+                "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, received_at, matched_at, persisted_at)
+                 VALUES ($1, $2, 'BTC-USDT', 'Buy', 'Limit', 'GTC', 50000, 1, 1, 'New', $3, $3, NOW())
+                 ON CONFLICT DO NOTHING"
+            )
+            .bind(id).bind(&user).bind(now)
+            .execute(&mut *tx).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let cnt: i64 = sqlx::query("SELECT COUNT(*) as cnt FROM orders WHERE id IN ($1, $2)")
+            .bind(id1).bind(id2).fetch_one(&pg).await.unwrap().get("cnt");
+        assert_eq!(cnt, 2, "both orders must be inserted");
+
+        // Balances untouched (no trades)
+        let avail: Decimal = sqlx::query("SELECT available FROM balances WHERE user_id = $1 AND asset = 'BTC'")
+            .bind(&user).fetch_one(&pg).await.unwrap().get("available");
+        assert_eq!(avail, dec!(50), "BTC balance must be unchanged with no trades");
+
+        sqlx::query("DELETE FROM orders WHERE id IN ($1, $2)").bind(id1).bind(id2).execute(&pg).await.unwrap();
+        sqlx::query("DELETE FROM balances WHERE user_id = $1").bind(&user).execute(&pg).await.unwrap();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 4. ORDER COUNT CONSISTENCY
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Place N orders via direct DB inserts (mimicking gateway submit), verify count(*) = N.
+    /// Regression test: benchmark showed 4326 DB rows from 116 client submissions.
+    #[tokio::test]
+    async fn order_count_consistency_n_inserts_yields_n_rows() {
+        let pg = pg_pool().await;
+        db::run_migrations_embedded(&pg).await.unwrap();
+
+        let user = format!("cnt-{}", &Uuid::new_v4().to_string()[..8]);
+        let n: usize = 5;
+        let mut ids: Vec<Uuid> = Vec::new();
+
+        for i in 0..n {
+            let id = Uuid::new_v4();
+            let coid = format!("bench-{i:04}");
+            sqlx::query(
+                "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, client_order_id, received_at, matched_at, persisted_at)
+                 VALUES ($1, $2, 'BTC-USDT', 'Buy', 'Limit', 'GTC', 50000, 1, 1, 'New', $3, NOW(), NOW(), NOW())
+                 ON CONFLICT DO NOTHING"
+            )
+            .bind(id).bind(&user).bind(&coid)
+            .execute(&pg).await.unwrap();
+            ids.push(id);
+        }
+
+        // Exactly N orders — no duplicates, no phantom rows
+        let cnt: i64 = sqlx::query("SELECT COUNT(*) as cnt FROM orders WHERE user_id = $1")
+            .bind(&user).fetch_one(&pg).await.unwrap().get("cnt");
+        assert_eq!(cnt, n as i64, "count(*) must equal N submitted orders (got {cnt}, expected {n})");
+
+        sqlx::query("DELETE FROM orders WHERE user_id = $1").bind(&user).execute(&pg).await.unwrap();
+    }
+
+    /// ON CONFLICT DO NOTHING prevents double-inserts from replay/retry.
+    /// Same order_id submitted twice → exactly 1 row.
+    #[tokio::test]
+    async fn order_count_on_conflict_do_nothing_no_duplicates() {
+        let pg = pg_pool().await;
+        db::run_migrations_embedded(&pg).await.unwrap();
+
+        let user = format!("ocdn-{}", &Uuid::new_v4().to_string()[..8]);
+        let id   = Uuid::new_v4();
+
+        // Insert same order twice (simulates Lambda retry / at-least-once delivery)
+        for _ in 0..2 {
+            sqlx::query(
+                "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, persisted_at)
+                 VALUES ($1, $2, 'BTC-USDT', 'Buy', 'Limit', 'GTC', 50000, 1, 1, 'New', NOW())
+                 ON CONFLICT DO NOTHING"
+            )
+            .bind(id).bind(&user)
+            .execute(&pg).await.unwrap();
+        }
+
+        let cnt: i64 = sqlx::query("SELECT COUNT(*) as cnt FROM orders WHERE id = $1")
+            .bind(id).fetch_one(&pg).await.unwrap().get("cnt");
+        assert_eq!(cnt, 1, "ON CONFLICT DO NOTHING must prevent duplicate rows");
+
+        sqlx::query("DELETE FROM orders WHERE id = $1").bind(id).execute(&pg).await.unwrap();
+    }
+
+    /// Batch insert with unique order IDs — 5 inserts = 5 rows, no merging.
+    #[tokio::test]
+    async fn order_count_batch_insert_unique_ids_all_persist() {
+        let pg = pg_pool().await;
+        db::run_migrations_embedded(&pg).await.unwrap();
+
+        let user = format!("bi-{}", &Uuid::new_v4().to_string()[..8]);
+        let n = 5usize;
+
+        let mut tx = pg.begin().await.unwrap();
+        for i in 0..n {
+            let id   = Uuid::new_v4();
+            let coid = format!("smoke-{i:04}");
+            sqlx::query(
+                "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, client_order_id, persisted_at)
+                 VALUES ($1, $2, 'BTC-USDT', 'Buy', 'Limit', 'GTC', 50000, 1, 1, 'New', $3, NOW())
+                 ON CONFLICT DO NOTHING"
+            )
+            .bind(id).bind(&user).bind(&coid)
+            .execute(&mut *tx).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let cnt: i64 = sqlx::query("SELECT COUNT(*) as cnt FROM orders WHERE user_id = $1")
+            .bind(&user).fetch_one(&pg).await.unwrap().get("cnt");
+        assert_eq!(cnt, n as i64, "batch insert of {n} unique orders must yield {n} rows");
+
+        sqlx::query("DELETE FROM orders WHERE user_id = $1").bind(&user).execute(&pg).await.unwrap();
     }
 }

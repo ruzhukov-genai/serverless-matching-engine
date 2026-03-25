@@ -32,3 +32,17 @@ pub async fn run_migrations(pool: &PgPool) -> Result<()> {
         .context("run migrations")?;
     Ok(())
 }
+
+/// Run migrations with migrations embedded at compile time.
+/// Safe to call even when migrations are already applied — uses sqlx migrate! macro
+/// which embeds migration files into the binary at compile time, resolving paths
+/// relative to this crate's CARGO_MANIFEST_DIR (crates/shared/).
+/// The migrations live at ../../migrations from this crate.
+#[cfg(any(test, feature = "integration"))]
+pub async fn run_migrations_embedded(pool: &PgPool) -> Result<()> {
+    sqlx::migrate!("../../migrations")
+        .run(pool)
+        .await
+        .context("run embedded migrations")?;
+    Ok(())
+}
