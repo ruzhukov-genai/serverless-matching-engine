@@ -1,39 +1,27 @@
 # =============================================================================
-# Dockerfile.worker — sme-worker-lambda for AWS Lambda (ARM/aarch64)
+# Dockerfile.worker — sme-worker-lambda for AWS Lambda (x86_64)
 #
 # Uses native lambda_runtime crate — no Lambda Web Adapter needed.
 # The binary is named `bootstrap` (Lambda custom runtime convention).
 # Lambda invokes /var/runtime/bootstrap directly.
 #
-# Build: docker buildx build --platform linux/arm64 -f infra/Dockerfile.worker .
+# Build: docker build -f infra/Dockerfile.worker -t sme-worker .
 # =============================================================================
 
 # ============================================================================
-# Stage 1: Build — cross-compile sme-worker-lambda for aarch64 Linux
+# Stage 1: Build — compile sme-worker-lambda for x86_64 Linux (native)
 # ============================================================================
-FROM --platform=linux/amd64 rust:1.91-bookworm AS builder
+FROM rust:1.91-bookworm AS builder
 
 WORKDIR /build
 
-# Install cross-compilation toolchain for aarch64
-RUN dpkg --add-architecture arm64 && \
-    apt-get update && \
+# Install build dependencies
+RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        gcc-aarch64-linux-gnu \
-        libc6-dev-arm64-cross \
         pkg-config \
-        libssl-dev:arm64 \
+        libssl-dev \
         && \
     rm -rf /var/lib/apt/lists/*
-
-# Add ARM target
-RUN rustup target add aarch64-unknown-linux-gnu
-
-# Configure cargo for cross-compilation
-RUN mkdir -p ~/.cargo && cat >> ~/.cargo/config.toml << 'EOF'
-[target.aarch64-unknown-linux-gnu]
-linker = "aarch64-linux-gnu-gcc"
-EOF
 
 # Cache dependencies — copy manifests first
 COPY Cargo.toml Cargo.lock ./
@@ -55,32 +43,28 @@ RUN mkdir -p crates/worker-lambda/src crates/gateway/src crates/api/src crates/s
     echo 'fn main() {}' > crates/api/src/main.rs && \
     echo '' > crates/shared/src/lib.rs
 
-ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-ENV PKG_CONFIG_SYSROOT_DIR=/usr/aarch64-linux-gnu
-ENV OPENSSL_DIR=/usr/aarch64-linux-gnu
-
 # Cache build (will fail on stubs but caches deps)
-RUN cargo build --release --target aarch64-unknown-linux-gnu --package sme-worker-lambda 2>/dev/null || true
+RUN cargo build --release --package sme-worker-lambda 2>/dev/null || true
 
 # Copy real source
 COPY crates/ ./crates/
 COPY tools/loadtest ./tools/loadtest/
 
-# Build sme-worker-lambda for ARM (binary is named 'bootstrap' per Cargo.toml)
-RUN cargo build --release --target aarch64-unknown-linux-gnu --package sme-worker-lambda && \
-    ls -lah /build/target/aarch64-unknown-linux-gnu/release/bootstrap || \
-    (echo "ERROR: bootstrap binary not found!" && find /build/target/aarch64-unknown-linux-gnu/release -name "bootstrap*" -o -name "sme-worker*" && exit 1)
+# Build sme-worker-lambda (binary is named 'bootstrap' per Cargo.toml)
+RUN cargo build --release --package sme-worker-lambda && \
+    ls -lah /build/target/release/bootstrap || \
+    (echo "ERROR: bootstrap binary not found!" && find /build/target/release -name "bootstrap*" -o -name "sme-worker*" && exit 1)
 
 # ============================================================================
-# Stage 2: Runtime — Lambda custom runtime base image (ARM64)
+# Stage 2: Runtime — Lambda custom runtime base image (x86_64)
 #
 # Lambda invokes /var/runtime/bootstrap directly.
 # No Lambda Web Adapter needed — lambda_runtime crate handles the runtime API.
 # ============================================================================
-FROM public.ecr.aws/lambda/provided:al2023-arm64 AS runtime
+FROM public.ecr.aws/lambda/provided:al2023-x86_64 AS runtime
 
-# Copy compiled bootstrap binary from builder (already executable from cargo build)
-COPY --from=builder --chmod=755 /build/target/aarch64-unknown-linux-gnu/release/bootstrap /var/runtime/bootstrap
+# Copy compiled bootstrap binary from builder
+COPY --from=builder --chmod=755 /build/target/release/bootstrap /var/runtime/bootstrap
 
 # Default environment (override in CloudFormation)
 ENV RUST_LOG=info

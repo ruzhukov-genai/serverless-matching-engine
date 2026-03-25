@@ -1,41 +1,27 @@
 # =============================================================================
-# Dockerfile.gateway — sme-gateway for AWS Lambda (ARM/aarch64)
+# Dockerfile.gateway — sme-gateway for AWS Lambda (x86_64)
 #
 # Uses AWS Lambda Web Adapter (LWA) — ZERO code changes to sme-gateway.
 # LWA acts as a shim that translates Lambda invocation events into HTTP
 # requests forwarded to sme-gateway, which runs as a normal HTTP server.
 #
-# Build: docker buildx build --platform linux/arm64 -f infra/Dockerfile.gateway .
+# Build: docker build -f infra/Dockerfile.gateway -t sme-gateway .
 # =============================================================================
 
 # ============================================================================
-# Stage 1: Build — cross-compile sme-gateway for aarch64 Linux
-# Pinned to linux/amd64 because we cross-compile (gcc-aarch64-linux-gnu).
-# SAM may pass --platform linux/arm64 — that only affects unpinned stages.
+# Stage 1: Build — compile sme-gateway for x86_64 Linux (native)
 # ============================================================================
-FROM --platform=linux/amd64 rust:1.91-bookworm AS builder
+FROM rust:1.91-bookworm AS builder
 
 WORKDIR /build
 
-# Install cross-compilation toolchain for aarch64
-RUN dpkg --add-architecture arm64 && \
-    apt-get update && \
+# Install build dependencies
+RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        gcc-aarch64-linux-gnu \
-        libc6-dev-arm64-cross \
         pkg-config \
-        libssl-dev:arm64 \
+        libssl-dev \
         && \
     rm -rf /var/lib/apt/lists/*
-
-# Add ARM target
-RUN rustup target add aarch64-unknown-linux-gnu
-
-# Configure cargo for cross-compilation
-RUN mkdir -p ~/.cargo && cat >> ~/.cargo/config.toml << 'EOF'
-[target.aarch64-unknown-linux-gnu]
-linker = "aarch64-linux-gnu-gcc"
-EOF
 
 # Cache dependencies — copy manifests first
 COPY Cargo.toml Cargo.lock ./
@@ -52,20 +38,16 @@ RUN mkdir -p crates/gateway/src crates/api/src crates/shared/src && \
     echo 'fn main() {}' > crates/api/src/main.rs && \
     echo '' > crates/shared/src/lib.rs
 
-ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-ENV PKG_CONFIG_SYSROOT_DIR=/usr/aarch64-linux-gnu
-ENV OPENSSL_DIR=/usr/aarch64-linux-gnu
-
 # Cache build (will fail on stubs but caches deps)
-RUN cargo build --release --target aarch64-unknown-linux-gnu --package sme-gateway 2>/dev/null || true
+RUN cargo build --release --package sme-gateway 2>/dev/null || true
 
 # Copy real source
 COPY crates/ ./crates/
 COPY web/ ./web/
 COPY tools/loadtest ./tools/loadtest/
 
-# Build sme-gateway for ARM
-RUN cargo build --release --target aarch64-unknown-linux-gnu --package sme-gateway
+# Build sme-gateway for x86_64
+RUN cargo build --release --package sme-gateway
 
 # ============================================================================
 # Stage 2: Runtime — AWS Lambda Web Adapter base image
@@ -74,16 +56,16 @@ RUN cargo build --release --target aarch64-unknown-linux-gnu --package sme-gatew
 # sme-gateway runs on PORT=3001 as a normal HTTP server.
 # LWA listens for Lambda events and forwards them as HTTP requests.
 # ============================================================================
-FROM --platform=linux/arm64 public.ecr.aws/awsguru/aws-lambda-adapter:0.8.4-aarch64 AS lwa
+FROM public.ecr.aws/awsguru/aws-lambda-adapter:0.8.4-x86_64 AS lwa
 
-# Use minimal ARM64 base for the final image
-FROM --platform=linux/arm64 public.ecr.aws/amazonlinux/amazonlinux:2023-minimal AS runtime
+# Use minimal x86_64 base for the final image
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal AS runtime
 
 # Copy Lambda Web Adapter binary + bootstrap from LWA image
 COPY --from=lwa /lambda-adapter /opt/extensions/lambda-adapter
 
 # Copy compiled sme-gateway binary
-COPY --from=builder /build/target/aarch64-unknown-linux-gnu/release/sme-gateway /var/runtime/sme-gateway
+COPY --from=builder /build/target/release/sme-gateway /var/runtime/sme-gateway
 
 # Copy web assets (static files served by sme-gateway)
 COPY --from=builder /build/web /var/runtime/web
@@ -91,9 +73,6 @@ COPY --from=builder /build/web /var/runtime/web
 WORKDIR /var/runtime
 
 # Lambda Web Adapter configuration
-# PORT / AWS_LWA_PORT: port sme-gateway listens on
-# AWS_LWA_READINESS_CHECK_PATH: LWA polls this until the process is ready
-# AWS_LWA_PASS_THROUGH_PATH: root path prefix to forward (/ = all)
 ENV PORT=3001
 ENV AWS_LWA_PORT=3001
 ENV AWS_LWA_READINESS_CHECK_PATH=/api/pairs

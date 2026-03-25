@@ -414,7 +414,7 @@ Resources:
       PackageType: Image
       ImageUri: !Ref GatewayImageUri
       Architectures:
-        - arm64
+        - x86_64
       MemorySize: 512
       Timeout: 30
       ReservedConcurrentExecutions: 500
@@ -466,7 +466,7 @@ Resources:
       PackageType: Image
       ImageUri: !Ref WorkerImageUri
       Architectures:
-        - arm64
+        - x86_64
       # 1024MB: needs headroom for PG + Dragonfly connection pools and match logic
       MemorySize: 1024
       Timeout: 30
@@ -574,7 +574,7 @@ Resources:
       PackageType: Image
       ImageUri: !Ref WsHandlerImageUri
       Architectures:
-        - arm64
+        - x86_64
       MemorySize: 256
       Timeout: 30
       Role: !GetAtt LambdaRole.Arn

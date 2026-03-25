@@ -230,14 +230,111 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, LambdaError> {
     let state = get_state().await?;
     let payload = event.payload;
 
+    // Admin commands (invoked directly, not through gateway)
+    if let Some(action) = payload.get("action").and_then(|v| v.as_str()) {
+        return handle_admin(state, action, &payload).await;
+    }
+
     if let Err(e) = process_order(state, &payload).await {
         tracing::error!(error = %e, "order processing failed");
-        // Return error — Lambda will mark this invocation as failed.
-        // For async invocations (InvocationType::Event), Lambda may retry.
         return Err(LambdaError::from(e.to_string()));
     }
 
     Ok(json!({"status": "ok"}))
+}
+
+/// Handle admin commands invoked directly (not through gateway).
+async fn handle_admin(state: &WorkerState, action: &str, _payload: &Value) -> Result<Value, LambdaError> {
+    match action {
+        "reset_balances" => {
+            tracing::info!("admin: resetting balances");
+            for i in 1..=10 {
+                let user = format!("user-{}", i);
+                sqlx::query(
+                    "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'BTC', 10, 0)
+                     ON CONFLICT (user_id, asset) DO UPDATE SET available = 10, locked = 0"
+                ).bind(&user).execute(&state.pg).await.map_err(|e| LambdaError::from(e.to_string()))?;
+
+                sqlx::query(
+                    "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'USDT', 1000000, 0)
+                     ON CONFLICT (user_id, asset) DO UPDATE SET available = 1000000, locked = 0"
+                ).bind(&user).execute(&state.pg).await.map_err(|e| LambdaError::from(e.to_string()))?;
+            }
+            // Re-sync balance cache in Dragonfly
+            cache::init_balances_from_pg(&state.dragonfly, &state.pg).await
+                .map_err(|e| LambdaError::from(e.to_string()))?;
+            tracing::info!("admin: balances reset for 10 users");
+            Ok(json!({"status": "ok", "action": "reset_balances", "users": 10}))
+        }
+        "truncate_orders" => {
+            tracing::info!("admin: truncating orders and trades");
+            sqlx::query("TRUNCATE orders CASCADE").execute(&state.pg).await
+                .map_err(|e| LambdaError::from(e.to_string()))?;
+            // Clear Dragonfly order book cache
+            let mut conn = state.dragonfly.get().await
+                .map_err(|e| LambdaError::from(e.to_string()))?;
+            for pair in state.pairs_cache.keys() {
+                let _: () = redis::cmd("DEL")
+                    .arg(format!("orderbook:{}:bids", pair))
+                    .arg(format!("orderbook:{}:asks", pair))
+                    .arg(format!("version:{}", pair))
+                    .query_async(&mut *conn).await
+                    .unwrap_or(());
+            }
+            tracing::info!("admin: orders truncated, book cache cleared");
+            Ok(json!({"status": "ok", "action": "truncate_orders"}))
+        }
+        "reset_all" => {
+            // Truncate orders + reset balances in one shot
+            sqlx::query("TRUNCATE orders CASCADE").execute(&state.pg).await
+                .map_err(|e| LambdaError::from(e.to_string()))?;
+            for i in 1..=10 {
+                let user = format!("user-{}", i);
+                sqlx::query(
+                    "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'BTC', 10, 0)
+                     ON CONFLICT (user_id, asset) DO UPDATE SET available = 10, locked = 0"
+                ).bind(&user).execute(&state.pg).await.map_err(|e| LambdaError::from(e.to_string()))?;
+                sqlx::query(
+                    "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'USDT', 1000000, 0)
+                     ON CONFLICT (user_id, asset) DO UPDATE SET available = 1000000, locked = 0"
+                ).bind(&user).execute(&state.pg).await.map_err(|e| LambdaError::from(e.to_string()))?;
+            }
+            // Sync caches
+            cache::init_balances_from_pg(&state.dragonfly, &state.pg).await
+                .map_err(|e| LambdaError::from(e.to_string()))?;
+            let mut conn = state.dragonfly.get().await
+                .map_err(|e| LambdaError::from(e.to_string()))?;
+            for pair in state.pairs_cache.keys() {
+                let _: () = redis::cmd("DEL")
+                    .arg(format!("orderbook:{}:bids", pair))
+                    .arg(format!("orderbook:{}:asks", pair))
+                    .arg(format!("version:{}", pair))
+                    .query_async(&mut *conn).await
+                    .unwrap_or(());
+            }
+            tracing::info!("admin: full reset complete (orders truncated, balances reset)");
+            Ok(json!({"status": "ok", "action": "reset_all", "users": 10}))
+        }
+        "query" => {
+            // Run a simple query and return results (for debugging)
+            let sql = _payload.get("sql").and_then(|v| v.as_str()).unwrap_or("SELECT count(*) as cnt FROM orders");
+            let row = sqlx::query(sql).fetch_one(&state.pg).await
+                .map_err(|e| LambdaError::from(e.to_string()))?;
+            let cnt: i64 = row.try_get("cnt").unwrap_or(0);
+            Ok(json!({"status": "ok", "result": cnt}))
+        }
+        "exec" => {
+            // Execute DDL or DML statement (no result set expected)
+            let sql = _payload.get("sql").and_then(|v| v.as_str())
+                .ok_or_else(|| LambdaError::from("sql field required"))?;
+            let result = sqlx::query(sql).execute(&state.pg).await
+                .map_err(|e| LambdaError::from(e.to_string()))?;
+            Ok(json!({"status": "ok", "rows_affected": result.rows_affected()}))
+        }
+        _ => {
+            Err(LambdaError::from(format!("unknown admin action: {}", action)))
+        }
+    }
 }
 
 /// Core order processing logic — extracted from sme-api worker.rs process_queued_order().
