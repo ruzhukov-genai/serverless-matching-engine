@@ -1,5 +1,5 @@
 //! Gateway route handlers — stateless REST API and WebSocket feeds.
-//! All data is read from Dragonfly cache keys (pre-computed by the worker).
+//! All data is read from Valkey cache keys (pre-computed by the worker).
 //! POST /api/orders validates and queues orders; returns 202 Accepted.
 
 use axum::{
@@ -57,7 +57,7 @@ fn stp_str(s: SelfTradePreventionMode) -> &'static str {
 use crate::AppState;
 
 // ── Per-user TTL cache ───────────────────────────────────────────────────────
-// Avoids hitting Dragonfly on every /api/orders and /api/portfolio request.
+// Avoids hitting Valkey on every /api/orders and /api/portfolio request.
 // Short TTL (2s) — eventual consistency acceptable for read-your-writes.
 
 const USER_CACHE_TTL_MS: u128 = 2_000;
@@ -325,8 +325,8 @@ pub async fn create_order(
             }
         }
         crate::DispatchMode::Queue => {
-            // LPUSH to Dragonfly queue (local dev / EC2 worker)
-            let mut conn = s.dragonfly.get().await?;
+            // LPUSH to Valkey queue (local dev / EC2 worker)
+            let mut conn = s.redis.get().await?;
             conn.lpush::<_, _, ()>(format!("queue:orders:{}", req.pair_id), &order_str).await?;
             tracing::info!(
                 order_id = %order_id,
@@ -380,13 +380,13 @@ pub async fn list_orders(
     let user_id = q.user_id.unwrap_or_else(|| "user-1".to_string());
     let cache_key = format!("cache:orders:{}", user_id);
 
-    // Check gateway-side TTL cache first (avoids Dragonfly round-trip)
+    // Check gateway-side TTL cache first (avoids Valkey round-trip)
     if let Some(cached) = s.user_cache.get(&cache_key).await {
         return Ok(raw_json(cached));
     }
 
-    // Fallback to Dragonfly
-    let mut conn = s.dragonfly.get().await?;
+    // Fallback to Valkey
+    let mut conn = s.redis.get().await?;
     let cached: String = conn.get(&cache_key).await.unwrap_or_else(|_| "{}".to_string());
 
     if cached != "{}" {
@@ -403,7 +403,7 @@ pub async fn cancel_order(
     Path(order_id): Path<Uuid>,
     State(s): State<AppState>,
 ) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
+    let mut conn = s.redis.get().await?;
     let cancel_json = json!({
         "type": "cancel",
         "order_id": order_id.to_string(),
@@ -426,7 +426,7 @@ pub async fn modify_order(
     State(s): State<AppState>,
     Json(_req): Json<CreateOrderRequest>,
 ) -> HandlerResult<impl IntoResponse> {
-    let mut conn = s.dragonfly.get().await?;
+    let mut conn = s.redis.get().await?;
     let modify_json = json!({
         "type": "modify",
         "order_id": order_id.to_string(),
@@ -450,7 +450,7 @@ pub async fn cancel_all_orders(
 ) -> HandlerResult<impl IntoResponse> {
     let user_id = q.user_id.unwrap_or_else(|| "user-1".to_string());
 
-    let mut conn = s.dragonfly.get().await?;
+    let mut conn = s.redis.get().await?;
     let cancel_all_json = json!({
         "type": "cancel_all",
         "user_id": user_id,
@@ -486,8 +486,8 @@ pub async fn get_portfolio(
         return Ok(raw_json(cached));
     }
 
-    // Fallback to Dragonfly
-    let mut conn = s.dragonfly.get().await?;
+    // Fallback to Valkey
+    let mut conn = s.redis.get().await?;
     let cached: String = conn.get(&cache_key).await.unwrap_or_else(|_| "{}".to_string());
 
     if cached != "{}" {
@@ -498,7 +498,7 @@ pub async fn get_portfolio(
     Ok(raw_json(r#"{"balances":[]}"#))
 }
 
-// ── Dashboard API — read from CacheBroadcasts (zero Dragonfly) ────────────────
+// ── Dashboard API — read from CacheBroadcasts (zero Valkey) ────────────────
 
 pub async fn get_metrics(State(s): State<AppState>) -> HandlerResult<Response> {
     Ok(raw_json(s.cache.get_latest("cache:metrics")
@@ -533,7 +533,7 @@ pub async fn get_snapshot(
     Query(q): Query<OrderbookQuery>,
     State(s): State<AppState>,
 ) -> HandlerResult<Response> {
-    // Read all cache keys — zero Dragonfly, all from watch channels
+    // Read all cache keys — zero Valkey, all from watch channels
     let ob = s.cache.get_latest(&format!("cache:orderbook:{}", pair_id));
     let trades = s.cache.get_latest(&format!("cache:trades:{}", pair_id));
     let ticker = s.cache.get_latest(&format!("cache:ticker:{}", pair_id));
@@ -625,7 +625,7 @@ pub async fn sse_stream(
 // ── WebSocket Feeds ───────────────────────────────────────────────────────────
 
 /// Shared-broadcast WS handler — subscribes to a CacheBroadcasts channel
-/// instead of polling Dragonfly directly. One Dragonfly poller feeds N clients.
+/// instead of polling Valkey directly. One Valkey poller feeds N clients.
 async fn cache_broadcast_ws(
     cache_key: String,
     state: AppState,
@@ -735,16 +735,16 @@ async fn handle_multiplexed_ws(state: AppState, mut socket: WebSocket) {
                                             });
                                             subscription_handles.push(handle);
                                         } else if ch_name.starts_with("portfolio:") {
-                                            // Poll portfolio from user cache / Dragonfly
+                                            // Poll portfolio from user cache / Valkey
                                             let user_id = ch_name.strip_prefix("portfolio:").unwrap().to_string();
                                             let handle = tokio::spawn(async move {
                                                 let cache_key = format!("cache:portfolio:{}", user_id);
                                                 let mut last_val = String::new();
                                                 loop {
-                                                    // Check user cache, then Dragonfly
+                                                    // Check user cache, then Valkey
                                                     let val = if let Some(cached) = state_clone.user_cache.get(&cache_key).await {
                                                         cached
-                                                    } else if let Ok(mut conn) = state_clone.dragonfly.get().await {
+                                                    } else if let Ok(mut conn) = state_clone.redis.get().await {
                                                         use deadpool_redis::redis::AsyncCommands;
                                                         conn.get::<_, String>(&cache_key).await.unwrap_or_default()
                                                     } else {

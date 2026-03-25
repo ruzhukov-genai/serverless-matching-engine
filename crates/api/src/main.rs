@@ -29,16 +29,16 @@ pub struct PairConfig {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub dragonfly: RedisPool,
-    /// Dragonfly connection URL — used to create dedicated BRPOP connections (Opt 2).
-    pub dragonfly_url: String,
+    pub redis: RedisPool,
+    /// Valkey connection URL — used to create dedicated BRPOP connections (Opt 2).
+    pub redis_url: String,
     /// Hot path pool — used by order writes.
     pub pg: PgPool,
     /// Background pool — async persist + read-only queries.
     pub pg_bg: PgPool,
     /// In-memory pairs cache: pair_id → PairConfig
     pub pairs_cache: Arc<HashMap<String, PairConfig>>,
-    /// Pre-computed per-pair Dragonfly key strings — avoids format! on hot path (Opt 3).
+    /// Pre-computed per-pair Valkey key strings — avoids format! on hot path (Opt 3).
     pub pair_keys: Arc<HashMap<String, PairKeys>>,
     /// Channel to the background persistence worker
     pub persist_tx: mpsc::Sender<routes::PersistJob>,
@@ -46,7 +46,7 @@ pub struct AppState {
     pub order_events_tx: broadcast::Sender<String>,
     /// Dirty user IDs — notifies cache refresh worker which portfolios to update
     pub dirty_users_tx: mpsc::Sender<String>,
-    /// Batched metrics — accumulated in-memory, flushed to Dragonfly every 2s
+    /// Batched metrics — accumulated in-memory, flushed to Valkey every 2s
     pub metrics_batch: Arc<worker::MetricsBatch>,
     /// Orderbook rebuild debouncer — coalesces rapid rebuilds per pair
     pub orderbook_debouncer: Arc<worker::OrderbookDebouncer>,
@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
     tracing::info!("sme-api (worker) starting");
 
     let config = sme_shared::Config::from_env();
-    let dragonfly = sme_shared::cache::create_pool_sized(&config.dragonfly_url, 30).await?;
+    let redis = sme_shared::cache::create_pool_sized(&config.redis_url, 30).await?;
 
     // Hot path pool: low latency, fast order inserts + balance locks.
     let pg_hot = sqlx::postgres::PgPoolOptions::new()
@@ -115,24 +115,24 @@ async fn main() -> Result<()> {
     let pairs_cache = Arc::new(load_pairs_cache(&pg_hot).await?);
     tracing::info!(count = pairs_cache.len(), "pairs cache loaded");
 
-    // Pre-compute per-pair Dragonfly key strings — avoids format! calls on hot path (Opt 3)
+    // Pre-compute per-pair Valkey key strings — avoids format! calls on hot path (Opt 3)
     let pair_keys: HashMap<String, PairKeys> = pairs_cache.keys()
         .map(|p| (p.clone(), PairKeys::new(p)))
         .collect();
     let pair_keys = Arc::new(pair_keys);
 
-    // Initialize cache keys in Dragonfly
+    // Initialize cache keys in Valkey
     tracing::info!("initializing cache keys");
-    initialize_cache_keys(&dragonfly, &pg_hot, &pairs_cache).await?;
+    initialize_cache_keys(&redis, &pg_hot, &pairs_cache).await?;
 
     // Seed order book ZSETs from PG resting orders — critical on fresh cache (ElastiCache migration)
     tracing::info!("seeding orderbook from PG resting orders");
-    sme_shared::cache::seed_orderbook_from_pg(&dragonfly, &pg_hot).await?;
+    sme_shared::cache::seed_orderbook_from_pg(&redis, &pg_hot).await?;
 
     // Seed ticker cache from recent trades in PG
     tracing::info!("seeding ticker cache from PG");
     let pair_ids_for_seed: Vec<String> = pairs_cache.keys().cloned().collect();
-    sme_shared::cache::seed_ticker_from_pg(&dragonfly, &pg_hot, &pair_ids_for_seed).await?;
+    sme_shared::cache::seed_ticker_from_pg(&redis, &pg_hot, &pair_ids_for_seed).await?;
 
     // Spawn background persistence worker — uses dedicated pg_bg pool
     let (persist_tx, persist_rx) = mpsc::channel::<routes::PersistJob>(1000);
@@ -149,8 +149,8 @@ async fn main() -> Result<()> {
     let orderbook_debouncer = Arc::new(worker::OrderbookDebouncer::new());
 
     let state = AppState {
-        dragonfly: dragonfly.clone(),
-        dragonfly_url: config.dragonfly_url.clone(),
+        redis: redis.clone(),
+        redis_url: config.redis_url.clone(),
         pg: pg_hot, pg_bg: pg_bg.clone(), pairs_cache, pair_keys,
         persist_tx, order_events_tx, dirty_users_tx,
         metrics_batch: metrics_batch.clone(), orderbook_debouncer: orderbook_debouncer.clone(),
@@ -169,15 +169,15 @@ async fn main() -> Result<()> {
         worker::cache_refresh_worker(cache_state, dirty_users_rx).await;
     });
 
-    // Metrics refresh — writes to Dragonfly cache keys read by gateway
-    let metrics_dragonfly = dragonfly.clone();
+    // Metrics refresh — writes to Valkey cache keys read by gateway
+    let metrics_redis = redis.clone();
     let metrics_pg = pg_bg.clone();
     tokio::spawn(async move {
-        routes::metrics_refresh_loop_worker(metrics_dragonfly, metrics_pg).await;
+        routes::metrics_refresh_loop_worker(metrics_redis, metrics_pg).await;
     });
 
-    // Metrics batch flush — drains accumulated order/trade/latency counters to Dragonfly every 2s
-    let flush_pool = dragonfly.clone();
+    // Metrics batch flush — drains accumulated order/trade/latency counters to Valkey every 2s
+    let flush_pool = redis.clone();
     let flush_batch = metrics_batch.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -195,7 +195,7 @@ async fn main() -> Result<()> {
         let _persist_tx_ref = persist_tx_clone.clone();
         let pg_ref = state.pg.clone();
         let pg_bg_ref = state.pg_bg.clone();
-        let df_ref = dragonfly.clone();
+        let df_ref = redis.clone();
         let batch_ref = metrics_batch.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(30));
@@ -223,8 +223,8 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Initialize Dragonfly balance keys from PG — fast-path balance locking
-    sme_shared::cache::init_balances_from_pg(&dragonfly, &pg_bg).await?;
+    // Initialize Valkey balance keys from PG — fast-path balance locking
+    sme_shared::cache::init_balances_from_pg(&redis, &pg_bg).await?;
 
     tracing::info!("worker started, listening for orders on queue:orders");
 
@@ -303,7 +303,7 @@ async fn run_seed(pg: &PgPool) -> Result<()> {
 }
 
 async fn initialize_cache_keys(
-    dragonfly: &RedisPool,
+    redis: &RedisPool,
     pg: &PgPool,
     pairs_cache: &HashMap<String, PairConfig>,
 ) -> Result<()> {
@@ -333,29 +333,29 @@ async fn initialize_cache_keys(
 
     let pairs_json = json!({"pairs": pairs});
     let pairs_str = serde_json::to_string(&pairs_json)?;
-    sme_shared::cache::set_and_publish(dragonfly, "cache:pairs", &pairs_str).await?;
+    sme_shared::cache::set_and_publish(redis, "cache:pairs", &pairs_str).await?;
 
     // Initialize empty caches for each pair
     for pair_id in pairs_cache.keys() {
         let empty_book = json!({ "pair": pair_id, "bids": [], "asks": [] });
         let book_str = serde_json::to_string(&empty_book)?;
-        sme_shared::cache::set_and_publish(dragonfly, &format!("cache:orderbook:{}", pair_id), &book_str).await?;
+        sme_shared::cache::set_and_publish(redis, &format!("cache:orderbook:{}", pair_id), &book_str).await?;
 
         let empty_ticker = json!({ "pair": pair_id, "last": null, "high_24h": null, "low_24h": null, "volume_24h": null });
         let ticker_str = serde_json::to_string(&empty_ticker)?;
-        sme_shared::cache::set_and_publish(dragonfly, &format!("cache:ticker:{}", pair_id), &ticker_str).await?;
+        sme_shared::cache::set_and_publish(redis, &format!("cache:ticker:{}", pair_id), &ticker_str).await?;
 
         let empty_trades = json!({ "pair": pair_id, "trades": [] });
         let trades_str = serde_json::to_string(&empty_trades)?;
-        sme_shared::cache::set_and_publish(dragonfly, &format!("cache:trades:{}", pair_id), &trades_str).await?;
+        sme_shared::cache::set_and_publish(redis, &format!("cache:trades:{}", pair_id), &trades_str).await?;
     }
 
     // Empty metrics caches
-    sme_shared::cache::set_and_publish(dragonfly, "cache:metrics", "{}").await?;
-    sme_shared::cache::set_and_publish(dragonfly, "cache:lock_metrics", "{}").await?;
-    sme_shared::cache::set_and_publish(dragonfly, "cache:throughput", r#"{"series":[]}"#).await?;
-    sme_shared::cache::set_and_publish(dragonfly, "cache:latency_metrics", "{}").await?;
-    sme_shared::cache::set_and_publish(dragonfly, "cache:audit", r#"{"audit":[],"events":[]}"#).await?;
+    sme_shared::cache::set_and_publish(redis, "cache:metrics", "{}").await?;
+    sme_shared::cache::set_and_publish(redis, "cache:lock_metrics", "{}").await?;
+    sme_shared::cache::set_and_publish(redis, "cache:throughput", r#"{"series":[]}"#).await?;
+    sme_shared::cache::set_and_publish(redis, "cache:latency_metrics", "{}").await?;
+    sme_shared::cache::set_and_publish(redis, "cache:audit", r#"{"audit":[],"events":[]}"#).await?;
 
     tracing::info!("cache keys initialized");
     Ok(())

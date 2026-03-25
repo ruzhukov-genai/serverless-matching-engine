@@ -762,7 +762,7 @@ async fn persist_trades(pg: &sqlx::PgPool, trades: &[Trade]) -> anyhow::Result<V
 /// Update resting orders in Postgres after a Lua atomic fill.
 ///
 /// Uses arithmetic SQL so we don't need the current remaining value.
-/// Dragonfly is already correct; this syncs the authoritative Postgres state.
+/// Valkey is already correct; this syncs the authoritative Postgres state.
 /// Runs each update individually (resting orders per match are typically ≤ a few).
 async fn update_resting_orders_after_lua(
     pg: &sqlx::PgPool,
@@ -879,7 +879,7 @@ fn row_to_trade_json(r: &sqlx::postgres::PgRow) -> Value {
 
 /// Runs forever, refreshing ticker + recent trades for all pairs every 2 seconds (original in-memory version).
 pub async fn metrics_refresh_loop_worker(
-    dragonfly: deadpool_redis::Pool,
+    redis: deadpool_redis::Pool,
     pg: sqlx::PgPool,
 ) {
     use tokio::time::{Duration, interval};
@@ -892,12 +892,12 @@ pub async fn metrics_refresh_loop_worker(
         let mut total_orders: i64 = 0;
         let mut total_trades: i64 = 0;
         for pair_id in PAIRS {
-            total_orders += metrics::get_order_count(&dragonfly, pair_id).await.unwrap_or(0);
-            total_trades += metrics::get_trade_count(&dragonfly, pair_id).await.unwrap_or(0);
+            total_orders += metrics::get_order_count(&redis, pair_id).await.unwrap_or(0);
+            total_trades += metrics::get_trade_count(&redis, pair_id).await.unwrap_or(0);
         }
         let mut all_latency: Vec<u64> = Vec::new();
         for pair_id in PAIRS {
-            let samples = metrics::get_latency_samples(&dragonfly, pair_id, 100).await.unwrap_or_default();
+            let samples = metrics::get_latency_samples(&redis, pair_id, 100).await.unwrap_or_default();
             all_latency.extend(samples);
         }
         let (p50, p95, p99) = metrics::compute_percentiles(all_latency);
@@ -915,7 +915,7 @@ pub async fn metrics_refresh_loop_worker(
         // ── /api/metrics/locks ──
         let mut all_waits: Vec<u64> = Vec::new();
         for pair_id in PAIRS {
-            let samples = metrics::get_lock_wait_samples(&dragonfly, pair_id, 1000).await.unwrap_or_default();
+            let samples = metrics::get_lock_wait_samples(&redis, pair_id, 1000).await.unwrap_or_default();
             all_waits.extend(samples);
         }
         let (avg_wait_ms, contention_rate) = if all_waits.is_empty() {
@@ -937,7 +937,7 @@ pub async fn metrics_refresh_loop_worker(
         let mut all_samples: Vec<u64> = Vec::new();
         let mut per_pair: Vec<Value> = Vec::new();
         for pair_id in PAIRS {
-            let samples = metrics::get_latency_samples(&dragonfly, pair_id, 1000).await.unwrap_or_default();
+            let samples = metrics::get_latency_samples(&redis, pair_id, 1000).await.unwrap_or_default();
             let (pp50, pp95, pp99) = metrics::compute_percentiles(samples.clone());
             per_pair.push(json!({
                 "pair_id": pair_id,
@@ -973,18 +973,18 @@ pub async fn metrics_refresh_loop_worker(
             Err(_) => json!({ "series": [] }),
         };
 
-        // Write to Dragonfly cache keys + PUBLISH for gateway subscribers
+        // Write to Valkey cache keys + PUBLISH for gateway subscribers
         let metrics_str = serde_json::to_string(&metrics_val).unwrap_or("{}".to_string());
-        let _ = sme_shared::cache::set_and_publish(&dragonfly, "cache:metrics", &metrics_str).await;
+        let _ = sme_shared::cache::set_and_publish(&redis, "cache:metrics", &metrics_str).await;
         
         let locks_str = serde_json::to_string(&locks_val).unwrap_or("{}".to_string());
-        let _ = sme_shared::cache::set_and_publish(&dragonfly, "cache:lock_metrics", &locks_str).await;
+        let _ = sme_shared::cache::set_and_publish(&redis, "cache:lock_metrics", &locks_str).await;
         
         let latency_str = serde_json::to_string(&latency_val).unwrap_or("{}".to_string());
-        let _ = sme_shared::cache::set_and_publish(&dragonfly, "cache:latency_metrics", &latency_str).await;
+        let _ = sme_shared::cache::set_and_publish(&redis, "cache:latency_metrics", &latency_str).await;
         
         let throughput_str = serde_json::to_string(&throughput_val).unwrap_or("{}".to_string());
-        let _ = sme_shared::cache::set_and_publish(&dragonfly, "cache:throughput", &throughput_str).await;
+        let _ = sme_shared::cache::set_and_publish(&redis, "cache:throughput", &throughput_str).await;
     }
 }
 

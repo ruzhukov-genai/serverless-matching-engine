@@ -19,18 +19,18 @@ async fn main() -> Result<()> {
     tracing::info!("order-service starting");
 
     let config = Config::from_env();
-    let dragonfly = cache::create_pool(&config.dragonfly_url).await?;
+    let redis = cache::create_pool(&config.redis_url).await?;
     let pg = sme_shared::db::create_pool(&config.database_url).await?;
     sme_shared::db::run_migrations(&pg).await?;
 
     let worker_id = format!("os-{}", Uuid::new_v4());
-    streams::create_consumer_group(&dragonfly, STREAM_ORDERS, CONSUMER_GROUP).await?;
+    streams::create_consumer_group(&redis, STREAM_ORDERS, CONSUMER_GROUP).await?;
 
     tracing::info!("entering consumer loop");
 
     loop {
         let messages =
-            streams::consume(&dragonfly, STREAM_ORDERS, CONSUMER_GROUP, &worker_id, 10).await?;
+            streams::consume(&redis, STREAM_ORDERS, CONSUMER_GROUP, &worker_id, 10).await?;
 
         for msg in messages {
             let msg_id = msg.id.clone();
@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
                 Ok(o) => o,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to deserialize order from stream");
-                    let _ = streams::ack(&dragonfly, STREAM_ORDERS, CONSUMER_GROUP, &msg_id).await;
+                    let _ = streams::ack(&redis, STREAM_ORDERS, CONSUMER_GROUP, &msg_id).await;
                     continue;
                 }
             };
@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
                 Ok(()) => {}
                 Err(e) => {
                     tracing::warn!(order_id = %order.id, reason = %e, "order rejected");
-                    let _ = streams::ack(&dragonfly, STREAM_ORDERS, CONSUMER_GROUP, &msg_id).await;
+                    let _ = streams::ack(&redis, STREAM_ORDERS, CONSUMER_GROUP, &msg_id).await;
                     continue;
                 }
             }
@@ -68,17 +68,17 @@ async fn main() -> Result<()> {
                 continue;
             }
 
-            // Save to Dragonfly cache
-            if let Err(e) = cache::save_order_to_book(&dragonfly, &order).await {
+            // Save to Valkey cache
+            if let Err(e) = cache::save_order_to_book(&redis, &order).await {
                 tracing::error!(error = %e, "failed to save order to cache");
             }
 
             // Publish to matching stream
-            if let Err(e) = streams::publish(&dragonfly, STREAM_ORDERS_MATCH, &order).await {
+            if let Err(e) = streams::publish(&redis, STREAM_ORDERS_MATCH, &order).await {
                 tracing::error!(error = %e, "failed to publish order to match stream");
             }
 
-            let _ = streams::ack(&dragonfly, STREAM_ORDERS, CONSUMER_GROUP, &msg_id).await;
+            let _ = streams::ack(&redis, STREAM_ORDERS, CONSUMER_GROUP, &msg_id).await;
             tracing::info!(order_id = %order.id, "order accepted and queued for matching");
         }
     }

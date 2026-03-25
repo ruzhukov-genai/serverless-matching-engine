@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
   Serverless Matching Engine - Backend Stack
-  EC2 t4g.micro (Dragonfly only) + RDS db.t4g.micro (PostgreSQL) + Lambda (gateway + worker) + API Gateway HTTP API.
+  EC2 t4g.micro (Valkey only) + RDS db.t4g.micro (PostgreSQL) + Lambda (gateway + worker) + API Gateway HTTP API.
   Lambda functions use AWS::Serverless::Function with PackageType: Image.
 
 # ---------------------------------------------------------------------------
@@ -89,7 +89,7 @@ Parameters:
     Type: String
     Default: 'elasticache'
     AllowedValues: ['ec2', 'elasticache']
-    Description: 'Cache backend: ec2 (Dragonfly on EC2) or elasticache'
+    Description: 'Cache backend: ec2 (Valkey on EC2) or elasticache'
 
 # ---------------------------------------------------------------------------
 # Conditions
@@ -257,52 +257,11 @@ Resources:
           exec > /var/log/sme-userdata.log 2>&1
 
           echo "=== SME EC2 Bootstrap ==="
-          # EC2 runs Dragonfly only — PostgreSQL is on RDS
+          # NOTE: EC2 is a legacy resource — Dragonfly was removed in favor of
+          # ElastiCache Valkey. This instance can be removed from the stack.
+          # Kept temporarily for backward compatibility with existing deployment.
           dnf update -y
-          dnf install -y --allowerasing wget curl tar unzip
-
-          # ----- Dragonfly setup -----
-          DRAGONFLY_VERSION="1.28.2"
-          ARCH="aarch64"
-          wget -q "https://github.com/dragonflydb/dragonfly/releases/download/v${!DRAGONFLY_VERSION}/dragonfly-${!ARCH}.tar.gz" \
-            -O /tmp/dragonfly.tar.gz
-          tar xzf /tmp/dragonfly.tar.gz -C /tmp
-          mv /tmp/dragonfly-${!ARCH} /usr/local/bin/dragonfly
-          chmod +x /usr/local/bin/dragonfly
-
-          useradd -r -s /bin/false dragonfly || true
-          mkdir -p /var/lib/dragonfly /etc/dragonfly
-          chown dragonfly:dragonfly /var/lib/dragonfly
-
-          cat > /etc/dragonfly/dragonfly.conf << 'DRAGONCFG'
-          --bind=0.0.0.0
-          --port=6379
-          --maxmemory=256mb
-          --proactor_threads=1
-          --default_lua_flags=allow-undeclared-keys
-          --dir=/var/lib/dragonfly
-          --logtostderr
-          DRAGONCFG
-
-          cat > /etc/systemd/system/dragonfly.service << 'DFUNIT'
-          [Unit]
-          Description=Dragonfly In-Memory Data Store
-          After=network.target
-          [Service]
-          User=dragonfly
-          ExecStart=/usr/local/bin/dragonfly --flagfile=/etc/dragonfly/dragonfly.conf
-          Restart=always
-          RestartSec=5
-          LimitNOFILE=65536
-          [Install]
-          WantedBy=multi-user.target
-          DFUNIT
-
-          systemctl daemon-reload
-          systemctl enable dragonfly
-          systemctl start dragonfly
-
-          echo "=== Bootstrap complete (Dragonfly only) ==="
+          echo "=== Bootstrap complete (no services — EC2 is deprecated) ==="
       Tags:
         - Key: Name
           Value: !Sub '${ProjectName}-ec2'
@@ -432,8 +391,8 @@ Resources:
           AWS_LWA_PORT: '3001'
           AWS_LWA_READINESS_CHECK_PATH: '/api/pairs'
           AWS_LWA_PASS_THROUGH_PATH: '/'
-          # Application settings — CacheMode toggles between EC2 Dragonfly and ElastiCache
-          DRAGONFLY_URL: !If
+          # Application settings — CacheMode toggles between EC2 Valkey and ElastiCache
+          REDIS_URL: !If
             - UseElastiCache
             - !Sub 'redis://${ElastiCacheRedis.PrimaryEndPoint.Address}:6379'
             - !Sub 'redis://${EC2Instance.PrivateIp}:6379'
@@ -467,7 +426,7 @@ Resources:
       ImageUri: !Ref WorkerImageUri
       Architectures:
         - x86_64
-      # 1024MB: needs headroom for PG + Dragonfly connection pools and match logic
+      # 1024MB: needs headroom for PG + Valkey connection pools and match logic
       MemorySize: 1024
       Timeout: 30
       # No ReservedConcurrentExecutions - scales freely with order volume
@@ -480,7 +439,7 @@ Resources:
           - !Ref WorkerLambdaSecurityGroupId
       Environment:
         Variables:
-          DRAGONFLY_URL: !If
+          REDIS_URL: !If
             - UseElastiCache
             - !Sub 'redis://${ElastiCacheRedis.PrimaryEndPoint.Address}:6379'
             - !Sub 'redis://${EC2Instance.PrivateIp}:6379'
@@ -586,7 +545,7 @@ Resources:
           - !Ref LambdaSecurityGroupId
       Environment:
         Variables:
-          DRAGONFLY_URL: !If
+          REDIS_URL: !If
             - UseElastiCache
             - !Sub 'redis://${ElastiCacheRedis.PrimaryEndPoint.Address}:6379'
             - !Sub 'redis://${EC2Instance.PrivateIp}:6379'
@@ -662,7 +621,7 @@ Outputs:
     Value: !Sub 'wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/ws'
 
   EC2PrivateIP:
-    Description: EC2 private IP (used by Lambda for Dragonfly)
+    Description: EC2 private IP (used by Lambda for Valkey)
     Value: !GetAtt EC2Instance.PrivateIp
 
   RDSEndpoint:

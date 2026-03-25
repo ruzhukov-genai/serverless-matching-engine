@@ -2,35 +2,31 @@
 # Usage: docker compose up -d
 
 services:
-  dragonfly:
-    image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
-    container_name: sme-dragonfly
+  valkey:
+    image: valkey/valkey:8.1-alpine
+    container_name: sme-valkey
     network_mode: host
     volumes:
-      - dragonfly-data:/data
-      - /tmp/dragonfly:/tmp/dragonfly
+      - valkey-data:/data
     command: >
-      dragonfly
-      --logtostderr
-      --cache_mode=true
-      --default_lua_flags=allow-undeclared-keys
-      --proactor_threads=1
-      --maxmemory=3gb
-      --hz=500
-      --tcp_nodelay=true
-      --bind=127.0.0.1
-      --port=6379
-      --unixsocket=/tmp/dragonfly/dragonfly.sock
-      --unixsocketperm=777
-    ulimits:
-      memlock: -1
+      valkey-server
+      --bind 127.0.0.1
+      --port 6379
+      --maxmemory 3gb
+      --maxmemory-policy allkeys-lru
+      --tcp-keepalive 60
+      --hz 500
+      --save ""
+      --appendonly no
+      --loglevel notice
+      --tcp-nodelay yes
     deploy:
       resources:
         limits:
           cpus: "1.6"
           memory: 4000M
     healthcheck:
-      test: ["CMD", "redis-cli", "-h", "127.0.0.1", "ping"]
+      test: ["CMD", "valkey-cli", "-h", "127.0.0.1", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -72,97 +68,6 @@ services:
       timeout: 3s
       retries: 5
 
-  # Valkey — Redis-compatible cache (matches ElastiCache/production Lua 5.1)
-  # Usage: docker compose --profile valkey up -d
-  # Then point apps at redis://127.0.0.1:6380
-  valkey:
-    image: valkey/valkey:8.1-alpine
-    container_name: sme-valkey
-    profiles: ["valkey"]
-    network_mode: host
-    volumes:
-      - valkey-data:/data
-    command: >
-      valkey-server
-      --bind 127.0.0.1
-      --port 6380
-      --maxmemory 1gb
-      --maxmemory-policy allkeys-lru
-      --tcp-keepalive 60
-      --hz 500
-      --save ""
-      --appendonly no
-      --loglevel notice
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 1500M
-    healthcheck:
-      test: ["CMD", "valkey-cli", "-h", "127.0.0.1", "-p", "6380", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
-  # --- Service containers (uncomment when ready) ---
-  # Run locally with: cargo run --bin <name>
-
-  # api:
-  #   build:
-  #     context: .
-  #     dockerfile: crates/api/Dockerfile
-  #   container_name: sme-api
-  #   ports:
-  #     - "3000:3000"
-  #   depends_on:
-  #     dragonfly: { condition: service_healthy }
-  #     postgres: { condition: service_healthy }
-  #   environment:
-  #     DRAGONFLY_URL: redis://dragonfly:6379
-  #     DATABASE_URL: postgres://sme:sme_dev@postgres:5432/matching_engine
-  #     RUST_LOG: sme_api=debug,sme_shared=debug
-
-  # matching-engine:
-  #   build:
-  #     context: .
-  #     dockerfile: crates/matching-engine/Dockerfile
-  #   container_name: sme-matching-engine
-  #   depends_on:
-  #     dragonfly: { condition: service_healthy }
-  #     postgres: { condition: service_healthy }
-  #   environment:
-  #     DRAGONFLY_URL: redis://dragonfly:6379
-  #     DATABASE_URL: postgres://sme:sme_dev@postgres:5432/matching_engine
-  #     STATELESS_MODE: "true"
-  #     RUST_LOG: matching_engine=debug,sme_shared=debug
-
-  # order-service:
-  #   build:
-  #     context: .
-  #     dockerfile: crates/order-service/Dockerfile
-  #   container_name: sme-order-service
-  #   depends_on:
-  #     dragonfly: { condition: service_healthy }
-  #     postgres: { condition: service_healthy }
-  #   environment:
-  #     DRAGONFLY_URL: redis://dragonfly:6379
-  #     DATABASE_URL: postgres://sme:sme_dev@postgres:5432/matching_engine
-  #     RUST_LOG: order_service=debug,sme_shared=debug
-
-  # transaction-service:
-  #   build:
-  #     context: .
-  #     dockerfile: crates/transaction-service/Dockerfile
-  #   container_name: sme-transaction-service
-  #   depends_on:
-  #     dragonfly: { condition: service_healthy }
-  #     postgres: { condition: service_healthy }
-  #   environment:
-  #     DRAGONFLY_URL: redis://dragonfly:6379
-  #     DATABASE_URL: postgres://sme:sme_dev@postgres:5432/matching_engine
-  #     RUST_LOG: transaction_service=debug,sme_shared=debug
-
 volumes:
-  dragonfly-data:
   valkey-data:
   postgres-data:

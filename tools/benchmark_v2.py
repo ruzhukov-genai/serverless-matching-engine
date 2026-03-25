@@ -117,9 +117,9 @@ def db_stats():
         return json.loads(out)
     except: return {}
 
-def dragonfly_stats():
+def valkey_stats():
     try:
-        out = subprocess.check_output(["docker", "exec", "sme-dragonfly", "redis-cli", "INFO", "clients"], text=True)
+        out = subprocess.check_output(["docker", "exec", "sme-valkey", "redis-cli", "INFO", "clients"], text=True)
         for line in out.split('\n'):
             if line.startswith('connected_clients:'):
                 return {"df_clients": int(line.split(':')[1].strip())}
@@ -288,7 +288,7 @@ async def run_level(num_clients, mode, deadline_offset):
 
     snap_before = server_snapshot()
     db_before = db_stats()
-    df_before = dragonfly_stats()
+    df_before = valkey_stats()
 
     server_samples = []
     async def sample_server():
@@ -307,7 +307,7 @@ async def run_level(num_clients, mode, deadline_offset):
     await sampler
 
     db_after = db_stats()
-    df_after = dragonfly_stats()
+    df_after = valkey_stats()
     merged = merge_stats(client_stats)
 
     # Peak server metrics

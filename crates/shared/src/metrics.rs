@@ -1,4 +1,4 @@
-//! Dragonfly-backed metrics helpers for the matching engine.
+//! Valkey-backed metrics helpers for the matching engine.
 //!
 //! Keys:
 //!   metrics:{pair_id}:latency   → list of match latency samples (ms, newest first)

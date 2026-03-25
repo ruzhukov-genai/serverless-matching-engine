@@ -34,8 +34,8 @@ def check_main_files():
     if os.path.exists(gateway_main):
         with open(gateway_main, "r") as f:
             content = f.read()
-            if "sme-gateway starting" in content and "dragonfly" in content and "pg_hot" not in content:
-                print("✓ Gateway main.rs looks correct (Dragonfly only)")
+            if "sme-gateway starting" in content and "valkey" in content and "pg_hot" not in content:
+                print("✓ Gateway main.rs looks correct (Valkey only)")
             else:
                 print("✗ Gateway main.rs has issues")
     

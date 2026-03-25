@@ -6,13 +6,13 @@ LOG=/tmp/sme-worker.log
 rm -f "$LOG" /tmp/sme-gateway.log
 
 DATABASE_URL=postgres://sme:sme_dev@localhost:5432/matching_engine \
-DRAGONFLY_URL=redis://localhost:6379 \
+REDIS_URL=redis://localhost:6379 \
 RUST_LOG=info \
 setsid ./target/release/sme-api >>"$LOG" 2>&1 &
 WPID=$!
 sleep 3
 
-PORT=3001 DRAGONFLY_URL=redis://localhost:6379 RUST_LOG=info \
+PORT=3001 REDIS_URL=redis://localhost:6379 RUST_LOG=info \
 setsid ./target/release/sme-gateway >>/tmp/sme-gateway.log 2>&1 &
 GPID=$!
 sleep 2

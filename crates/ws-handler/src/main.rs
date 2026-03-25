@@ -3,13 +3,13 @@
 //! Invoked directly by API Gateway WebSocket API (no Lambda Web Adapter).
 //! Handles $connect, $disconnect, and $default (subscribe/unsubscribe commands).
 //!
-//! Connection state is stored in Dragonfly:
+//! Connection state is stored in Valkey:
 //!   ws:connections          → SET of all active connectionIds
 //!   ws:subs:{channel}       → SET of connectionIds subscribed to this channel
 //!   ws:conn:{connectionId}  → SET of channels this connection is subscribed to
 //!
 //! On subscribe, the current cached value is sent immediately via API GW Management API.
-//! Stale connections (410 Gone) are removed from Dragonfly on push failure.
+//! Stale connections (410 Gone) are removed from Valkey on push failure.
 
 use std::env;
 use std::time::Duration;
@@ -62,10 +62,10 @@ async fn get_state() -> Result<&'static AppState> {
         return Ok(s);
     }
 
-    let dragonfly_url = env::var("DRAGONFLY_URL")
+    let redis_url = env::var("REDIS_URL")
         .unwrap_or_else(|_| "redis://localhost:6379".to_string());
 
-    let mut cfg = Config::from_url(&dragonfly_url);
+    let mut cfg = Config::from_url(&redis_url);
     cfg.pool = Some(deadpool_redis::PoolConfig {
         max_size: 5,
         timeouts: deadpool_redis::Timeouts {

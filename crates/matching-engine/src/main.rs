@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
     tracing::info!("matching-engine starting");
 
     let config = Config::from_env();
-    let dragonfly = cache::create_pool(&config.dragonfly_url).await?;
+    let redis = cache::create_pool(&config.redis_url).await?;
     let pg = sme_shared::db::create_pool(&config.database_url).await?;
     sme_shared::db::run_migrations(&pg).await?;
 
@@ -34,13 +34,13 @@ async fn main() -> Result<()> {
     tracing::info!(worker_id = %worker_id, "worker id assigned");
 
     // Create consumer group (idempotent)
-    streams::create_consumer_group(&dragonfly, STREAM_ORDERS_MATCH, CONSUMER_GROUP).await?;
+    streams::create_consumer_group(&redis, STREAM_ORDERS_MATCH, CONSUMER_GROUP).await?;
 
     tracing::info!("entering consumer loop");
 
     loop {
         let messages =
-            streams::consume(&dragonfly, STREAM_ORDERS_MATCH, CONSUMER_GROUP, &worker_id, 10)
+            streams::consume(&redis, STREAM_ORDERS_MATCH, CONSUMER_GROUP, &worker_id, 10)
                 .await?;
 
         for msg in messages {
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
                 Ok(o) => o,
                 Err(e) => {
                     tracing::error!(msg_id = %msg_id, error = %e, "failed to deserialize order");
-                    let _ = streams::ack(&dragonfly, STREAM_ORDERS_MATCH, CONSUMER_GROUP, &msg_id).await;
+                    let _ = streams::ack(&redis, STREAM_ORDERS_MATCH, CONSUMER_GROUP, &msg_id).await;
                     continue;
                 }
             };
@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
             tracing::debug!(order_id = %order.id, pair = %order.pair_id, "processing order");
 
             // Acquire distributed lock for this pair
-            let lock_guard = match lock::acquire_lock(&dragonfly, &order.pair_id, &worker_id).await
+            let lock_guard = match lock::acquire_lock(&redis, &order.pair_id, &worker_id).await
             {
                 Ok(g) => g,
                 Err(e) => {
@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
 
             // Load opposite side of the book
             let opposite = order.side.opposite();
-            let mut book = cache::load_order_book(&dragonfly, &order.pair_id, opposite).await?;
+            let mut book = cache::load_order_book(&redis, &order.pair_id, opposite).await?;
 
             // Sort book for price-time priority
             book.sort_by(|a, b| {
@@ -88,9 +88,9 @@ async fn main() -> Result<()> {
                 if updated.status == OrderStatus::Filled
                     || updated.status == OrderStatus::Cancelled
                 {
-                    let _ = cache::remove_order_from_book(&dragonfly, updated).await;
+                    let _ = cache::remove_order_from_book(&redis, updated).await;
                 } else {
-                    let _ = cache::save_order_to_book(&dragonfly, updated).await;
+                    let _ = cache::save_order_to_book(&redis, updated).await;
                 }
             }
 
@@ -98,9 +98,9 @@ async fn main() -> Result<()> {
             if result.incoming.status == OrderStatus::New
                 || result.incoming.status == OrderStatus::PartiallyFilled
             {
-                let _ = cache::save_order_to_book(&dragonfly, &result.incoming).await;
+                let _ = cache::save_order_to_book(&redis, &result.incoming).await;
             } else {
-                let _ = cache::remove_order_from_book(&dragonfly, &result.incoming).await;
+                let _ = cache::remove_order_from_book(&redis, &result.incoming).await;
             }
 
             // Persist to DB
@@ -120,7 +120,7 @@ async fn main() -> Result<()> {
 
             // Publish trades to transaction stream
             for trade in &result.trades {
-                if let Err(e) = streams::publish(&dragonfly, STREAM_TRANSACTIONS, trade).await {
+                if let Err(e) = streams::publish(&redis, STREAM_TRANSACTIONS, trade).await {
                     tracing::error!(error = %e, "failed to publish trade to stream");
                 }
             }
@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
             lock_guard.release().await;
 
             // Acknowledge the stream message
-            let _ = streams::ack(&dragonfly, STREAM_ORDERS_MATCH, CONSUMER_GROUP, &msg_id).await;
+            let _ = streams::ack(&redis, STREAM_ORDERS_MATCH, CONSUMER_GROUP, &msg_id).await;
 
             tracing::info!(
                 order_id = %order.id,

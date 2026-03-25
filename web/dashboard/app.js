@@ -36,7 +36,7 @@ async function fetchMetrics() {
         animateValue('kpi-pairs', metricsData.active_pairs || 0);
         animateValue('kpi-workers', metricsData.active_workers || 0);
 
-        // Lock metrics from real Dragonfly data
+        // Lock metrics from real Valkey data
         setText('lock-contention', ((locksData.contention_rate || 0) * 100).toFixed(1) + '%');
         setText('lock-wait', (locksData.avg_wait_ms || 0).toFixed(2) + ' ms');
         setText('lock-retries', locksData.retry_count || 0);
@@ -55,7 +55,7 @@ async function fetchMetrics() {
         pushData(throughputData, now, { values: latestCount });
         drawThroughputChart(tpData.series || []);
 
-        // Latency chart — real P50/P95/P99 from Dragonfly samples
+        // Latency chart — real P50/P95/P99 from Valkey samples
         const p50 = latData.p50 || 0;
         const p95 = latData.p95 || 0;
         const p99 = latData.p99 || 0;

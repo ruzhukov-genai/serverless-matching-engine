@@ -38,7 +38,7 @@ use sme_shared::{
 /// Minimal AppState for the worker Lambda.
 /// Initialized once on first invocation, reused on warm starts.
 struct WorkerState {
-    dragonfly: deadpool_redis::Pool,
+    redis: deadpool_redis::Pool,
     pg: sqlx::PgPool,
     pairs_cache: Arc<HashMap<String, PairConfig>>,
     pair_keys: Arc<HashMap<String, PairKeys>>,
@@ -63,15 +63,15 @@ async fn get_state() -> Result<&'static WorkerState> {
 
     tracing::info!("get_state: initializing worker (cold start)");
 
-    let dragonfly_url = std::env::var("DRAGONFLY_URL")
+    let redis_url = std::env::var("REDIS_URL")
         .unwrap_or_else(|_| "redis://localhost:6379".to_string());
     let database_url = std::env::var("DATABASE_URL")
         .context("DATABASE_URL env var required")?;
 
     // Minimal pool for Lambda — each instance processes one order at a time
-    tracing::info!("get_state: connecting to Dragonfly");
-    let dragonfly = cache::create_pool_sized(&dragonfly_url, 2).await
-        .context("failed to create Dragonfly pool")?;
+    tracing::info!("get_state: connecting to Valkey");
+    let redis = cache::create_pool_sized(&redis_url, 2).await
+        .context("failed to create Valkey pool")?;
 
     tracing::info!("get_state: creating PG pool (lazy)");
     let pg = sqlx::postgres::PgPoolOptions::new()
@@ -99,7 +99,7 @@ async fn get_state() -> Result<&'static WorkerState> {
     // Uses a sentinel key to avoid 40+ concurrent Lambdas all trying to seed simultaneously.
     // The first Lambda to cold-start seeds; subsequent ones skip.
     let needs_seed = {
-        let mut conn = dragonfly.get().await.context("pool.get for seed check")?;
+        let mut conn = redis.get().await.context("pool.get for seed check")?;
         let exists: bool = redis::cmd("EXISTS")
             .arg("cache:pairs")
             .query_async(&mut *conn)
@@ -112,20 +112,20 @@ async fn get_state() -> Result<&'static WorkerState> {
         tracing::info!("cache not populated — seeding from PG");
 
         // Initialize balance cache from PG (needed for Lua balance-lock to work)
-        cache::init_balances_from_pg(&dragonfly, &pg).await
+        cache::init_balances_from_pg(&redis, &pg).await
             .context("failed to init balance cache")?;
 
         // Seed order book ZSETs from PG resting orders
-        cache::seed_orderbook_from_pg(&dragonfly, &pg).await
+        cache::seed_orderbook_from_pg(&redis, &pg).await
             .context("failed to seed orderbook from PG")?;
 
         // Seed cache:pairs (Gateway reads this for /api/pairs)
-        seed_pairs_cache(&dragonfly, &pg).await
+        seed_pairs_cache(&redis, &pg).await
             .context("failed to seed cache:pairs")?;
 
         // Seed ticker cache from recent trades
         let pair_ids: Vec<String> = pairs_cache.keys().cloned().collect();
-        cache::seed_ticker_from_pg(&dragonfly, &pg, &pair_ids).await
+        cache::seed_ticker_from_pg(&redis, &pg, &pair_ids).await
             .context("failed to seed ticker cache from PG")?;
 
         tracing::info!("cache seeding complete");
@@ -133,7 +133,7 @@ async fn get_state() -> Result<&'static WorkerState> {
         tracing::info!("cache already populated — skipping seed");
     }
 
-    let state = WorkerState { dragonfly, pg, pairs_cache, pair_keys };
+    let state = WorkerState { redis, pg, pairs_cache, pair_keys };
 
     // Ignore error if another invocation raced us (OnceCell guarantees only one wins)
     let _ = STATE.set(state);
@@ -162,7 +162,7 @@ async fn load_pairs_cache(pg: &sqlx::PgPool) -> Result<HashMap<String, PairConfi
 }
 
 /// Seed cache:pairs from PG so the Gateway's /api/pairs endpoint returns valid JSON.
-async fn seed_pairs_cache(dragonfly: &deadpool_redis::Pool, pg: &sqlx::PgPool) -> Result<()> {
+async fn seed_pairs_cache(redis: &deadpool_redis::Pool, pg: &sqlx::PgPool) -> Result<()> {
     let rows = sqlx::query(
         "SELECT id, base, quote, tick_size, lot_size, min_order_size, max_order_size, \
          price_precision, qty_precision, price_band_pct, active \
@@ -192,7 +192,7 @@ async fn seed_pairs_cache(dragonfly: &deadpool_redis::Pool, pg: &sqlx::PgPool) -
 
     let pairs_json = json!({"pairs": pairs});
     let pairs_str = serde_json::to_string(&pairs_json)?;
-    cache::set_and_publish(dragonfly, "cache:pairs", &pairs_str).await?;
+    cache::set_and_publish(redis, "cache:pairs", &pairs_str).await?;
     tracing::info!(count = pairs.len(), "cache:pairs seeded");
     Ok(())
 }
@@ -252,10 +252,10 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, LambdaError> {
 ///
 /// Lightweight commands (run_migrations, exec_sql) use a standalone PG connection
 /// so they can run before full worker initialization.
-/// Stateful commands (reset_all, etc.) call get_state() for Dragonfly access.
+/// Stateful commands (reset_all, etc.) call get_state() for Valkey access.
 async fn handle_manage(command: &str, args: &Value) -> Result<Value, LambdaError> {
     match command {
-        // ── Lightweight (standalone PG, no Dragonfly) ────────────────
+        // ── Lightweight (standalone PG, no Valkey) ────────────────
         "run_migrations" => {
             tracing::info!("manage: running migrations");
             let pg = standalone_pg().await?;
@@ -283,7 +283,7 @@ async fn handle_manage(command: &str, args: &Value) -> Result<Value, LambdaError
             Ok(json!({"status": "ok", "command": "query", "result": cnt}))
         }
 
-        // ── Stateful (needs Dragonfly + PG via get_state) ────────────
+        // ── Stateful (needs Valkey + PG via get_state) ────────────
         "reset_balances" => {
             let state = get_state().await?;
             tracing::info!("manage: resetting balances");
@@ -298,7 +298,7 @@ async fn handle_manage(command: &str, args: &Value) -> Result<Value, LambdaError
                      ON CONFLICT (user_id, asset) DO UPDATE SET available = 1000000, locked = 0"
                 ).bind(&user).execute(&state.pg).await.map_err(|e| LambdaError::from(e.to_string()))?;
             }
-            cache::init_balances_from_pg(&state.dragonfly, &state.pg).await
+            cache::init_balances_from_pg(&state.redis, &state.pg).await
                 .map_err(|e| LambdaError::from(e.to_string()))?;
             tracing::info!("manage: balances reset for 10 users");
             Ok(json!({"status": "ok", "command": "reset_balances", "users": 10}))
@@ -308,7 +308,7 @@ async fn handle_manage(command: &str, args: &Value) -> Result<Value, LambdaError
             tracing::info!("manage: truncating orders and trades");
             sqlx::query("TRUNCATE orders CASCADE").execute(&state.pg).await
                 .map_err(|e| LambdaError::from(e.to_string()))?;
-            let mut conn = state.dragonfly.get().await
+            let mut conn = state.redis.get().await
                 .map_err(|e| LambdaError::from(e.to_string()))?;
             for pair in state.pairs_cache.keys() {
                 let _: () = redis::cmd("DEL")
@@ -337,9 +337,9 @@ async fn handle_manage(command: &str, args: &Value) -> Result<Value, LambdaError
                      ON CONFLICT (user_id, asset) DO UPDATE SET available = 1000000, locked = 0"
                 ).bind(&user).execute(&state.pg).await.map_err(|e| LambdaError::from(e.to_string()))?;
             }
-            cache::init_balances_from_pg(&state.dragonfly, &state.pg).await
+            cache::init_balances_from_pg(&state.redis, &state.pg).await
                 .map_err(|e| LambdaError::from(e.to_string()))?;
-            let mut conn = state.dragonfly.get().await
+            let mut conn = state.redis.get().await
                 .map_err(|e| LambdaError::from(e.to_string()))?;
             for pair in state.pairs_cache.keys() {
                 let _: () = redis::cmd("DEL")
@@ -357,7 +357,7 @@ async fn handle_manage(command: &str, args: &Value) -> Result<Value, LambdaError
 }
 
 /// Create a standalone PG pool (1 connection) for lightweight manage commands.
-/// Doesn't require Dragonfly or full worker state.
+/// Doesn't require Valkey or full worker state.
 async fn standalone_pg() -> Result<sqlx::PgPool, LambdaError> {
     let database_url = std::env::var("DATABASE_URL")
         .map_err(|_| LambdaError::from("DATABASE_URL env var required"))?;
@@ -472,7 +472,7 @@ async fn process_order(state: &WorkerState, payload: &Value) -> Result<()> {
     // 5. Atomic Lua EVAL: balance lock + matching (ADR-004)
     let match_start = std::time::Instant::now();
     let lua_result = cache::match_order_lua(
-        &state.dragonfly,
+        &state.redis,
         &order,
         pair_keys,
         &lock_asset,
@@ -527,7 +527,7 @@ async fn process_order(state: &WorkerState, payload: &Value) -> Result<()> {
     // 9. Push updates to WebSocket subscribers (fire-and-forget, non-critical)
     let ws_endpoint = std::env::var("WS_API_ENDPOINT").unwrap_or_default();
     if !ws_endpoint.is_empty() {
-        push_ws_updates(&state.dragonfly, &pair_id, &ws_endpoint).await;
+        push_ws_updates(&state.redis, &pair_id, &ws_endpoint).await;
     }
 
     let total_ms = total_start.elapsed().as_millis() as u64;
@@ -786,7 +786,7 @@ async fn persist_order(
 
 // ── Cache updates ─────────────────────────────────────────────────────────────
 
-/// Update Dragonfly cache keys after an order is processed.
+/// Update Valkey cache keys after an order is processed.
 /// Rebuilds orderbook snapshot using Lua (single round-trip).
 async fn update_cache_after_processing(
     state: &WorkerState,
@@ -803,7 +803,7 @@ async fn update_cache_after_processing(
     }
 
     // Rebuild orderbook snapshot (Lua single round-trip)
-    let (bids, asks) = cache::orderbook_snapshot_lua(&state.dragonfly, &order.pair_id, 50).await?;
+    let (bids, asks) = cache::orderbook_snapshot_lua(&state.redis, &order.pair_id, 50).await?;
 
     let bids_json: Vec<Value> = bids.iter().map(|(p, q)| json!([p, q])).collect();
     let asks_json: Vec<Value> = asks.iter().map(|(p, q)| json!([p, q])).collect();
@@ -813,7 +813,7 @@ async fn update_cache_after_processing(
         "bids": bids_json,
         "asks": asks_json,
     }))?;
-    cache::set_and_publish(&state.dragonfly, &format!("cache:orderbook:{}", order.pair_id), &orderbook_json).await?;
+    cache::set_and_publish(&state.redis, &format!("cache:orderbook:{}", order.pair_id), &orderbook_json).await?;
 
     // Update trades cache from PG (last 50)
     update_trades_cache(state, &order.pair_id).await?;
@@ -857,7 +857,7 @@ async fn update_trades_cache(state: &WorkerState, pair_id: &str) -> Result<()> {
     }).collect();
 
     let trades_str = serde_json::to_string(&json!({ "pair": pair_id, "trades": trades }))?;
-    cache::set_and_publish(&state.dragonfly, &format!("cache:trades:{}", pair_id), &trades_str).await?;
+    cache::set_and_publish(&state.redis, &format!("cache:trades:{}", pair_id), &trades_str).await?;
     Ok(())
 }
 
@@ -895,7 +895,7 @@ async fn update_ticker_cache(state: &WorkerState, pair_id: &str) -> Result<()> {
     };
 
     let ticker_str = serde_json::to_string(&ticker_json)?;
-    cache::set_and_publish(&state.dragonfly, &format!("cache:ticker:{}", pair_id), &ticker_str).await?;
+    cache::set_and_publish(&state.redis, &format!("cache:ticker:{}", pair_id), &ticker_str).await?;
     Ok(())
 }
 
@@ -903,7 +903,7 @@ async fn update_portfolio_caches(
     state: &WorkerState,
     user_ids: &std::collections::HashSet<String>,
 ) -> Result<()> {
-    let mut conn = state.dragonfly.get().await?;
+    let mut conn = state.redis.get().await?;
     for user_id in user_ids {
         let rows = sqlx::query(
             "SELECT user_id, asset, available, locked FROM balances WHERE user_id = $1 ORDER BY asset",
@@ -932,7 +932,7 @@ async fn update_portfolio_caches(
 
 /// Push cache updates to WebSocket subscribers via API Gateway Management API.
 /// Fire-and-forget: errors are logged but never propagate to the caller.
-/// Stale connections (410 Gone) are removed from Dragonfly automatically.
+/// Stale connections (410 Gone) are removed from Valkey automatically.
 async fn push_ws_updates(
     pool: &deadpool_redis::Pool,
     pair_id: &str,
@@ -1026,7 +1026,7 @@ async fn push_ws_updates(
             }
         }
 
-        // Remove stale connections from Dragonfly
+        // Remove stale connections from Valkey
         for stale_id in &stale_conns {
             let _ = conn.srem::<_, _, ()>("ws:connections", stale_id).await;
             let _ = conn.srem::<_, _, ()>(format!("ws:subs:{}", ch_name), stale_id).await;

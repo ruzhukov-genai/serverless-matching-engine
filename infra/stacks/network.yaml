@@ -203,7 +203,7 @@ Resources:
   EC2SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: EC2 sme backend - Dragonfly PostgreSQL SSH
+      GroupDescription: EC2 sme backend - Valkey PostgreSQL SSH
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -232,7 +232,7 @@ Resources:
         - IpProtocol: tcp
           FromPort: 6379
           ToPort: 6379
-          Description: Dragonfly on EC2
+          Description: Valkey on EC2
           DestinationSecurityGroupId: !Ref EC2SecurityGroup
         - IpProtocol: tcp
           FromPort: 443
@@ -249,13 +249,13 @@ Resources:
   WorkerLambdaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Lambda sme-worker - allows outbound to EC2 (Dragonfly) + RDS (PG)
+      GroupDescription: Lambda sme-worker - allows outbound to EC2 (Valkey) + RDS (PG)
       VpcId: !Ref VPC
       SecurityGroupEgress:
         - IpProtocol: tcp
           FromPort: 6379
           ToPort: 6379
-          Description: Dragonfly on EC2
+          Description: Valkey on EC2
           DestinationSecurityGroupId: !Ref EC2SecurityGroup
         - IpProtocol: tcp
           FromPort: 5432
@@ -289,7 +289,7 @@ Resources:
           FromPort: 5432
           ToPort: 5432
           SourceSecurityGroupId: !Ref EC2SecurityGroup
-          Description: PostgreSQL from EC2 (Dragonfly cache seeding scripts)
+          Description: PostgreSQL from EC2 (Valkey cache seeding scripts)
       SecurityGroupEgress:
         - IpProtocol: -1
           CidrIp: 127.0.0.1/32
@@ -358,7 +358,7 @@ Resources:
       FromPort: 6379
       ToPort: 6379
       SourceSecurityGroupId: !Ref EC2SecurityGroup
-      Description: Redis from EC2 (Dragonfly rollback/migration)
+      Description: Redis from EC2 (Valkey rollback/migration)
 
   # ---- Lambda SG egress to ElastiCache (added separately to avoid circular refs) ----
 
@@ -386,8 +386,8 @@ Resources:
 
   # ---- EC2 ingress rules from Lambda SGs (added separately to avoid circular refs) ----
 
-  # Allow Gateway Lambda -> Dragonfly (6379)
-  EC2IngressDragonfly:
+  # Allow Gateway Lambda -> Valkey (6379)
+  EC2IngressValkey:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
       GroupId: !Ref EC2SecurityGroup
@@ -395,10 +395,10 @@ Resources:
       FromPort: 6379
       ToPort: 6379
       SourceSecurityGroupId: !Ref LambdaSecurityGroup
-      Description: Dragonfly from Gateway Lambda
+      Description: Valkey from Gateway Lambda
 
-  # Allow Worker Lambda -> Dragonfly (6379)
-  EC2IngressDragonflyWorker:
+  # Allow Worker Lambda -> Valkey (6379)
+  EC2IngressValkeyWorker:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
       GroupId: !Ref EC2SecurityGroup
@@ -406,7 +406,7 @@ Resources:
       FromPort: 6379
       ToPort: 6379
       SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
-      Description: Dragonfly from Worker Lambda
+      Description: Valkey from Worker Lambda
 
   # NOTE: VPC Endpoints (Lambda + STS) created manually via CLI.
   # AWS::EC2::VpcEndpoint resource type not available for this account.

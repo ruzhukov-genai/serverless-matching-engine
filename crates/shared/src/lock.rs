@@ -1,4 +1,4 @@
-//! Order Book Locking — distributed per-pair mutex via Dragonfly/Redis SET NX EX.
+//! Order Book Locking — distributed per-pair mutex via Valkey/Redis SET NX EX.
 //!
 //! Uses exponential backoff with jitter.
 //!

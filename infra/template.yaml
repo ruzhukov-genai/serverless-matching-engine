@@ -56,7 +56,7 @@ Parameters:
     Type: String
     Default: 'elasticache'
     AllowedValues: ['ec2', 'elasticache']
-    Description: 'Cache backend: ec2 (Dragonfly on EC2) or elasticache (for quick rollback set to ec2)'
+    Description: 'Cache backend: ec2 (Valkey on EC2) or elasticache (for quick rollback set to ec2)'
 
 # ---------------------------------------------------------------------------
 # Resources — Nested CloudFormation stacks (each is a SAM template)
@@ -145,7 +145,7 @@ Outputs:
     Value: !GetAtt FrontendStack.Outputs.FrontendBucketName
 
   EC2PrivateIP:
-    Description: EC2 private IP (used by Lambda for Dragonfly)
+    Description: EC2 private IP (used by Lambda for Valkey)
     Value: !GetAtt BackendStack.Outputs.EC2PrivateIP
 
   RDSEndpoint:

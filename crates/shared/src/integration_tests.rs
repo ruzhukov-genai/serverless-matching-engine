@@ -1,4 +1,4 @@
-//! Integration tests — require running Dragonfly (6379) + PostgreSQL (5432).
+//! Integration tests — require running Valkey (6379) + PostgreSQL (5432).
 //! Run with: cargo test --features integration -- --test-threads=1
 //!
 //! These tests use unique pair_ids to avoid cross-test interference in cache,
@@ -17,10 +17,10 @@ mod tests {
 
     // ── Helpers ───────────────────────────────────────────────────────────
 
-    async fn dragonfly_pool() -> deadpool_redis::Pool {
+    async fn redis_pool() -> deadpool_redis::Pool {
         cache::create_pool("redis://localhost:6379")
             .await
-            .expect("connect to dragonfly")
+            .expect("connect to redis")
     }
 
     async fn pg_pool() -> sqlx::PgPool {
@@ -81,13 +81,13 @@ mod tests {
 
     #[tokio::test]
     async fn cache_health_check() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         cache::health_check(&pool).await.expect("health check should pass");
     }
 
     #[tokio::test]
     async fn cache_save_and_load_bid() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-CACHE-BID";
         cleanup_pair(&pool, pair).await;
 
@@ -105,7 +105,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_save_and_load_ask() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-CACHE-ASK";
         cleanup_pair(&pool, pair).await;
 
@@ -123,7 +123,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_load_empty_book() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-EMPTY-BOOK";
         cleanup_pair(&pool, pair).await;
 
@@ -133,7 +133,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_asks_sorted_by_price_asc() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-ASK-SORT";
         cleanup_pair(&pool, pair).await;
 
@@ -158,7 +158,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_bids_sorted_by_price_desc() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-BID-SORT";
         cleanup_pair(&pool, pair).await;
 
@@ -183,7 +183,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_remove_order() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-REMOVE";
         cleanup_pair(&pool, pair).await;
 
@@ -207,7 +207,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_get_order() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-GET";
         cleanup_pair(&pool, pair).await;
 
@@ -227,7 +227,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_update_order_in_place() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-UPDATE";
         cleanup_pair(&pool, pair).await;
 
@@ -249,7 +249,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_version_increment() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-VERSION";
         cleanup_pair(&pool, pair).await;
 
@@ -269,7 +269,7 @@ mod tests {
 
     #[tokio::test]
     async fn lock_acquire_and_release() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-LOCK-1";
         cleanup_pair(&pool, pair).await;
 
@@ -288,7 +288,7 @@ mod tests {
 
     #[tokio::test]
     async fn lock_prevents_concurrent_acquisition() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-LOCK-2";
         cleanup_pair(&pool, pair).await;
 
@@ -321,7 +321,7 @@ mod tests {
 
     #[tokio::test]
     async fn lock_ttl_expires() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-LOCK-TTL";
         cleanup_pair(&pool, pair).await;
 
@@ -342,7 +342,7 @@ mod tests {
 
     #[tokio::test]
     async fn lock_release_only_own() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-LOCK-OWN";
         cleanup_pair(&pool, pair).await;
 
@@ -372,7 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn lock_different_pairs_independent() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair_a = "TEST-LOCK-PAIR-A";
         let pair_b = "TEST-LOCK-PAIR-B";
         cleanup_pair(&pool, pair_a).await;
@@ -540,7 +540,7 @@ mod tests {
     async fn full_cycle_lock_load_match_write() {
         use crate::engine::match_order;
 
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-FULLCYCLE";
         cleanup_pair(&pool, pair).await;
 
@@ -592,7 +592,7 @@ mod tests {
     async fn full_cycle_complete_fill_removes_from_book() {
         use crate::engine::match_order;
 
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-FULLCYCLE-FILL";
         cleanup_pair(&pool, pair).await;
 
@@ -624,7 +624,7 @@ mod tests {
     async fn full_cycle_multiple_fills_across_levels() {
         use crate::engine::match_order;
 
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-FULLCYCLE-MULTI";
         cleanup_pair(&pool, pair).await;
 
@@ -675,7 +675,7 @@ mod tests {
 
     #[tokio::test]
     async fn full_cycle_lock_contention_sequential() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-CONTENTION";
         cleanup_pair(&pool, pair).await;
 
@@ -714,7 +714,7 @@ mod tests {
     async fn collision_two_buyers_one_ask() {
         use crate::engine::match_order;
 
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-COLLISION-2B1A";
         cleanup_pair(&pool, pair).await;
 
@@ -788,7 +788,7 @@ mod tests {
     async fn collision_two_sellers_one_bid() {
         use crate::engine::match_order;
 
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-COLLISION-2S1B";
         cleanup_pair(&pool, pair).await;
 
@@ -857,7 +857,7 @@ mod tests {
     async fn double_sell_same_order() {
         use crate::engine::match_order;
 
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-DOUBLE-SELL";
         cleanup_pair(&pool, pair).await;
 
@@ -896,7 +896,7 @@ mod tests {
     async fn sequencing_three_sells_one_large_bid() {
         use crate::engine::match_order;
 
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-SEQ-3S1B";
         cleanup_pair(&pool, pair).await;
 
@@ -948,7 +948,7 @@ mod tests {
     async fn collision_5_sellers_sequential_exact_fill() {
         use crate::engine::match_order;
 
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-COLLISION-5S";
         cleanup_pair(&pool, pair).await;
 
@@ -1004,7 +1004,7 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU64, Ordering};
 
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-COLLISION-CS";
         cleanup_pair(&pool, pair).await;
 
@@ -1062,7 +1062,7 @@ mod tests {
     async fn double_fill_prevention_stale_read() {
         use crate::engine::match_order;
 
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-STALE-READ";
         cleanup_pair(&pool, pair).await;
 
@@ -1102,7 +1102,7 @@ mod tests {
     async fn sequencing_interleaved_buy_sell() {
         use crate::engine::match_order;
 
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-INTERLEAVE";
         cleanup_pair(&pool, pair).await;
 
@@ -1168,7 +1168,7 @@ mod tests {
     async fn sequencing_partial_cascade_with_versioning() {
         use crate::engine::match_order;
 
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-CASCADE-VER";
         cleanup_pair(&pool, pair).await;
 
@@ -1219,7 +1219,7 @@ mod tests {
     async fn collision_cross_pair_isolation() {
         use crate::engine::match_order;
 
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair_btc = "TEST-ISO-BTC";
         let pair_eth = "TEST-ISO-ETH";
         cleanup_pair(&pool, pair_btc).await;
@@ -1265,7 +1265,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_filtered_asks_by_buy_price() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-FILT-ASK";
         cleanup_pair(&pool, pair).await;
 
@@ -1293,7 +1293,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_filtered_bids_by_sell_price() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-FILT-BID";
         cleanup_pair(&pool, pair).await;
 
@@ -1321,7 +1321,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_batched_loading() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-BATCH";
         cleanup_pair(&pool, pair).await;
 
@@ -1359,7 +1359,7 @@ mod tests {
 
     #[tokio::test]
     async fn lock_is_locked_and_fence() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-DIAG";
         cleanup_pair(&pool, pair).await;
 
@@ -1391,7 +1391,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_get_version_non_mutating() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-GETVER";
         cleanup_pair(&pool, pair).await;
 
@@ -1507,7 +1507,7 @@ mod tests {
         // After: buyer has 1 BTC + 950K USDT, seller has 99 BTC + 50K USDT
         use crate::engine::match_order;
 
-        let df = dragonfly_pool().await;
+        let df = redis_pool().await;
         let pg = pg_pool().await;
         db::run_migrations(&pg).await.unwrap();
         let (pair, buyer, seller) = setup_balance_test(&pg, "FULL").await;
@@ -1563,7 +1563,7 @@ mod tests {
         // Seller: 1 BTC locked (remaining), buyer: fully filled
         use crate::engine::match_order;
 
-        let df = dragonfly_pool().await;
+        let df = redis_pool().await;
         let pg = pg_pool().await;
         db::run_migrations(&pg).await.unwrap();
         let (pair, buyer, seller) = setup_balance_test(&pg, "PARTIAL").await;
@@ -1618,7 +1618,7 @@ mod tests {
         // Buyer pays different prices per level (price improvement)
         use crate::engine::match_order;
 
-        let df = dragonfly_pool().await;
+        let df = redis_pool().await;
         let pg = pg_pool().await;
         db::run_migrations(&pg).await.unwrap();
 
@@ -1716,7 +1716,7 @@ mod tests {
         // Total BTC transferred = 1, total USDT transferred = 50000. No double-spend.
         use crate::engine::match_order;
 
-        let df = dragonfly_pool().await;
+        let df = redis_pool().await;
         let pg = pg_pool().await;
         db::run_migrations(&pg).await.unwrap();
 
@@ -1817,7 +1817,7 @@ mod tests {
         // Symmetric: two sellers race for 1 bid. Conservation of value must hold.
         use crate::engine::match_order;
 
-        let df = dragonfly_pool().await;
+        let df = redis_pool().await;
         let pg = pg_pool().await;
         db::run_migrations(&pg).await.unwrap();
 
@@ -1908,7 +1908,7 @@ mod tests {
         // After all 5: buyer has 5 BTC, 750K USDT. Each seller has 9 BTC, 50K USDT.
         use crate::engine::match_order;
 
-        let df = dragonfly_pool().await;
+        let df = redis_pool().await;
         let pg = pg_pool().await;
         db::run_migrations(&pg).await.unwrap();
 
@@ -2088,7 +2088,7 @@ mod tests {
     async fn metrics_record_and_read() {
         use crate::metrics;
 
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "TEST-METRICS";
 
         // Clean up metrics keys
@@ -2146,7 +2146,7 @@ mod tests {
     /// Basic cross: resting ask, then crossing bid → trade, ask removed from book.
     #[tokio::test]
     async fn test_lua_matching_basic_cross() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "LUA-BASIC-CROSS";
         cleanup_pair(&pool, pair).await;
 
@@ -2182,7 +2182,7 @@ mod tests {
     /// Partial fill: large resting ask, smaller crossing bid → partial fill, ask updated.
     #[tokio::test]
     async fn test_lua_matching_partial_fill() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "LUA-PARTIAL";
         cleanup_pair(&pool, pair).await;
 
@@ -2214,7 +2214,7 @@ mod tests {
     /// No cross: bid below best ask → no trades, bid rests in book.
     #[tokio::test]
     async fn test_lua_matching_no_cross() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "LUA-NO-CROSS";
         cleanup_pair(&pool, pair).await;
 
@@ -2250,7 +2250,7 @@ mod tests {
     /// Multi-level sweep: 3 asks at different prices, large bid walks through all 3.
     #[tokio::test]
     async fn test_lua_matching_multi_level() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "LUA-MULTI-LEVEL";
         cleanup_pair(&pool, pair).await;
 
@@ -2287,7 +2287,7 @@ mod tests {
     /// Resting ask gets cancelled, no trade, bid rests.
     #[tokio::test]
     async fn test_lua_matching_stp_cancel_maker() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "LUA-STP-CM";
         cleanup_pair(&pool, pair).await;
 
@@ -2480,7 +2480,7 @@ mod tests {
     /// Save an order via save_order_to_book, fetch via get_order, verify all fields.
     #[tokio::test]
     async fn test_save_and_fetch_order_new_hash_format() {
-        let pool = dragonfly_pool().await;
+        let pool = redis_pool().await;
         let pair = "LUA-HASH-FMT";
         cleanup_pair(&pool, pair).await;
 

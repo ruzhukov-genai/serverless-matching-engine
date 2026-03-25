@@ -60,7 +60,7 @@ pub async fn create_pool(url: &str) -> Result<Pool> {
     create_pool_sized(url, 200).await
 }
 
-/// Create a Dragonfly connection pool with a specific max size.
+/// Create a Valkey connection pool with a specific max size.
 /// Use smaller pools where fewer connections are needed (e.g. gateway: ~20).
 pub async fn create_pool_sized(url: &str, max_size: usize) -> Result<Pool> {
     let pool = DPConfig::from_url(url)
@@ -79,7 +79,7 @@ pub async fn create_pool_sized(url: &str, max_size: usize) -> Result<Pool> {
 /// Channel name for cache update pub/sub notifications.
 pub const CACHE_UPDATES_CHANNEL: &str = "cache_updates";
 
-/// SET a cache key in Dragonfly AND PUBLISH the update for gateway subscribers.
+/// SET a cache key in Valkey AND PUBLISH the update for gateway subscribers.
 /// Format: "key\nvalue" — simple, zero-allocation parse on the subscriber side.
 pub async fn set_and_publish(pool: &Pool, key: &str, value: &str) -> Result<()> {
     let mut conn = pool.get().await.context("pool.get")?;
@@ -105,7 +105,7 @@ pub async fn health_check(pool: &Pool) -> Result<()> {
 
 // ── Pre-computed per-pair key strings ────────────────────────────────────────
 
-/// Holds the three static Dragonfly key strings for one trading pair.
+/// Holds the three static Valkey key strings for one trading pair.
 /// Computed once at startup and stored in AppState — avoids 3 format! calls
 /// on every order on the hot path.
 #[derive(Clone, Debug)]
@@ -476,11 +476,11 @@ pub async fn load_order_book_batched(
     fetch_orders_by_ids(pool, &ids).await
 }
 
-// ── Balance locking via Dragonfly (replaces PG hot-path lock) ─────────────────
+// ── Balance locking via Valkey (replaces PG hot-path lock) ─────────────────
 
-/// Lock balance in Dragonfly atomically via Lua EVAL.
+/// Lock balance in Valkey atomically via Lua EVAL.
 /// Eliminates the TOCTOU race in the previous HGET + pipeline approach.
-pub async fn lock_balance_dragonfly(
+pub async fn lock_balance_redis(
     pool: &Pool,
     user_id: &str,
     asset: &str,
@@ -508,8 +508,8 @@ pub async fn lock_balance_dragonfly(
     }
 }
 
-/// Release locked balance back to available in Dragonfly.
-pub async fn unlock_balance_dragonfly(
+/// Release locked balance back to available in Valkey.
+pub async fn unlock_balance_redis(
     pool: &Pool,
     user_id: &str,
     asset: &str,
@@ -526,7 +526,7 @@ pub async fn unlock_balance_dragonfly(
     Ok(())
 }
 
-/// Initialize Dragonfly balance keys from PG (called at startup).
+/// Initialize Valkey balance keys from PG (called at startup).
 pub async fn init_balances_from_pg(pool: &Pool, pg: &sqlx::PgPool) -> Result<()> {
     use sqlx::Row;
     let rows = sqlx::query("SELECT user_id, asset, available, locked FROM balances")
@@ -553,7 +553,7 @@ pub async fn init_balances_from_pg(pool: &Pool, pg: &sqlx::PgPool) -> Result<()>
             .await
             .context("HSET balance")?;
     }
-    tracing::info!(count = rows.len(), "initialized Dragonfly balance keys from PG");
+    tracing::info!(count = rows.len(), "initialized Valkey balance keys from PG");
     Ok(())
 }
 
@@ -561,7 +561,7 @@ pub async fn init_balances_from_pg(pool: &Pool, pg: &sqlx::PgPool) -> Result<()>
 ///
 /// Queries PG for all GTC orders with status IN ('New', 'PartiallyFilled') and
 /// rebuilds `book:{pair_id}:bids`, `book:{pair_id}:asks`, and `order:{id}` HASHes
-/// in Dragonfly. Safe to call on a fresh (empty) cache — idempotent.
+/// in Valkey. Safe to call on a fresh (empty) cache — idempotent.
 ///
 /// Call this after `init_balances_from_pg()` on cold start so the Lua matching
 /// script finds resting orders when the cache backend is new (e.g. after switching
@@ -935,7 +935,7 @@ pub async fn load_order_book_snapshot(
 
 /// The Lua CAS script — atomically checks version, applies ZSet mutations, increments version.
 ///
-/// All accessed keys are declared in KEYS[] (Dragonfly/Redis cluster compatibility).
+/// All accessed keys are declared in KEYS[] (Valkey/Redis cluster compatibility).
 /// Order hash data is pre-written by the caller (Phase 1) before this script runs (Phase 2).
 ///
 /// KEYS: [1]=version, [2]=bids_zset, [3]=asks_zset, [4..4+N-1]=order hash keys (one per mutation)
@@ -1137,10 +1137,10 @@ fn redis_value_to_string(v: &redis::Value) -> Option<String> {
     }
 }
 
-/// Match an incoming order atomically inside Dragonfly via a single EVAL round-trip.
+/// Match an incoming order atomically inside Valkey via a single EVAL round-trip.
 ///
 /// The Lua script calls ZRANGEBYSCORE internally to fetch resting order IDs,
-/// then accesses their hashes directly. Dragonfly (non-cluster) allows undeclared
+/// then accesses their hashes directly. Valkey (non-cluster) allows undeclared
 /// key access in scripts — no Phase 1 round-trip needed.
 ///
 /// The balance lock is now merged into this EVAL (Opt 1) — saves 1 round-trip.

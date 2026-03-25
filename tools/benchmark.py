@@ -110,9 +110,9 @@ def db_stats():
         return json.loads(out)
     except: return {}
 
-def dragonfly_stats():
+def valkey_stats():
     try:
-        out = subprocess.check_output(["docker", "exec", "sme-dragonfly", "redis-cli", "INFO", "clients"], text=True)
+        out = subprocess.check_output(["docker", "exec", "sme-valkey", "redis-cli", "INFO", "clients"], text=True)
         for line in out.split('\n'):
             if line.startswith('connected_clients:'):
                 return {"df_clients": int(line.split(':')[1].strip())}
@@ -302,7 +302,7 @@ async def run_benchmark():
 
         snap_before = server_snapshot()
         db_before = db_stats()
-        df_before = dragonfly_stats()
+        df_before = valkey_stats()
 
         deadline = time.monotonic() + TEST_DURATION
 
@@ -320,7 +320,7 @@ async def run_benchmark():
 
         snap_after = server_snapshot()
         db_after = db_stats()
-        df_after = dragonfly_stats()
+        df_after = valkey_stats()
         merged = merge_stats(client_stats)
 
         # Peak server metrics
@@ -359,7 +359,7 @@ async def run_benchmark():
         print(f"\n  🔌 Server Resources (peak during test):")
         print(f"    CPU: {peak_cpu}%  |  Mem: {peak_mem} MB  |  Threads: {peak_threads}")
         print(f"    TCP conns: {peak_conns}  |  FDs: {peak_fds}  |  PG conns: {db_after.get('pg_conns','?')}")
-        print(f"    Dragonfly clients: {df_after.get('df_clients','?')}")
+        print(f"    Valkey clients: {df_after.get('df_clients','?')}")
 
         all_results.append({
             "clients": num_clients,

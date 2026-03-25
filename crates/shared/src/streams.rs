@@ -1,4 +1,4 @@
-//! Dragonfly Streams helpers — XADD, XREADGROUP, XACK, XGROUP CREATE wrappers.
+//! Valkey Streams helpers — XADD, XREADGROUP, XACK, XGROUP CREATE wrappers.
 //!
 //! Data is serialized/deserialized using MessagePack (rmp-serde).
 

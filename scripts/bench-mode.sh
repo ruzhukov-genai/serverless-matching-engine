@@ -16,7 +16,7 @@ if [[ "$MODE" == "on" ]]; then
     sysctl -w net.ipv4.tcp_max_syn_backlog=8192
     sysctl -w net.ipv4.tcp_tw_reuse=1
 
-    # Memory overcommit (Dragonfly recommends this)
+    # Memory overcommit (Valkey recommends this)
     sysctl -w vm.overcommit_memory=1
 
     # Disable transparent hugepages (reduces latency jitter)

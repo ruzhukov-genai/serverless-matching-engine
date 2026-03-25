@@ -67,7 +67,7 @@ impl CacheBroadcasts {
 /// Order dispatch mode — controls how gateway forwards orders to the worker.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DispatchMode {
-    /// LPUSH to Dragonfly queue (local dev / EC2 worker)
+    /// LPUSH to Valkey queue (local dev / EC2 worker)
     Queue,
     /// Async Lambda invoke (AWS production)
     Lambda,
@@ -75,12 +75,12 @@ pub enum DispatchMode {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub dragonfly: RedisPool,
+    pub redis: RedisPool,
     /// Order events broadcast — single channel, WS clients filter by user_id
     pub order_events_tx: broadcast::Sender<String>,
     /// Shared cache broadcasts — one poller per key, N subscribers
     pub cache: CacheBroadcasts,
-    /// Per-user TTL cache — avoids Dragonfly round-trips for orders/portfolio
+    /// Per-user TTL cache — avoids Valkey round-trips for orders/portfolio
     pub user_cache: routes::UserCache,
     /// Order dispatch mode: "queue" (default) or "lambda"
     pub dispatch_mode: DispatchMode,
@@ -90,11 +90,11 @@ pub struct AppState {
     pub worker_lambda_arn: String,
 }
 
-/// Subscribe to Dragonfly pub/sub channel for cache updates.
+/// Subscribe to Valkey pub/sub channel for cache updates.
 /// Replaces 15 per-key polling tasks with a single subscriber.
 /// Message format: "key\nvalue" (key on first line, rest is JSON value).
 async fn spawn_cache_subscriber(
-    dragonfly_url: String,
+    redis_url: String,
     cache: CacheBroadcasts,
 ) {
     use deadpool_redis::redis::Client;
@@ -102,7 +102,7 @@ async fn spawn_cache_subscriber(
 
     loop {
         // Create a dedicated connection for SUBSCRIBE (can't use pool — blocks)
-        let client = match Client::open(dragonfly_url.as_str()) {
+        let client = match Client::open(redis_url.as_str()) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "failed to create redis client for pub/sub");
@@ -201,7 +201,7 @@ async fn main() -> Result<()> {
     // - 15 cache pollers (transient checkout per interval)
     // - Order LPUSH burst (~10 concurrent at peak)
     // - Per-user fallback reads (declining with TTL cache)
-    let dragonfly = sme_shared::cache::create_pool_sized(&config.dragonfly_url, 30).await?;
+    let redis = sme_shared::cache::create_pool_sized(&config.redis_url, 30).await?;
 
     // Order events broadcast — single channel, WS clients filter by user_id
     let (order_events_tx, _) = broadcast::channel::<String>(1024);
@@ -241,7 +241,7 @@ async fn main() -> Result<()> {
     // Warm cache: one-time GET for all keys (pub/sub only delivers new messages)
     {
         use deadpool_redis::redis::AsyncCommands;
-        if let Ok(mut conn) = dragonfly.get().await {
+        if let Ok(mut conn) = redis.get().await {
             for (key, _) in &poll_specs {
                 if let Ok(val) = conn.get::<_, String>(key).await {
                     if !val.is_empty() && val != "{}" {
@@ -250,19 +250,19 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        tracing::info!(keys = poll_specs.len(), "cache warmed from Dragonfly");
+        tracing::info!(keys = poll_specs.len(), "cache warmed from Valkey");
     }
 
     // Single pub/sub subscriber replaces 15 per-key pollers
     let all_keys: Vec<String> = poll_specs.iter().map(|(k, _)| k.clone()).collect();
     tokio::spawn(spawn_cache_subscriber(
-        config.dragonfly_url.clone(),
+        config.redis_url.clone(),
         cache.clone(),
     ));
 
     // Slow fallback poller (every 30s) — handles missed messages during reconnection
     tokio::spawn(spawn_fallback_poller(
-        dragonfly.clone(),
+        redis.clone(),
         cache.clone(),
         all_keys,
     ));
@@ -289,7 +289,7 @@ async fn main() -> Result<()> {
     };
 
     let state = AppState {
-        dragonfly: dragonfly.clone(),
+        redis: redis.clone(),
         order_events_tx,
         cache: cache.clone(),
         user_cache: routes::UserCache::new(),
@@ -299,7 +299,7 @@ async fn main() -> Result<()> {
     };
 
     let app = Router::new()
-        // Trading API - all read from Dragonfly cache
+        // Trading API - all read from Valkey cache
         .route("/api/pairs", get(routes::list_pairs))
         .route("/api/orderbook/{pair_id}", get(routes::get_orderbook))
         .route("/api/trades/{pair_id}", get(routes::get_trades))
@@ -319,7 +319,7 @@ async fn main() -> Result<()> {
         .route("/ws/orderbook/{pair_id}", get(routes::ws_orderbook))
         .route("/ws/trades/{pair_id}", get(routes::ws_trades))
         .route("/ws/orders/{user_id}", get(routes::ws_orders))
-        // Dashboard API - all read from Dragonfly cache
+        // Dashboard API - all read from Valkey cache
         .route("/api/metrics", get(routes::get_metrics))
         .route("/api/metrics/locks", get(routes::get_lock_metrics))
         .route("/api/metrics/throughput", get(routes::get_throughput))
@@ -341,7 +341,7 @@ async fn main() -> Result<()> {
         let req_count = request_count.clone();
         let ws_conns = ws_connections.clone();
         let cache_ref = cache.clone();
-        let pool_ref = dragonfly.clone();
+        let pool_ref = redis.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {

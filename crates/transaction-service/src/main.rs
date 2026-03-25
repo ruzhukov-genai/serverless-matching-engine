@@ -17,18 +17,18 @@ async fn main() -> Result<()> {
     tracing::info!("transaction-service starting");
 
     let config = Config::from_env();
-    let dragonfly = cache::create_pool(&config.dragonfly_url).await?;
+    let redis = cache::create_pool(&config.redis_url).await?;
     let pg = sme_shared::db::create_pool(&config.database_url).await?;
     sme_shared::db::run_migrations(&pg).await?;
 
     let worker_id = format!("ts-{}", Uuid::new_v4());
-    streams::create_consumer_group(&dragonfly, STREAM_TRANSACTIONS, CONSUMER_GROUP).await?;
+    streams::create_consumer_group(&redis, STREAM_TRANSACTIONS, CONSUMER_GROUP).await?;
 
     tracing::info!("entering consumer loop");
 
     loop {
         let messages =
-            streams::consume(&dragonfly, STREAM_TRANSACTIONS, CONSUMER_GROUP, &worker_id, 10)
+            streams::consume(&redis, STREAM_TRANSACTIONS, CONSUMER_GROUP, &worker_id, 10)
                 .await?;
 
         for msg in messages {
@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
                 Err(e) => {
                     tracing::error!(error = %e, "failed to deserialize trade");
                     let _ =
-                        streams::ack(&dragonfly, STREAM_TRANSACTIONS, CONSUMER_GROUP, &msg_id)
+                        streams::ack(&redis, STREAM_TRANSACTIONS, CONSUMER_GROUP, &msg_id)
                             .await;
                     continue;
                 }
@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
             }
 
             let _ =
-                streams::ack(&dragonfly, STREAM_TRANSACTIONS, CONSUMER_GROUP, &msg_id).await;
+                streams::ack(&redis, STREAM_TRANSACTIONS, CONSUMER_GROUP, &msg_id).await;
             tracing::info!(trade_id = %trade.id, "trade settled");
         }
     }

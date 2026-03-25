@@ -51,7 +51,7 @@ async def warmup(base_url, target_concurrency, warmup_duration=15):
     """
     Warm up Lambda instances by ramping up concurrency gradually.
     Sends orders at increasing concurrency to pre-initialize Lambda instances,
-    PG connection pools, and Dragonfly connections before the real benchmark.
+    PG connection pools, and Valkey connections before the real benchmark.
     """
     # Ramp: 5 → target_concurrency/2 → target_concurrency over warmup_duration
     ramp_levels = [
