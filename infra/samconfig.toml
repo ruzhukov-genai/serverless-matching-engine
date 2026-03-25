@@ -18,4 +18,4 @@ resolve_image_repos = true
 no_fail_on_empty_changeset = true
 # SAM uploads nested stack templates to S3 automatically.
 # Override parameters on first deploy or set them here:
-# parameter_overrides = "KeyPairName=my-key DBPassword=secret123"
+# parameter_overrides = "DBPassword=secret123"

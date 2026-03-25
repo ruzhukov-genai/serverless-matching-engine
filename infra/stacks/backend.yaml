@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
   Serverless Matching Engine - Backend Stack
-  EC2 t4g.micro (Valkey only) + RDS db.t4g.micro (PostgreSQL) + Lambda (gateway + worker) + API Gateway HTTP API.
+  RDS db.t4g.micro (PostgreSQL) + ElastiCache Valkey (cache.t4g.micro) + Lambda (gateway + worker + ws-handler) + API Gateway HTTP API + WebSocket API.
   Lambda functions use AWS::Serverless::Function with PackageType: Image.
 
 # ---------------------------------------------------------------------------
@@ -13,10 +13,6 @@ Parameters:
   ProjectName:
     Type: String
     Default: serverless-matching-engine
-
-  KeyPairName:
-    Type: AWS::EC2::KeyPair::KeyName
-    Description: EC2 key pair for SSH access.
 
   DBPassword:
     Type: String
@@ -29,7 +25,7 @@ Parameters:
     Default: '*'
     Description: CORS allowed origin for API Gateway. Use your CloudFront URL in production.
 
-  # ImageUri parameters removed — SAM builds Docker images via Metadata blocks.
+  # ImageUri parameters removed -- SAM builds Docker images via Metadata blocks.
   # sam build creates ECR images; sam deploy pushes and updates Lambda.
 
   # Network inputs (passed from root template via nested stack outputs)
@@ -48,10 +44,6 @@ Parameters:
   PrivateSubnetB:
     Type: AWS::EC2::Subnet::Id
     Description: Private subnet B from Network stack.
-
-  EC2SecurityGroupId:
-    Type: AWS::EC2::SecurityGroup::Id
-    Description: EC2 security group ID from Network stack.
 
   LambdaSecurityGroupId:
     Type: AWS::EC2::SecurityGroup::Id
@@ -73,103 +65,11 @@ Parameters:
     Type: AWS::EC2::SecurityGroup::Id
     Description: ElastiCache security group ID from Network stack.
 
-  CacheMode:
-    Type: String
-    Default: 'elasticache'
-    AllowedValues: ['ec2', 'elasticache']
-    Description: 'Cache backend: ec2 (Valkey on EC2) or elasticache'
-
-
-# ---------------------------------------------------------------------------
-# Conditions
-# ---------------------------------------------------------------------------
-Conditions:
-  UseElastiCache: !Equals [!Ref CacheMode, 'elasticache']
-
-# ---------------------------------------------------------------------------
-# Mappings - Amazon Linux 2023 ARM64 AMIs per region
-# ---------------------------------------------------------------------------
-Mappings:
-  AmazonLinux2023ArmAmi:
-    us-east-1:
-      AMI: ami-0a9eef82780017c25   # AL2023 arm64 us-east-1
-    us-east-2:
-      AMI: ami-09b7b6f76e4b19aca   # AL2023 arm64 us-east-2
-    us-west-1:
-      AMI: ami-0b3c63d1b69e89b2c   # AL2023 arm64 us-west-1
-    us-west-2:
-      AMI: ami-03f65b8614a860c29   # AL2023 arm64 us-west-2
-    eu-west-1:
-      AMI: ami-0a2e4b86924cbb8d5   # AL2023 arm64 eu-west-1
-    eu-central-1:
-      AMI: ami-065deacbcaac64cf2   # AL2023 arm64 eu-central-1
-    ap-southeast-1:
-      AMI: ami-06c4be2792f419b7b   # AL2023 arm64 ap-southeast-1
-    ap-northeast-1:
-      AMI: ami-0dcce5b7b22f83e5a   # AL2023 arm64 ap-northeast-1
 
 # ---------------------------------------------------------------------------
 # Resources
 # ---------------------------------------------------------------------------
 Resources:
-
-  # =========================================================================
-  # IAM - EC2 Instance Profile
-  # =========================================================================
-  EC2Role:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub '${ProjectName}-ec2-role'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: ec2.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
-        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
-      Policies:
-        - PolicyName: ECRPull
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - ecr:GetAuthorizationToken
-                  - ecr:BatchCheckLayerAvailability
-                  - ecr:GetDownloadUrlForLayer
-                  - ecr:BatchGetImage
-                Resource: '*'
-        - PolicyName: S3BinaryDownload
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - s3:GetObject
-                Resource: 'arn:aws:s3:::*'
-        - PolicyName: CloudWatchLogs
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: 'arn:aws:logs:*:*:*'
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-
-  EC2InstanceProfile:
-    Type: AWS::IAM::InstanceProfile
-    Properties:
-      InstanceProfileName: !Sub '${ProjectName}-ec2-profile'
-      Roles:
-        - !Ref EC2Role
 
   # =========================================================================
   # IAM - Lambda Execution Role
@@ -220,47 +120,6 @@ Resources:
           Value: !Ref ProjectName
 
   # =========================================================================
-  # EC2 Instance (t4g.micro ARM)
-  # =========================================================================
-  EC2Instance:
-    Type: AWS::EC2::Instance
-    Properties:
-      InstanceType: t4g.micro
-      ImageId: !FindInMap [AmazonLinux2023ArmAmi, !Ref 'AWS::Region', AMI]
-      KeyName: !Ref KeyPairName
-      IamInstanceProfile: !Ref EC2InstanceProfile
-      SubnetId: !Ref PrivateSubnetA
-      SecurityGroupIds:
-        - !Ref EC2SecurityGroupId
-      BlockDeviceMappings:
-        - DeviceName: /dev/xvda
-          Ebs:
-            VolumeType: gp3
-            VolumeSize: 30
-            DeleteOnTermination: true
-            Encrypted: true
-      UserData:
-        Fn::Base64: !Sub |
-          #!/bin/bash
-          set -euo pipefail
-          exec > /var/log/sme-userdata.log 2>&1
-
-          echo "=== SME EC2 Bootstrap ==="
-          # NOTE: EC2 is a legacy resource — can be removed from the stack.
-          # Cache is now ElastiCache Valkey (managed by CloudFormation).
-          # Kept temporarily for backward compatibility with existing deployment.
-          dnf update -y
-          echo "=== Bootstrap complete (no services — EC2 is deprecated) ==="
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-ec2'
-        - Key: Project
-          Value: !Ref ProjectName
-
-  # ElasticIP removed — EC2 now in private subnet (no public IP needed)
-  # Access via SSM Session Manager only
-
-  # =========================================================================
   # RDS PostgreSQL (db.t4g.micro)
   # =========================================================================
   DBSubnetGroup:
@@ -305,7 +164,7 @@ Resources:
           Value: !Ref ProjectName
 
   # =========================================================================
-  # ElastiCache Redis (single-node, non-cluster mode)
+  # ElastiCache Valkey (single-node, non-cluster mode)
   # Non-cluster mode required: our Lua scripts access keys in different slots (ADR-004)
   # =========================================================================
   ElastiCacheSubnetGroup:
@@ -318,7 +177,6 @@ Resources:
 
   ValkeyCache:
     Type: AWS::ElastiCache::ReplicationGroup
-    Condition: UseElastiCache
     Properties:
       ReplicationGroupDescription: !Sub '${ProjectName} Valkey cache'
       Engine: valkey
@@ -384,11 +242,8 @@ Resources:
           AWS_LWA_PORT: '3001'
           AWS_LWA_READINESS_CHECK_PATH: '/api/pairs'
           AWS_LWA_PASS_THROUGH_PATH: '/'
-          # Application settings — CacheMode toggles between EC2 Valkey and ElastiCache
-          REDIS_URL: !If
-            - UseElastiCache
-            - !Sub 'redis://${ValkeyCache.PrimaryEndPoint.Address}:6379'
-            - !Sub 'redis://${EC2Instance.PrivateIp}:6379'
+          # Cache: ElastiCache Valkey
+          REDIS_URL: !Sub 'redis://${ValkeyCache.PrimaryEndPoint.Address}:6379'
           RUST_LOG: info
           # Worker Lambda dispatch
           ORDER_DISPATCH_MODE: lambda
@@ -435,10 +290,8 @@ Resources:
           - !Ref WorkerLambdaSecurityGroupId
       Environment:
         Variables:
-          REDIS_URL: !If
-            - UseElastiCache
-            - !Sub 'redis://${ValkeyCache.PrimaryEndPoint.Address}:6379'
-            - !Sub 'redis://${EC2Instance.PrivateIp}:6379'
+          # Cache: ElastiCache Valkey
+          REDIS_URL: !Sub 'redis://${ValkeyCache.PrimaryEndPoint.Address}:6379'
           DATABASE_URL: !Sub 'postgres://sme:${DBPassword}@${RDSInstance.Endpoint.Address}:5432/matching_engine'
           RUST_LOG: info
           WS_API_ENDPOINT: !Sub 'https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/ws'
@@ -544,10 +397,8 @@ Resources:
           - !Ref LambdaSecurityGroupId
       Environment:
         Variables:
-          REDIS_URL: !If
-            - UseElastiCache
-            - !Sub 'redis://${ValkeyCache.PrimaryEndPoint.Address}:6379'
-            - !Sub 'redis://${EC2Instance.PrivateIp}:6379'
+          # Cache: ElastiCache Valkey
+          REDIS_URL: !Sub 'redis://${ValkeyCache.PrimaryEndPoint.Address}:6379'
           RUST_LOG: info
       Tags:
         Project: !Ref ProjectName
@@ -619,10 +470,6 @@ Outputs:
     Description: WebSocket API URL for real-time feeds
     Value: !Sub 'wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/ws'
 
-  EC2PrivateIP:
-    Description: EC2 private IP (used by Lambda for Valkey)
-    Value: !GetAtt EC2Instance.PrivateIp
-
   RDSEndpoint:
     Description: RDS PostgreSQL endpoint
     Value: !GetAtt RDSInstance.Endpoint.Address
@@ -632,5 +479,5 @@ Outputs:
     Value: !GetAtt RDSInstance.Endpoint.Port
 
   ElastiCacheEndpoint:
-    Description: ElastiCache Redis endpoint address
+    Description: ElastiCache Valkey endpoint address
     Value: !GetAtt ValkeyCache.PrimaryEndPoint.Address

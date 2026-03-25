@@ -115,7 +115,6 @@ aws cloudformation deploy \
   --region "${REGION}" \
   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
   --parameter-overrides \
-    "KeyPairName=GmindRZKeyPair" \
     "DBPassword=sme_prod_9b43c1802d8440e9666be882d925d933" \
   --no-fail-on-empty-changeset
 
