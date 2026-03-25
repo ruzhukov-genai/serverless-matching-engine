@@ -22,7 +22,7 @@ crates/
 infra/
   template.yaml → Root SAM template with nested stacks
   stacks/       → Network, backend, frontend CloudFormation stacks
-  Dockerfile.*  → Lambda container builds (gateway: ARM64, worker: x86_64)
+  Dockerfile.*  → Lambda container builds (all x86_64, uses cargo-chef for layer caching)
 web/
   trading/      → vanilla HTML/CSS/JS trading UI
   dashboard/    → vanilla HTML/CSS/JS admin dashboard

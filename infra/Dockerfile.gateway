@@ -5,52 +5,48 @@
 # LWA acts as a shim that translates Lambda invocation events into HTTP
 # requests forwarded to sme-gateway, which runs as a normal HTTP server.
 #
-# Build: docker build -f infra/Dockerfile.gateway -t sme-gateway .
+# Optimized for Docker layer caching with cargo-chef:
+#   1. Planner: reads Cargo.toml/lock, generates recipe.json
+#   2. Cook: builds only dependencies (cached unless Cargo.toml/lock change)
+#   3. Build: compiles application code (only this layer rebuilds on src changes)
+#
+# Build: docker buildx build --platform linux/amd64 -f infra/Dockerfile.gateway -t sme-gateway .
 # =============================================================================
 
 # ============================================================================
-# Stage 1: Build — compile sme-gateway for x86_64 Linux (native)
+# Stage 1: Chef planner — generate dependency recipe
 # ============================================================================
-FROM rust:1.91-bookworm AS builder
-
+FROM rust:1.91-bookworm AS planner
+RUN cargo install cargo-chef --locked
 WORKDIR /build
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Install build dependencies
+# ============================================================================
+# Stage 2: Cook — build dependencies only (cached layer)
+# ============================================================================
+FROM rust:1.91-bookworm AS deps
+RUN cargo install cargo-chef --locked
+
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        pkg-config \
-        libssl-dev \
-        && \
+    apt-get install -y --no-install-recommends pkg-config libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Cache dependencies — copy manifests first
-COPY Cargo.toml Cargo.lock ./
-COPY crates/gateway/Cargo.toml ./crates/gateway/
-COPY crates/api/Cargo.toml ./crates/api/
-COPY crates/shared/Cargo.toml ./crates/shared/
+WORKDIR /build
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json --package sme-gateway
 
-# Stub out loadtest (not needed for Lambda, just needs to exist)
-RUN mkdir -p tools/loadtest/src && echo 'fn main() {}' > tools/loadtest/src/main.rs
-
-# Create stub src files to cache dependency compilation
-RUN mkdir -p crates/gateway/src crates/api/src crates/shared/src && \
-    echo 'fn main() {}' > crates/gateway/src/main.rs && \
-    echo 'fn main() {}' > crates/api/src/main.rs && \
-    echo '' > crates/shared/src/lib.rs
-
-# Cache build (will fail on stubs but caches deps)
-RUN cargo build --release --package sme-gateway 2>/dev/null || true
-
-# Copy real source
-COPY crates/ ./crates/
-COPY web/ ./web/
-COPY tools/loadtest ./tools/loadtest/
-
-# Build sme-gateway for x86_64
+# ============================================================================
+# Stage 3: Build — compile application code (fast: deps already cached)
+# ============================================================================
+FROM deps AS builder
+COPY . .
+# Touch src files so cargo sees them as newer than the cached dep artifacts
+RUN find crates/ tools/ -name "*.rs" -exec touch {} +
 RUN cargo build --release --package sme-gateway
 
 # ============================================================================
-# Stage 2: Runtime — AWS Lambda Web Adapter base image
+# Stage 4: Runtime — AWS Lambda Web Adapter base image
 #
 # LWA handles Lambda invocation → HTTP translation automatically.
 # sme-gateway runs on PORT=3001 as a normal HTTP server.

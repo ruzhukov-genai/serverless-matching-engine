@@ -5,60 +5,49 @@
 # Uses native lambda_runtime crate — no Lambda Web Adapter needed.
 # The binary is named `bootstrap` (Lambda custom runtime convention).
 #
-# Build: docker build -f infra/Dockerfile.ws-handler -t sme-ws-handler .
+# Optimized for Docker layer caching with cargo-chef:
+#   1. Planner: reads Cargo.toml/lock, generates recipe.json
+#   2. Cook: builds only dependencies (cached unless Cargo.toml/lock change)
+#   3. Build: compiles application code (only this layer rebuilds on src changes)
+#
+# Build: docker buildx build --platform linux/amd64 -f infra/Dockerfile.ws-handler -t sme-ws-handler .
 # =============================================================================
 
 # ============================================================================
-# Stage 1: Build — compile sme-ws-handler for x86_64 Linux (native)
+# Stage 1: Chef planner — generate dependency recipe
 # ============================================================================
-FROM rust:1.91-bookworm AS builder
-
+FROM rust:1.91-bookworm AS planner
+RUN cargo install cargo-chef --locked
 WORKDIR /build
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Install build dependencies
+# ============================================================================
+# Stage 2: Cook — build dependencies only (cached layer)
+# ============================================================================
+FROM rust:1.91-bookworm AS deps
+RUN cargo install cargo-chef --locked
+
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        pkg-config \
-        libssl-dev \
-        && \
+    apt-get install -y --no-install-recommends pkg-config libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Cache dependencies — copy manifests first
-COPY Cargo.toml Cargo.lock ./
-COPY crates/ws-handler/Cargo.toml ./crates/ws-handler/
-COPY crates/worker-lambda/Cargo.toml ./crates/worker-lambda/
-COPY crates/gateway/Cargo.toml ./crates/gateway/
-COPY crates/api/Cargo.toml ./crates/api/
-COPY crates/shared/Cargo.toml ./crates/shared/
+WORKDIR /build
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json --package sme-ws-handler
 
-# Stub out other crates (not needed, just must exist in workspace)
-RUN mkdir -p tools/loadtest/src && echo 'fn main() {}' > tools/loadtest/src/main.rs
-RUN mkdir -p crates/matching-engine/src && echo 'fn main() {}' > crates/matching-engine/src/main.rs
-RUN mkdir -p crates/order-service/src && echo 'fn main() {}' > crates/order-service/src/main.rs
-RUN mkdir -p crates/transaction-service/src && echo 'fn main() {}' > crates/transaction-service/src/main.rs
-
-# Create stub src files to cache dependency compilation
-RUN mkdir -p crates/ws-handler/src crates/worker-lambda/src crates/gateway/src crates/api/src crates/shared/src && \
-    echo 'fn main() {}' > crates/ws-handler/src/main.rs && \
-    echo 'fn main() {}' > crates/worker-lambda/src/main.rs && \
-    echo 'fn main() {}' > crates/gateway/src/main.rs && \
-    echo 'fn main() {}' > crates/api/src/main.rs && \
-    echo '' > crates/shared/src/lib.rs
-
-# Cache build (will fail on stubs but caches deps)
-RUN cargo build --release --package sme-ws-handler 2>/dev/null || true
-
-# Copy real source
-COPY crates/ ./crates/
-COPY tools/loadtest ./tools/loadtest/
-
-# Build sme-ws-handler (binary is named 'bootstrap' per Cargo.toml)
+# ============================================================================
+# Stage 3: Build — compile application code (fast: deps already cached)
+# ============================================================================
+FROM deps AS builder
+COPY . .
+RUN find crates/ tools/ -name "*.rs" -exec touch {} +
 RUN cargo build --release --package sme-ws-handler
 
 # ============================================================================
-# Stage 2: Runtime — minimal Lambda runtime (x86_64)
+# Stage 4: Runtime — minimal Lambda runtime (x86_64)
 # ============================================================================
-FROM public.ecr.aws/lambda/provided:al2023 AS runtime
+FROM public.ecr.aws/lambda/provided:al2023-x86_64 AS runtime
 
 # Copy compiled bootstrap binary
 COPY --from=builder --chmod=755 /build/target/release/bootstrap /var/runtime/bootstrap

@@ -1,16 +1,22 @@
+# VCS / IDE
 .git
 .gitignore
-target/debug
-target/*/deps
-target/*/build
-.aws-sam
-infra/.aws-sam
 .idea
+.vscode
 *.swp
 *.swo
 .DS_Store
+
+# Rust build artifacts (deps cached inside Docker via cargo-chef)
+target/
+
+# SAM build artifacts
+.aws-sam
+infra/.aws-sam
+
+# Misc
 node_modules
 *.log
-.vscode
 coverage
 tmp
+docs/

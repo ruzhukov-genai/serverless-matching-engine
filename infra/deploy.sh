@@ -38,11 +38,11 @@ done
 
 # ── Step 1: Build Docker images ───────────────────────────────────────────
 if [[ "$SKIP_BUILD" == false && "$DEPLOY_ONLY" == false ]]; then
-  echo "=== Step 1/3: Building Docker images (cross-compile arm64) ==="
+  echo "=== Step 1/3: Building Docker images (amd64) ==="
 
   echo "→ Building gateway..."
   docker buildx build \
-    --platform linux/arm64 \
+    --platform linux/amd64 \
     --provenance=false \
     -f "${INFRA_DIR}/Dockerfile.gateway" \
     -t "${GATEWAY_URI}" \
@@ -50,7 +50,7 @@ if [[ "$SKIP_BUILD" == false && "$DEPLOY_ONLY" == false ]]; then
 
   echo "→ Building worker..."
   docker buildx build \
-    --platform linux/arm64 \
+    --platform linux/amd64 \
     --provenance=false \
     -f "${INFRA_DIR}/Dockerfile.worker" \
     -t "${WORKER_URI}" \
@@ -58,7 +58,7 @@ if [[ "$SKIP_BUILD" == false && "$DEPLOY_ONLY" == false ]]; then
 
   echo "→ Building ws-handler..."
   docker buildx build \
-    --platform linux/arm64 \
+    --platform linux/amd64 \
     --provenance=false \
     -f "${INFRA_DIR}/Dockerfile.ws-handler" \
     -t "${WS_HANDLER_URI}" \
