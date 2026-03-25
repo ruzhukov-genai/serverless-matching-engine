@@ -61,24 +61,28 @@ async fn get_state() -> Result<&'static WorkerState> {
         return Ok(s);
     }
 
+    tracing::info!("get_state: initializing worker (cold start)");
+
     let dragonfly_url = std::env::var("DRAGONFLY_URL")
         .unwrap_or_else(|_| "redis://localhost:6379".to_string());
     let database_url = std::env::var("DATABASE_URL")
         .context("DATABASE_URL env var required")?;
 
-    // Smaller pool sizes for Lambda — connections are per-instance, not global
-    let dragonfly = cache::create_pool_sized(&dragonfly_url, 10).await
+    // Minimal pool for Lambda — each instance processes one order at a time
+    tracing::info!("get_state: connecting to Dragonfly");
+    let dragonfly = cache::create_pool_sized(&dragonfly_url, 2).await
         .context("failed to create Dragonfly pool")?;
 
+    tracing::info!("get_state: creating PG pool (lazy)");
     let pg = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
-        .min_connections(1)
+        .min_connections(0)
         .acquire_timeout(Duration::from_secs(10))
         .idle_timeout(Duration::from_secs(60))
         .max_lifetime(Duration::from_secs(300))
-        .connect(&database_url)
-        .await
-        .context("failed to connect to PostgreSQL")?;
+        .connect_lazy(&database_url)
+        .context("failed to create PostgreSQL pool")?;
+    tracing::info!("get_state: PG pool created (lazy, no connection yet)");
 
     // Note: DB migrations are run explicitly via deploy scripts or migrate tool
     // to avoid connection stampede during cold starts
@@ -91,36 +95,42 @@ async fn get_state() -> Result<&'static WorkerState> {
         .collect();
     let pair_keys = Arc::new(pair_keys);
 
-    // Initialize balance cache from PG (needed for Lua balance-lock to work)
-    cache::init_balances_from_pg(&dragonfly, &pg).await
-        .context("failed to init balance cache")?;
-
-    // Seed order book ZSETs from PG resting orders — critical on fresh cache (ElastiCache migration)
-    cache::seed_orderbook_from_pg(&dragonfly, &pg).await
-        .context("failed to seed orderbook from PG")?;
-
-    // Seed cache:pairs on cold start (Gateway reads this for /api/pairs)
-    seed_pairs_cache(&dragonfly, &pg).await
-        .context("failed to seed cache:pairs")?;
-
-    // Seed ticker cache from recent trades
-    let pair_ids: Vec<String> = pairs_cache.keys().cloned().collect();
-    cache::seed_ticker_from_pg(&dragonfly, &pg, &pair_ids).await
-        .context("failed to seed ticker cache from PG")?;
-
-    // Lua EVAL smoke test
-    {
-        let mut conn = dragonfly.get().await.context("pool.get for lua test")?;
-        let test_result: redis::Value = redis::cmd("EVAL")
-            .arg("return redis.call('SET','__lua_test','ok')")
-            .arg(0)
+    // Seed caches from PG only if not already populated.
+    // Uses a sentinel key to avoid 40+ concurrent Lambdas all trying to seed simultaneously.
+    // The first Lambda to cold-start seeds; subsequent ones skip.
+    let needs_seed = {
+        let mut conn = dragonfly.get().await.context("pool.get for seed check")?;
+        let exists: bool = redis::cmd("EXISTS")
+            .arg("cache:pairs")
             .query_async(&mut *conn)
             .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "Lua EVAL smoke test FAILED");
-                anyhow::anyhow!("Lua smoke test failed: {e}")
-            })?;
-        tracing::info!(?test_result, "Lua EVAL smoke test passed");
+            .unwrap_or(false);
+        !exists
+    };
+
+    if needs_seed {
+        tracing::info!("cache not populated — seeding from PG");
+
+        // Initialize balance cache from PG (needed for Lua balance-lock to work)
+        cache::init_balances_from_pg(&dragonfly, &pg).await
+            .context("failed to init balance cache")?;
+
+        // Seed order book ZSETs from PG resting orders
+        cache::seed_orderbook_from_pg(&dragonfly, &pg).await
+            .context("failed to seed orderbook from PG")?;
+
+        // Seed cache:pairs (Gateway reads this for /api/pairs)
+        seed_pairs_cache(&dragonfly, &pg).await
+            .context("failed to seed cache:pairs")?;
+
+        // Seed ticker cache from recent trades
+        let pair_ids: Vec<String> = pairs_cache.keys().cloned().collect();
+        cache::seed_ticker_from_pg(&dragonfly, &pg, &pair_ids).await
+            .context("failed to seed ticker cache from PG")?;
+
+        tracing::info!("cache seeding complete");
+    } else {
+        tracing::info!("cache already populated — skipping seed");
     }
 
     let state = WorkerState { dragonfly, pg, pairs_cache, pair_keys };
