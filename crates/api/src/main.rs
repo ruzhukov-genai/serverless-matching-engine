@@ -54,10 +54,27 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let migrate_only = args.iter().any(|arg| arg == "--migrate");
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .json()
         .init();
+
+    if migrate_only {
+        tracing::info!("Running migrations only");
+        let config = sme_shared::Config::from_env();
+        let pg = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&config.database_url)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect pg: {}", e))?;
+        
+        sme_shared::db::run_migrations(&pg).await?;
+        tracing::info!("Migrations completed");
+        return Ok(());
+    }
 
     tracing::info!("sme-api (worker) starting");
 

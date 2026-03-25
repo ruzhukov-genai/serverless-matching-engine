@@ -80,9 +80,8 @@ async fn get_state() -> Result<&'static WorkerState> {
         .await
         .context("failed to connect to PostgreSQL")?;
 
-    // Run DB migrations (add columns, create indexes, etc.)
-    sme_shared::db::run_migrations(&pg).await
-        .context("failed to run DB migrations")?;
+    // Note: DB migrations are run explicitly via deploy scripts or migrate tool
+    // to avoid connection stampede during cold starts
 
     let pairs_cache = Arc::new(load_pairs_cache(&pg).await?);
     tracing::info!(count = pairs_cache.len(), "pairs cache loaded");
