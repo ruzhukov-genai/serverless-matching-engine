@@ -25,7 +25,7 @@ Originally, a single BRPOP loop consumed all orders from `queue:orders`. Orders 
 
 ### Why semaphore=3, not higher:
 - `lock_balance` does UPDATE on `balances` table — same-user orders contend on PG row locks
-- Lua EVAL serializes in Dragonfly — concurrent EVALs queue up
+- Lua EVAL serializes in Valkey — concurrent EVALs queue up
 - Benchmarked: sem=10 caused db_pre median to spike 3x and lua to spike 4x
 - sem=3 balances throughput (3x vs sequential) with acceptable contention
 
@@ -48,3 +48,7 @@ Future: load dynamically from pairs table.
 - **Unbounded concurrency:** Spawn task per order with no semaphore. Causes PG connection exhaustion and row-lock storms under burst.
 - **Batch matching:** Accumulate N orders, match as a batch in one Lua call. Better throughput but much more complex Lua script. Future optimization.
 - **Multiple consumer tasks per pair:** 3 BRPOP loops instead of 1 + semaphore. Works but wastes idle connections on low-volume pairs.
+
+---
+
+_Updated 2026-03-25: Dragonfly replaced with Valkey (ElastiCache) for managed serverless cache._

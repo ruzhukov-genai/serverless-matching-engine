@@ -18,7 +18,7 @@ The Gateway Lambda serves REST via API Gateway HTTP API, but HTTP API doesn't su
 Browser ──WS──▶ API Gateway WebSocket API ──▶ Gateway Lambda ($connect/$disconnect/$default)
                         ▲                              │
                         │                              ▼
-                   @connections API              Dragonfly (connection store)
+                   @connections API              Valkey (connection store)
                         ▲                              ▲
                         │                              │
                    Worker Lambda ─────────────────────▶│ (writes cache + publishes)
@@ -27,20 +27,20 @@ Browser ──WS──▶ API Gateway WebSocket API ──▶ Gateway Lambda ($c
 ```
 
 ### Connection Management
-- `$connect` → store `connectionId` in Dragonfly SET `ws:connections`
-- `$disconnect` → remove `connectionId` from Dragonfly
+- `$connect` → store `connectionId` in Valkey SET `ws:connections`
+- `$disconnect` → remove `connectionId` from Valkey
 - `$default` → parse `{"subscribe": ["trades:BTC-USDT", ...]}` commands
   - Store subscriptions: `ws:subs:{channel}` → SET of connectionIds
   - Store reverse map: `ws:conn:{connectionId}` → SET of channels
   - Send current cached value immediately via `@connections` POST
 
 ### Push Mechanism
-- Worker Lambda already writes `cache:trades:{pair}`, `cache:orderbook:{pair}` to Dragonfly
+- Worker Lambda already writes `cache:trades:{pair}`, `cache:orderbook:{pair}` to Valkey
 - After writing cache, Worker calls `push_ws_updates()`:
-  1. For each updated cache key, read `ws:subs:{channel}` from Dragonfly
+  1. For each updated cache key, read `ws:subs:{channel}` from Valkey
   2. POST to `https://{api-id}.execute-api.{region}.amazonaws.com/{stage}/@connections/{connectionId}`
   3. Wrap in same format: `{"ch": "trades:BTC-USDT", "data": {...}}`
-- Stale connections (410 Gone) → remove from Dragonfly
+- Stale connections (410 Gone) → remove from Valkey
 
 ### CloudFormation Resources
 - `AWS::ApiGatewayV2::Api` (ProtocolType: WEBSOCKET)
@@ -58,7 +58,7 @@ Browser ──WS──▶ API Gateway WebSocket API ──▶ Gateway Lambda ($c
 
 ### Worker Lambda Changes
 - After `persist_and_update_cache()`, call `push_to_ws_subscribers()`
-- Read subscriber list from Dragonfly
+- Read subscriber list from Valkey
 - POST updates to API GW @connections endpoint
 - Handle 410 Gone (stale connections) gracefully
 
@@ -67,7 +67,7 @@ Browser ──WS──▶ API Gateway WebSocket API ──▶ Gateway Lambda ($c
 - Trading UI works on AWS with live feeds
 - Adds ~10-50ms latency to trade push (Worker → API GW @connections)
 - Worker Lambda needs IAM permission: `execute-api:ManageConnections`
-- Connection state in Dragonfly (ephemeral, acceptable)
+- Connection state in Valkey (ephemeral, acceptable)
 - No additional always-on compute (Lambda-only, pay-per-invocation)
 - Gateway Lambda handles both HTTP (via LWA) and WS (via direct event parsing)
 
@@ -78,3 +78,7 @@ Browser ──WS──▶ API Gateway WebSocket API ──▶ Gateway Lambda ($c
 - **AppSync:** Managed WS but adds vendor lock-in and doesn't fit our event model
 - **EC2 + Gateway process:** Defeats the serverless goal
 - **Polling from frontend:** Works but poor UX (500ms+ stale data, high request volume)
+
+---
+
+_Updated 2026-03-25: Dragonfly replaced with Valkey (ElastiCache) for managed serverless cache._

@@ -13,7 +13,8 @@ Valkey (Redis-compatible) for distributed locking/caching, PostgreSQL for persis
 ```
 crates/
   gateway/      → stateless HTTP/WS gateway (port 3001), reads Valkey cache
-  worker-lambda/ → Worker Lambda (processes individual orders)
+  worker-lambda/ → Worker Lambda (processes individual orders, matching, PG writes)
+  ws-handler/   → WebSocket API Gateway handler ($connect/$disconnect/sendMessage)
   api/          → local dev worker (BRPOP queue consumer), matching, PG writes
   shared/       → types, config, cache (sorted sets + Lua matching), DB, engine
   matching-engine/  → re-exports shared engine (standalone binary, unused in PoC)
@@ -22,7 +23,7 @@ crates/
 infra/
   template.yaml → Root SAM template with nested stacks
   stacks/       → Network, backend, frontend CloudFormation stacks
-  Dockerfile.*  → Lambda container builds (all x86_64, uses cargo-chef for layer caching)
+  Dockerfile.*  → Lambda container builds (all x86_64, cargo-chef for dep caching)
 web/
   trading/      → vanilla HTML/CSS/JS trading UI
   dashboard/    → vanilla HTML/CSS/JS admin dashboard
@@ -216,8 +217,9 @@ python3 tools/benchmark.py
 | `infra/stacks/network.yaml` | VPC, subnets, security groups |
 | `infra/stacks/backend.yaml` | EC2, Lambda ×2, API Gateway, UserData |
 | `infra/stacks/frontend.yaml` | S3, CloudFront, OAC |
-| `infra/Dockerfile.gateway` | Gateway Lambda Docker build (arm64) |
-| `infra/Dockerfile.worker` | Worker Lambda Docker build (x86_64) |
+| `infra/Dockerfile.gateway` | Gateway Lambda Docker build (x86_64, Lambda Web Adapter) |
+| `infra/Dockerfile.worker` | Worker Lambda Docker build (x86_64, native runtime) |
+| `infra/Dockerfile.ws-handler` | WS Handler Lambda Docker build (x86_64, native runtime) |
 | `tools/deploy.sh` | Build + push + deploy + run_migrations |
 | `tools/bench_aws.py` | AWS benchmark script with warmup |
 | `tools/new_migration.sh` | Create timestamped migration file |
@@ -256,6 +258,12 @@ All admin operations via direct invocation:
 {"manage": {"command": "query", "sql": "..."}}
 ```
 
+### Deploy Gotchas
+- **SAM uses legacy Docker builder** — no BuildKit features (`COPY --chmod`). Use `COPY` + `RUN chmod` instead.
+- **Lambda Web Adapter (buffered mode)**: `tokio::spawn` does NOT work for background tasks — LWA freezes the runtime immediately after the HTTP response. All async work must complete before the handler returns.
+- **CloudFormation cannot change resource types** — if you need to change e.g. `CacheCluster` → `ReplicationGroup`, create a new resource with a different logical name.
+- **ElastiCache ReplicationGroup requires `AutomaticFailoverEnabled: false`** for single-node (`NumCacheClusters: 1`).
+
 ### Migrations
 - Format: `migrations/YYYYMMDDHHMMSS_description.sql`
 - Each file has `-- migration:` and `-- depends-on:` comment headers
@@ -266,11 +274,12 @@ All admin operations via direct invocation:
 ### AWS Infrastructure
 | Component | Service | Spec |
 |-----------|---------|------|
-| Cache | ElastiCache Valkey | `cache.t4g.micro`, Valkey 8.1 |
+| Cache | ElastiCache Valkey | `cache.t4g.micro`, Valkey 8.1, ReplicationGroup (CF-managed `ValkeyCache`) |
 | Database | RDS PostgreSQL | `db.t4g.small`, PG 16.6 |
 | Connection Pool | RDS Proxy | `sme-proxy-v2` |
-| Gateway | Lambda (arm64) | 512MB, Lambda Web Adapter |
+| Gateway | Lambda (x86_64) | 512MB, Lambda Web Adapter (buffered mode) |
 | Worker | Lambda (x86_64) | 1024MB, native Rust runtime |
+| WS Handler | Lambda (x86_64) | 256MB, native Rust runtime |
 | Frontend | CloudFront + S3 | `d3ux5yer0uv7b5.cloudfront.net` |
 | HTTP API | API Gateway | `kpvhsf0ub8` |
 | WebSocket | API Gateway WS | `2shnq9yk0c` |

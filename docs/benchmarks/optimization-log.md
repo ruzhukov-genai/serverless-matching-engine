@@ -25,7 +25,7 @@ Metrics:       20,377ms
 | Shared WS broadcast (1 poller per pair, fan-out) | 200 WS conns each polling DF | 1 poller per key | Orders went from 0 to 441 (29/s) |
 | Top-200 orderbook batching | 14k HMGET per load | 200 per side | Orderbook 14,813ms → 725ms (20x) |
 | Metrics in-memory cache (5s refresh) | Per-request DF reads | Background cache | 20,377ms → 112ms (182x) |
-| Dragonfly pool 50→200 | Pool exhaustion | Room for growth | 100% errors → 0% |
+| Valkey pool 50→200 | Pool exhaustion | Room for growth | 100% errors → 0% |
 | WS /orders (pub/sub) | REST polling | Real-time push | Removed REST polling entirely |
 | PG hot pool 30→60 | Connection pressure | Headroom | Enabled concurrent order processing |
 
@@ -100,11 +100,11 @@ Metrics:       20,377ms
 ### ❌ Failures / Reverted
 | Optimization | Why it failed |
 |---|---|
-| **lock_balance as Lua EVAL** | Made things WORSE (6ms vs 4.5ms PG). Dragonfly Lua is single-threaded — balance lock EVAL competed with matching EVAL. |
-| **Semaphore sem=6 (increased from 3)** | More concurrent orders = more Dragonfly Lua contention. Reverted to sem=3. |
+| **lock_balance as Lua EVAL** | Made things WORSE (6ms vs 4.5ms PG). Valkey Lua is single-threaded — balance lock EVAL competed with matching EVAL. |
+| **Semaphore sem=6 (increased from 3)** | More concurrent orders = more Valkey Lua contention. Reverted to sem=3. |
 
-### 🔴 CRITICAL LESSON: Dragonfly Lua contention
-**Any new Lua EVAL on the hot path will degrade matching performance.** Dragonfly runs Lua scripts single-threaded. Adding more EVALs = serialization = slower. Use pipeline commands (non-blocking) instead of EVAL when possible.
+### 🔴 CRITICAL LESSON: Valkey Lua contention
+**Any new Lua EVAL on the hot path will degrade matching performance.** Valkey runs Lua scripts single-threaded. Adding more EVALs = serialization = slower. Use pipeline commands (non-blocking) instead of EVAL when possible.
 
 ---
 
@@ -116,7 +116,7 @@ Metrics:       20,377ms
 | Batch snapshot API (`/api/snapshot/{pair_id}`) | Single request replaces 8 REST calls |
 | Multiplexed WS (`/ws/stream`) | 1 WS connection replaces 3+ per client |
 | TCP_NODELAY on all connections | Free latency win for small JSON |
-| Dragonfly Unix Domain Socket | ~18% latency improvement over TCP loopback |
+| Valkey Unix Domain Socket | ~18% latency improvement over TCP loopback |
 
 ### ❌ Failures / Reverted
 | Optimization | Why it failed |

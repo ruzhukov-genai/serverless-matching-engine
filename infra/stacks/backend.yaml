@@ -246,8 +246,8 @@ Resources:
           exec > /var/log/sme-userdata.log 2>&1
 
           echo "=== SME EC2 Bootstrap ==="
-          # NOTE: EC2 is a legacy resource — Dragonfly was removed in favor of
-          # ElastiCache Valkey. This instance can be removed from the stack.
+          # NOTE: EC2 is a legacy resource — can be removed from the stack.
+          # Cache is now ElastiCache Valkey (managed by CloudFormation).
           # Kept temporarily for backward compatibility with existing deployment.
           dnf update -y
           echo "=== Bootstrap complete (no services — EC2 is deprecated) ==="

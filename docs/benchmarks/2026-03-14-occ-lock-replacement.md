@@ -4,7 +4,7 @@
 - **Instance:** AWS t3a.large (2 vCPU, 8GB RAM)
 - **OS:** Linux 6.17.0-1007-aws (Ubuntu)
 - **Rust:** 1.94.0 (release mode)
-- **Dragonfly:** localhost:6379 (single instance)
+- **Valkey:** localhost:6379 (single instance)
 - **PostgreSQL:** localhost:5432
 - **Tool:** `tools/loadtest/` (custom Rust load tester)
 
@@ -41,9 +41,9 @@ loop {
 - `CasResult { Ok, Conflict }` enum
 - `load_order_book_snapshot()`: single pipeline GET version + ZRANGEBYSCORE + HGET×N
 - `apply_book_mutations_cas()`: two-phase write
-  - Phase 1: Pipeline HSET for UPSERT ops (outside Lua — binary data can't go through Lua ARGV in Dragonfly)
+  - Phase 1: Pipeline HSET for UPSERT ops (outside Lua — binary data can't go through Lua ARGV in Valkey)
   - Phase 2: Lua EVAL checks version, applies ZADD/ZREM, increments version atomically
-  - All Redis keys declared in `KEYS[]` for Dragonfly key-access enforcement compatibility
+  - All Redis keys declared in `KEYS[]` for Valkey key-access enforcement compatibility
 
 **`routes.rs` changes:**
 - `create_order` uses OCC retry loop (max 10 retries) instead of lock
@@ -126,7 +126,7 @@ For real-world workloads (multiple pairs, mixed resting/crossing), OCC wins.
 ## Stateless Property
 
 **Preserved.** No per-instance state required:
-- OCC reads the version from Dragonfly at the start of each iteration
+- OCC reads the version from Valkey at the start of each iteration
 - Any API instance can handle any order — the Lua CAS script is the sole arbiter
 - Lock keys (`book:{pair_id}:lock`) are no longer used in the create_order hot path
 - Cancel/modify still use distributed lock (unchanged, correct, low-frequency)

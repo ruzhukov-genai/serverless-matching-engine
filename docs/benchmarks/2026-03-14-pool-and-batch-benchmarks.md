@@ -2,14 +2,14 @@
 
 ## Environment
 - **Host:** Ubuntu server (local Docker Compose)
-- **Dragonfly:** Docker container, `--cache_mode=true`
+- **Valkey:** Docker container, `--cache_mode=true`
 - **PostgreSQL:** Docker container, postgres:16-alpine
 - **Rust:** 1.94.0 (release mode)
 - **Tool:** `tools/loadtest/` (custom Rust load tester, 15s per concurrency level)
 
 ## Commits
 - **Baseline:** `7796190` (post-code-optimization, from previous benchmark)
-- **Pool tuning:** `bc5261d` — PG max_connections 20→50, min_connections 5, Dragonfly max_size 50
+- **Pool tuning:** `bc5261d` — PG max_connections 20→50, min_connections 5, Valkey max_size 50
 - **Batch persistence:** `15765d4` — single TX for all trades in a fill
 
 ## What Changed
@@ -23,7 +23,7 @@
 | idle_timeout | — | 600s |
 | max_lifetime | — | 1800s |
 
-### 2. Dragonfly pool (`crates/shared/src/cache.rs`)
+### 2. Valkey pool (`crates/shared/src/cache.rs`)
 | Setting | Before | After |
 |---------|--------|-------|
 | max_size | default (10) | 50 |
@@ -43,7 +43,7 @@ Replaced per-trade sequential loop with `persist_trades()`:
 | 4 | 102.5 | 114.3 | **+11.5%** | 37.58 | 34.91 | **-7.1%** |
 | 8 | 1.1 | **116.6** | **+∞** | 6619 | **66.08** | **-99%** |
 
-> **Concurrency 8 was previously a near-total stall** (5s lock TTL timeouts firing constantly because the Dragonfly pool was exhausted). With pool size 50, connections are always available — the lock acquire/release completes fast enough that the 5s TTL is never hit.
+> **Concurrency 8 was previously a near-total stall** (5s lock TTL timeouts firing constantly because the Valkey pool was exhausted). With pool size 50, connections are always available — the lock acquire/release completes fast enough that the 5s TTL is never hit.
 
 ## Load Test: Crossing Orders (matching + settlement)
 
@@ -68,7 +68,7 @@ Replaced per-trade sequential loop with `persist_trades()`:
 ## Analysis
 
 ### Why pool size fixed the concurrency-8 stall
-The distributed lock sequence is: `SET NX EX` (acquire) → work → `DEL` (release). Both ops need a Dragonfly connection from the pool. With the default pool size of 10 and 8 concurrent requests all competing for connections, threads were blocking waiting for a connection while *holding the per-pair lock* — causing the 5s TTL to fire and the lock to expire mid-operation. With pool size 50, connections are always available; lock hold time drops to ~1ms, and all 8 concurrent requests can run.
+The distributed lock sequence is: `SET NX EX` (acquire) → work → `DEL` (release). Both ops need a Valkey connection from the pool. With the default pool size of 10 and 8 concurrent requests all competing for connections, threads were blocking waiting for a connection while *holding the per-pair lock* — causing the 5s TTL to fire and the lock to expire mid-operation. With pool size 50, connections are always available; lock hold time drops to ~1ms, and all 8 concurrent requests can run.
 
 ### Why batch persistence improved crossing latency ~10%
 Each crossing order previously opened 1 DB transaction per trade (for balance settlement). With batch persistence, all trades for a single order fill are committed in one transaction with aggregated balance deltas. Fewer round-trips to PostgreSQL, less transaction overhead.

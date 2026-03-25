@@ -7,7 +7,7 @@ Fully serverless architecture using AWS managed services. No EC2 instances neede
 ```
 template.yaml (root)
 ├── stacks/network.yaml   — VPC, subnets, route tables, IGW, security groups
-├── stacks/backend.yaml   — Lambda ×2 (gateway + worker), RDS, ElastiCache, API Gateway
+├── stacks/backend.yaml   — Lambda ×3 (gateway + worker + ws-handler), RDS, ElastiCache, API Gateway
 └── stacks/frontend.yaml  — S3 bucket, CloudFront, OAC
 ```
 
@@ -25,11 +25,11 @@ template.yaml (root)
          └─────────────────────┬─────────────────────┘
                                │
               ┌────────────────┴────────────────┐
-              │     Gateway Lambda (arm64)       │
+              │    Gateway Lambda (x86_64)       │
               │  512MB, Rust + Lambda Web Adapter│
               │  Reads Valkey cache, serves      │
-              │  REST + WebSocket, dispatches    │
-              │  orders to Worker Lambda         │
+              │  REST API, dispatches orders     │
+              │  to Worker Lambda (inline await) │
               └────────────────┬────────────────┘
                                │ (async Lambda invoke)
               ┌────────────────┴────────────────┐
@@ -52,10 +52,10 @@ template.yaml (root)
 ### ElastiCache Valkey (cache.t4g.micro)
 - **Engine:** Valkey 8.1.0
 - **Node type:** cache.t4g.micro (2 vCPU, 0.5GB)
-- **Cluster:** `sme-valkey-001`
+- **CF resource:** `ValkeyCache` (ReplicationGroup, single-node, no automatic failover)
 - **Purpose:** Order book cache (sorted sets), Lua atomic matching, balance cache,
   pub/sub for real-time feeds, metrics storage
-- **Endpoint:** `sme-valkey.rmmdxf.ng.0001.use1.cache.amazonaws.com:6379`
+- **Endpoint:** dynamically assigned by CloudFormation (output: `ElastiCacheEndpoint`)
 
 ### RDS PostgreSQL (db.t4g.small)
 - **Engine:** PostgreSQL 16.6
@@ -70,13 +70,23 @@ template.yaml (root)
 - **Key benefit:** Prevents connection stampede when 40+ Lambdas cold-start simultaneously
 
 ### Gateway Lambda
-- **Architecture:** arm64
+- **Architecture:** x86_64
 - **Memory:** 512 MB
 - **Timeout:** 30s
-- **Handler:** Lambda Web Adapter (runs Rust HTTP server on port 3001)
+- **Handler:** Lambda Web Adapter (buffered mode, runs Rust axum server on port 3001)
 - **Env vars:** `REDIS_URL`, `ORDER_DISPATCH_MODE=lambda`, `WORKER_LAMBDA_ARN`
 - **VPC:** Private subnets A+B
 - **Key insight:** Uses `lambda-adapter` extension to run a standard axum HTTP server
+- **Constraint:** `tokio::spawn` does NOT work — LWA freezes runtime after response. All async work must complete inline.
+
+### WS Handler Lambda
+- **Architecture:** x86_64
+- **Memory:** 256 MB
+- **Timeout:** 30s
+- **Handler:** `bootstrap` (native Rust Lambda runtime)
+- **Purpose:** API Gateway WebSocket $connect/$disconnect/sendMessage
+- **Env vars:** `REDIS_URL`
+- **VPC:** Private subnets A+B
 
 ### Worker Lambda
 - **Architecture:** x86_64
@@ -114,34 +124,14 @@ tools/deploy.sh --migrate-only     # Just run migrations (no build/deploy)
 tools/deploy.sh --skip-build       # Deploy with existing images + migrations
 ```
 
-### Manual Lambda Update
-```bash
-# Build worker
-DOCKER_BUILDKIT=1 docker build --provenance=false -f infra/Dockerfile.worker -t sme-worker:latest .
+### How It Works
+`tools/deploy.sh` does:
+1. `sam build --parallel` — builds all 3 Docker images (gateway, worker, ws-handler) using `cargo-chef` for dep layer caching
+2. `sam deploy` — pushes images to ECR, uploads templates to S3, deploys via CloudFormation changeset
+3. Runs `manage:run_migrations` on the worker Lambda after deploy
 
-# Push to ECR
-ECR=210352747749.dkr.ecr.us-east-1.amazonaws.com/serverless-matching-engine/sme-worker
-docker tag sme-worker:latest $ECR:latest
-docker push $ECR:latest
-
-# Update Lambda
-python3 -c "
-import boto3
-client = boto3.client('lambda', region_name='us-east-1')
-client.update_function_code(
-    FunctionName='serverless-matching-engine-worker',
-    ImageUri='$ECR:latest',
-    Architectures=['x86_64']
-)
-"
-```
-
-### Full Stack Deploy (infrastructure changes)
-```bash
-cd infra
-sam build --use-buildkit
-sam deploy --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
-```
+SAM reads `Metadata.DockerContext` + `Metadata.Dockerfile` from each function in `backend.yaml` to build images.
+No manual `docker build` / `docker push` / `update-function-code` needed.
 
 ## Manage Commands
 
@@ -217,13 +207,14 @@ aws lambda invoke --function-name serverless-matching-engine-worker \
 - RDS Proxy SG rules need both inbound (from Lambda) AND outbound (to RDS + Secrets Manager)
 
 ### Docker Builds
-- `--provenance=false` required — attestation manifests create OCI index format Lambda rejects
-- Worker: native x86_64 build (no cross-compile). Gateway: still arm64.
-- Docker build caches break when Cargo.toml deps change — full rebuild ~5-8 min
+- All 3 Lambdas are x86_64 — no cross-compilation needed on x86_64 build hosts
+- SAM uses legacy Docker builder (no BuildKit) — don't use `COPY --chmod`, use `COPY` + `RUN chmod`
+- `cargo-chef` caches dependency layers — rebuild after dep changes takes ~15min (full) vs ~1min (code-only)
+- `docker system prune -af --volumes` reclaims massive space (78GB+) — run periodically
 
 ### Lambda Container Recycling
-- `update-function-code` doesn't immediately replace warm instances
-- Change any env var via `update-function-configuration` to force all containers to recycle
+- SAM deploy automatically creates new image tags — all warm instances get replaced on next invoke
+- If using manual `update-function-code`, change any env var to force all containers to recycle
 
 ### CloudWatch Logs
 - `filter-log-events` has 30-60s lag after Lambda finishes

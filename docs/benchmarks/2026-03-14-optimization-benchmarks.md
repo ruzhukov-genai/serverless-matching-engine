@@ -4,7 +4,7 @@
 - **Instance:** AWS t3a.large (2 vCPU, 8GB RAM)
 - **OS:** Linux 6.17.0-1007-aws (Ubuntu)
 - **Rust:** 1.94.0 (release mode)
-- **Dragonfly:** localhost:6379 (single instance)
+- **Valkey:** localhost:6379 (single instance)
 - **PostgreSQL:** localhost:5432
 - **Tool:** `tools/loadtest/` (custom Rust load tester)
 
@@ -27,7 +27,7 @@
 
 **No change** — unit tests are CPU-bound matching logic, no I/O. Sub-millisecond.
 
-## Integration Tests (103 tests, Dragonfly + PostgreSQL)
+## Integration Tests (103 tests, Valkey + PostgreSQL)
 
 | Commit | Run 1 | Run 2 | Run 3 | Avg |
 |--------|-------|-------|-------|-----|
@@ -64,7 +64,7 @@ Every 2nd order crosses — tests the full path: validate → lock → match →
 ## Analysis
 
 ### Why the improvement is moderate (~3-6%)
-The current **bottleneck is the distributed lock** (Dragonfly SET NX EX), not the DB or Redis reads. All orders for the same pair serialize through a single lock, so:
+The current **bottleneck is the distributed lock** (Valkey SET NX EX), not the DB or Redis reads. All orders for the same pair serialize through a single lock, so:
 - At concurrency 1: lock wait ≈ 0, each order runs ~15ms (dominated by DB insert + cache write)
 - At concurrency 2-4: lock contention starts, and the reduced time-under-lock from fewer DB queries translates to ~6% improvement
 - At concurrency 8+: lock timeout (5s TTL) causes near-total stall
@@ -74,9 +74,9 @@ The DB query elimination pays off in **sustained throughput**: fewer connections
 
 ### Next optimization targets
 1. **Multi-pair sharding** — distribute load across pair-specific locks (already supported)
-2. **Connection pooling tuning** — increase PostgreSQL/Dragonfly pool sizes
+2. **Connection pooling tuning** — increase PostgreSQL/Valkey pool sizes
 3. **Batch DB writes** — combine multiple trade inserts into single multi-row INSERT
-4. **Lock-free reads** — serve orderbook/ticker from Dragonfly without locking
+4. **Lock-free reads** — serve orderbook/ticker from Valkey without locking
 5. **Consider bb8 or mobc** for connection pool alternatives
 6. **Profile with flamegraph** to find hidden hotspots
 

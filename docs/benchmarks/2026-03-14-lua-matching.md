@@ -4,12 +4,12 @@
 - **Instance:** AWS t3a.large (2 vCPU, 8GB RAM)
 - **OS:** Linux 6.17.0-1007-aws (Ubuntu)
 - **Rust:** 1.94.0 (release mode)
-- **Dragonfly:** localhost:6379, `--cache_mode=true`
+- **Valkey:** localhost:6379, `--cache_mode=true`
 - **PostgreSQL:** localhost:5432
 - **Tool:** `tools/loadtest/` (custom Rust load tester, 15s per concurrency level)
 
 ## Commit
-`a6dd1cf` — `perf: move order matching into Dragonfly Lua script — atomic, lock-free`
+`a6dd1cf` — `perf: move order matching into Valkey Lua script — atomic, lock-free`
 
 ## What Changed
 
@@ -17,7 +17,7 @@ Replaced the OCC/CAS retry loop (from prior commit) with a two-phase Lua-based m
 
 **Phase 1 (RT1):** `ZRANGEBYSCORE` — fetch up to 100 resting order IDs from the
 opposite book side. This gives us the candidate list with their keys, necessary
-because Dragonfly enforces that Lua scripts only access keys declared in `KEYS[]`.
+because Valkey enforces that Lua scripts only access keys declared in `KEYS[]`.
 
 **Phase 2 (RT2):** `EVAL` — the Lua script receives:
 - `KEYS[1..3]` = bids, asks, version
@@ -56,7 +56,7 @@ the OCC/CAS path (unchanged). FOK is rare in practice.
 | **total_ms** | **13ms** | **93ms** | **144ms** | **30ms** |
 
 **Key observation:** `lua_ms` p50 = 7ms for the entire match operation (book load +
-match logic + all Dragonfly writes), down from 3ms CAS p50 at low contention.
+match logic + all Valkey writes), down from 3ms CAS p50 at low contention.
 At high concurrency, Lua eliminates retry storms entirely (no 409s from CAS).
 
 ## Load Test: Resting Orders (no matching)
@@ -138,17 +138,17 @@ Engine correctness is unaffected.
 | total p50 | ~15ms | 10ms | **13ms** |
 | total p95 | — | 77ms | **93ms** |
 | total p99 | — | 150ms | **144ms** |
-| Dragonfly ops p50 | ~5ms | 3ms | **7ms** |
-| Dragonfly ops p95 | — | 57ms | **75ms** |
+| Valkey ops p50 | ~5ms | 3ms | **7ms** |
+| Valkey ops p95 | — | 57ms | **75ms** |
 | Post-lock (DB) p50 | ~11ms | 11ms | **10ms** |
 
 ## Analysis
 
 ### Why Lua requires 2 round-trips for resting
-Dragonfly enforces that Lua scripts can only access keys declared upfront in
+Valkey enforces that Lua scripts can only access keys declared upfront in
 `KEYS[]`. Since resting order IDs come from a sorted set, they're not known until
 a ZRANGEBYSCORE is issued. Result: 1 extra round-trip vs a hypothetical single-call
-design (which would work on Redis without key enforcement, but not Dragonfly).
+design (which would work on Redis without key enforcement, but not Valkey).
 
 ### Why Lua wins at c=2 crossing vs OCC
 OCC at c=2 has ~20% retry rate (two threads racing for the same version → one
@@ -164,9 +164,9 @@ reaching DB). Lua exposes it. Fix: wrap `persist_trades` + `update_order_db` in
 a deadlock-retry loop.
 
 ### The fundamental bottleneck
-At c=4+ same-pair crossing, the bottleneck shifted from Dragonfly (now fast and
-atomic) to PostgreSQL (balance row deadlocks). The Dragonfly side is no longer
-the limiting factor. Lua matching is as fast as Dragonfly can go.
+At c=4+ same-pair crossing, the bottleneck shifted from Valkey (now fast and
+atomic) to PostgreSQL (balance row deadlocks). The Valkey side is no longer
+the limiting factor. Lua matching is as fast as Valkey can go.
 
 ### Net verdict
 - **Lua is a clear win over lock-based** for resting orders (+17-21% at c=4-8)
@@ -185,8 +185,8 @@ the limiting factor. Lua matching is as fast as Dragonfly can go.
 ## Architecture — Stateless Property
 
 **Fully preserved.** Zero per-instance state required:
-- Phase 1 (ZRANGEBYSCORE): reads from shared Dragonfly
-- Phase 2 (EVAL): Dragonfly is the sole arbiter for all book mutations
+- Phase 1 (ZRANGEBYSCORE): reads from shared Valkey
+- Phase 2 (EVAL): Valkey is the sole arbiter for all book mutations
 - Any API instance handles any order without coordination
 - Lock keys (`book:{pair_id}:lock`) no longer used in the create_order hot path
 - Cancel/modify still use the distributed lock (low-frequency operations)

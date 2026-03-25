@@ -15,7 +15,7 @@ Order processing has a hot path: validate → lock balance → match → respond
 ### Hot path (blocks order processing):
 1. Validate order (in-memory pairs cache, ~2µs)
 2. `lock_balance` — UPDATE balances SET available=available-X, locked=locked+X (~2-3ms)
-3. Lua EVAL in Dragonfly — atomic match against order book (~2ms)
+3. Lua EVAL in Valkey — atomic match against order book (~2ms)
 
 ### Deferred (fire-and-forget via mpsc channel):
 4. `insert_order_db` — INSERT into orders table
@@ -33,11 +33,15 @@ Order processing has a hot path: validate → lock balance → match → respond
 
 - Hot path: ~5ms median (was ~20ms)
 - Orders are "in-flight" between match and DB persist (~10-50ms gap)
-- If worker crashes after match but before persist: Dragonfly has the trade, PG doesn't. Acceptable for PoC. Production needs WAL or idempotent replay.
+- If worker crashes after match but before persist: Valkey has the trade, PG doesn't. Acceptable for PoC. Production needs WAL or idempotent replay.
 - Two PG pools: `pg` (hot, 60 conns) for balance locks, `pg_bg` (background, 40 conns) for persistence
 - `lock_balance` provides the atomicity guarantee — if funds are insufficient, the order is rejected before matching
 
 ## Alternatives Considered
 
 - **Synchronous persist:** Simpler, consistent, but 4x slower. Ruled out for throughput.
-- **Write-ahead log in Dragonfly:** Persist a job queue in Dragonfly, separate persist service consumes it. Better crash recovery but adds operational complexity.
+- **Write-ahead log in Valkey:** Persist a job queue in Valkey, separate persist service consumes it. Better crash recovery but adds operational complexity.
+
+---
+
+_Updated 2026-03-25: Dragonfly replaced with Valkey (ElastiCache) for managed serverless cache._

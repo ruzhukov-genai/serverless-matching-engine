@@ -4,7 +4,7 @@
 - **Instance:** AWS t3a.large (2 vCPU, 8GB RAM)
 - **OS:** Linux 6.17.0-1007-aws (Ubuntu)
 - **Rust:** 1.94.0 (release mode)
-- **Dragonfly:** localhost:6379 (single instance, `--cache_mode=true`)
+- **Valkey:** localhost:6379 (single instance, `--cache_mode=true`)
 - **PostgreSQL:** localhost:5432 (Docker container, postgres:16-alpine)
 - **Tool:** `tools/loadtest/` (custom Rust load tester, 15s per concurrency level)
 
@@ -58,7 +58,7 @@ a single msgpack blob. Scale factor: 10^8 (8 decimal places).
 
 **Key observation:** `lua_ms` p50 dropped from 7ms (pre-deadlock-fix) to **3ms** —
 because the deadlock fix eliminates DB transaction retries that were blocking the
-Dragonfly-side pipeline. The `post_lock_ms` p95 is higher (81ms vs 32ms) due to
+Valkey-side pipeline. The `post_lock_ms` p95 is higher (81ms vs 32ms) due to
 broader concurrency in this run, but deadlocks are gone at all tested concurrency levels.
 
 ## Load Test: Resting Orders (no matching, single pair BTC-USDT)
@@ -140,8 +140,8 @@ architectural wins (no lock stall at c=8+, no CAS retry storms) remain.
 | total p50 | ~20ms | ~15ms | 10ms | 13ms | **11ms** |
 | total p95 | — | — | 77ms | 93ms | **34ms** |
 | total p99 | — | — | 150ms | 144ms | **55ms** |
-| Dragonfly p50 | — | — | 3ms | 7ms | **3ms** |
-| Dragonfly p95 | — | — | 57ms | 75ms | **14ms** |
+| Valkey p50 | — | — | 3ms | 7ms | **3ms** |
+| Valkey p95 | — | — | 57ms | 75ms | **14ms** |
 | DB persist p50 | — | — | 11ms | 10ms | **15ms** |
 
 **p95 total latency: 34ms (vs 93ms pre-fix) — 63% improvement.**
@@ -229,8 +229,8 @@ limit of synchronous relational persistence.
 ## Architecture Notes
 
 ### Stateless property: fully preserved
-- Phase 1 (ZRANGEBYSCORE): reads from shared Dragonfly
-- Phase 2 (EVAL): Dragonfly is sole arbiter for all book mutations
+- Phase 1 (ZRANGEBYSCORE): reads from shared Valkey
+- Phase 2 (EVAL): Valkey is sole arbiter for all book mutations
 - Any API instance handles any order without coordination
 - Lock keys no longer used in the `create_order` hot path (cancel/modify still use lock)
 
@@ -245,7 +245,7 @@ rare in practice and the CAS path is correct for it.
 
 1. **Multi-pair horizontal scaling** — run the engine on multiple pairs simultaneously
    to push past the current ~130 ord/s single-pair ceiling. Architecture already supports
-   it (independent Dragonfly key spaces per pair).
+   it (independent Valkey key spaces per pair).
 
 2. **PostgreSQL write batching** — aggregate multiple order DB inserts into a single
    multi-row INSERT (currently one INSERT per incoming order). Estimate: 20-30% DB
@@ -254,14 +254,14 @@ rare in practice and the CAS path is correct for it.
 3. **Async audit log** — move `INSERT INTO audit_log` off the critical path into a
    background queue. Currently contributes ~3-5ms to `post_lock_ms`.
 
-4. **Dragonfly persistence** — enable RDB snapshots for order book durability across
+4. **Valkey persistence** — enable RDB snapshots for order book durability across
    restarts. Currently, book state is rebuilt from DB on startup.
 
 5. **Flamegraph profiling** — profile the 11ms p50 path to find remaining hotspots.
    Hypothesis: DB connection pool contention at c=8+ is the next bottleneck.
 
 6. **WebSocket push instead of poll** — current orderbook/trades WS polls every 500ms.
-   Push on book mutation (via Redis pub/sub or Dragonfly streams) would reduce latency
+   Push on book mutation (via Redis pub/sub or Valkey streams) would reduce latency
    for market data consumers.
 
 7. **Retry on `deadlock_detected`** — while the sorted-delta fix eliminates ABBA
@@ -275,7 +275,7 @@ rare in practice and the CAS path is correct for it.
 ### What Changed
 
 Decoupled all PostgreSQL writes from the HTTP response path. After the Lua EVAL
-completes (Dragonfly is the source of truth), the response is returned immediately.
+completes (Valkey is the source of truth), the response is returned immediately.
 Trade inserts, balance settlements, order status updates, and audit log writes are
 dispatched to a background `tokio::sync::mpsc` channel and processed by a single
 background worker.
@@ -293,7 +293,7 @@ POST /api/orders → validate → insert order → lock balance → Lua match �
 
 | Phase | p50 | p95 | p99 | avg | Notes |
 |-------|-----|-----|-----|-----|-------|
-| lua_ms (RT1 ZRANGEBYSCORE + RT2 EVAL) | **3ms** | **34ms** | **105ms** | **9ms** | Dragonfly only |
+| lua_ms (RT1 ZRANGEBYSCORE + RT2 EVAL) | **3ms** | **34ms** | **105ms** | **9ms** | Valkey only |
 | respond_ms (build JSON + send to channel) | **0ms** | **0ms** | **0ms** | **0ms** | Effectively free |
 | **total_ms** (validate + insert + lock + lua + respond) | **18ms** | **171ms** | **243ms** | **41ms** | Hot path end-to-end |
 
@@ -304,7 +304,7 @@ The `total_ms` p50 of 18ms breaks down as:
 - ~2ms: in-memory validation
 - ~6ms: `INSERT INTO orders` (synchronous — order must exist in DB for idempotency)
 - ~7ms: `lock_balance` DB UPDATE (synchronous — prevents double-spend)
-- ~3ms: Lua EVAL (Dragonfly)
+- ~3ms: Lua EVAL (Valkey)
 - ~0ms: respond (build JSON + mpsc try_send)
 
 ### Background Persistence Timing (off hot path)
@@ -345,7 +345,7 @@ or a dedicated connection pool for the background worker.
 #### Why low concurrency (c=1,2) improved
 At c=1, the previous sync path serialized every request through ~15ms of PG I/O after
 Lua matching. With async persistence, the hot path returns immediately after Lua (~3ms
-Dragonfly) + ~15ms DB pre-match ops = ~18ms total. The respond latency dropped from
+Valkey) + ~15ms DB pre-match ops = ~18ms total. The respond latency dropped from
 ~15ms (blocked on persist) to 0ms, enabling faster client-side pipelining.
 
 #### Why high concurrency (c=4-8) regressed
@@ -438,7 +438,7 @@ uses `s.pg` (pg_hot). The background persist worker receives its own dedicated
 
 | Phase | p50 | p95 | p99 | avg | Notes |
 |-------|-----|-----|-----|-----|-------|
-| lua_ms (RT1 ZRANGEBYSCORE + RT2 EVAL) | **6ms** | **49ms** | **120ms** | **15ms** | Dragonfly only |
+| lua_ms (RT1 ZRANGEBYSCORE + RT2 EVAL) | **6ms** | **49ms** | **120ms** | **15ms** | Valkey only |
 | respond_ms (build JSON + channel send) | **0ms** | **0ms** | **1ms** | **0ms** | Effectively free |
 | **total_ms** (validate + insert + lock + lua + respond) | **24ms** | **93ms** | **168ms** | **35ms** | Hot path end-to-end |
 
