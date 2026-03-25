@@ -19,7 +19,6 @@ services:
       --save ""
       --appendonly no
       --loglevel notice
-      --tcp-nodelay yes
     deploy:
       resources:
         limits:
