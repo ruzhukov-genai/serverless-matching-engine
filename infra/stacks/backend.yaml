@@ -35,6 +35,11 @@ Parameters:
       directly (bypasses gateway Lambda for POST /api/orders),
       lambda=sync invoke.
 
+  ValkeyEndpoint:
+    Type: String
+    Default: 'stv1i47uzrgunmx4.rmmdxf.ng.0001.use1.cache.amazonaws.com'
+    Description: Valkey/ElastiCache endpoint (managed outside CF).
+
   # Network inputs (passed from root template via nested stack outputs)
   VpcId:
     Type: AWS::EC2::VPC::Id
@@ -189,22 +194,25 @@ Resources:
         - !Ref PrivateSubnetA
         - !Ref PrivateSubnetB
 
-  ValkeyCache:
-    Type: AWS::ElastiCache::ReplicationGroup
-    Properties:
-      ReplicationGroupDescription: !Sub '${ProjectName} Valkey cache'
-      Engine: valkey
-      EngineVersion: '8.1'
-      CacheNodeType: cache.t4g.micro
-      NumCacheClusters: 1
-      AutomaticFailoverEnabled: false
-      CacheSubnetGroupName: !Ref ElastiCacheSubnetGroup
-      SecurityGroupIds:
-        - !Ref ElastiCacheSecurityGroupId
-      TransitEncryptionEnabled: false
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
+  # ValkeyCache removed from CF — managed manually.
+  # Physical resource was deleted outside CF, causing cascade !GetAtt failures.
+  # TODO: re-import into CF when doing infra cleanup.
+  # ValkeyCache:
+  #   Type: AWS::ElastiCache::ReplicationGroup
+  #   Properties:
+  #     ReplicationGroupDescription: !Sub '${ProjectName} Valkey cache'
+  #     Engine: valkey
+  #     EngineVersion: '8.1'
+  #     CacheNodeType: cache.t4g.micro
+  #     NumCacheClusters: 1
+  #     AutomaticFailoverEnabled: false
+  #     CacheSubnetGroupName: !Ref ElastiCacheSubnetGroup
+  #     SecurityGroupIds:
+  #       - !Ref ElastiCacheSecurityGroupId
+  #     TransitEncryptionEnabled: false
+  #     Tags:
+  #       - Key: Project
+  #         Value: !Ref ProjectName
 
   # =========================================================================
   # CloudWatch Log Groups for Lambda
@@ -257,7 +265,7 @@ Resources:
           AWS_LWA_READINESS_CHECK_PATH: '/api/pairs'
           AWS_LWA_PASS_THROUGH_PATH: '/'
           # Cache: ElastiCache Valkey
-          REDIS_URL: !Sub 'redis://${ValkeyCache.PrimaryEndPoint.Address}:6379'
+          REDIS_URL: !Sub 'redis://${ValkeyEndpoint}:6379'
           RUST_LOG: info
           # Worker dispatch mode — controlled by OrderDispatchMode parameter.
           # sqs-direct doesn't need gateway dispatch (API GW sends to SQS directly),
@@ -307,7 +315,7 @@ Resources:
       Environment:
         Variables:
           # Cache: ElastiCache Valkey
-          REDIS_URL: !Sub 'redis://${ValkeyCache.PrimaryEndPoint.Address}:6379'
+          REDIS_URL: !Sub 'redis://${ValkeyEndpoint}:6379'
           DATABASE_URL: !Sub 'postgres://sme:${DBPassword}@${RDSInstance.Endpoint.Address}:5432/matching_engine'
           RUST_LOG: info
           WS_API_ENDPOINT: !Sub 'https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/ws'
@@ -349,7 +357,7 @@ Resources:
       QueueName: !Sub '${ProjectName}-orders.fifo'
       FifoQueue: true
       ContentBasedDeduplication: false
-      VisibilityTimeout: 60
+      VisibilityTimeout: 180
       MessageRetentionPeriod: 3600
       ReceiveMessageWaitTimeSeconds: 0
       Tags:
@@ -467,7 +475,7 @@ Resources:
       Environment:
         Variables:
           # Cache: ElastiCache Valkey
-          REDIS_URL: !Sub 'redis://${ValkeyCache.PrimaryEndPoint.Address}:6379'
+          REDIS_URL: !Sub 'redis://${ValkeyEndpoint}:6379'
           RUST_LOG: info
       Tags:
         Project: !Ref ProjectName
@@ -600,4 +608,4 @@ Outputs:
 
   ElastiCacheEndpoint:
     Description: ElastiCache Valkey endpoint address
-    Value: !GetAtt ValkeyCache.PrimaryEndPoint.Address
+    Value: !Ref ValkeyEndpoint
