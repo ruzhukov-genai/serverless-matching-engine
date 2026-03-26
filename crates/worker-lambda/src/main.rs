@@ -661,8 +661,16 @@ async fn process_order(state: &WorkerState, payload: &Value) -> Result<()> {
     let persist_ms = persist_start.elapsed().as_millis() as u64;
 
     // 8. Update cache keys (orderbook, trades, ticker, portfolio)
-    update_cache_after_processing(state, &order, &trades).await
-        .context("cache update failed")?;
+    //    Non-fatal: order is already matched + persisted. Stale cache is acceptable —
+    //    next successful order or EventBridge drain will refresh it.
+    if let Err(e) = update_cache_after_processing(state, &order, &trades).await {
+        tracing::warn!(
+            error = %e,
+            order_id = %order.id,
+            pair_id = %order.pair_id,
+            "cache update failed (non-fatal, order already persisted)"
+        );
+    }
 
     // 9. Push updates to WebSocket subscribers (fire-and-forget, non-critical)
     let ws_endpoint = std::env::var("WS_API_ENDPOINT").unwrap_or_default();
@@ -943,7 +951,8 @@ async fn update_cache_after_processing(
     }
 
     // Rebuild orderbook snapshot (Lua single round-trip)
-    let (bids, asks) = cache::orderbook_snapshot_lua(&state.redis, &order.pair_id, 50).await?;
+    let (bids, asks) = cache::orderbook_snapshot_lua(&state.redis, &order.pair_id, 50).await
+        .context("orderbook_snapshot_lua")?;
 
     let bids_json: Vec<Value> = bids.iter().map(|(p, q)| json!([p, q])).collect();
     let asks_json: Vec<Value> = asks.iter().map(|(p, q)| json!([p, q])).collect();
@@ -953,13 +962,16 @@ async fn update_cache_after_processing(
         "bids": bids_json,
         "asks": asks_json,
     }))?;
-    cache::set_and_publish(&state.redis, &format!("cache:orderbook:{}", order.pair_id), &orderbook_json).await?;
+    cache::set_and_publish(&state.redis, &format!("cache:orderbook:{}", order.pair_id), &orderbook_json).await
+        .context("set_and_publish orderbook")?;
 
     // Update trades cache from PG (last 50)
-    update_trades_cache(state, &order.pair_id).await?;
+    update_trades_cache(state, &order.pair_id).await
+        .context("update_trades_cache")?;
 
     // Update ticker cache from PG
-    update_ticker_cache(state, &order.pair_id).await?;
+    update_ticker_cache(state, &order.pair_id).await
+        .context("update_ticker_cache")?;
 
     // Update portfolio caches for all affected users
     let mut dirty_users = std::collections::HashSet::new();
@@ -968,7 +980,8 @@ async fn update_cache_after_processing(
         dirty_users.insert(trade.buyer_id.clone());
         dirty_users.insert(trade.seller_id.clone());
     }
-    update_portfolio_caches(state, &dirty_users).await?;
+    update_portfolio_caches(state, &dirty_users).await
+        .context("update_portfolio_caches")?;
 
     Ok(())
 }
