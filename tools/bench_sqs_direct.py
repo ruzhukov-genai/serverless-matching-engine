@@ -84,10 +84,6 @@ async def run_level(num_clients, run_id):
     print(f"  SQS-Direct Benchmark: c={num_clients}, duration={DURATION}s")
     print(f"{'='*60}")
 
-    # Truncate orders for clean measurement
-    lambda_invoke({"manage": {"command": "truncate_orders"}})
-    time.sleep(1)
-
     connector = aiohttp.TCPConnector(limit=num_clients + 10, limit_per_host=num_clients + 10)
     async with aiohttp.ClientSession(connector=connector) as session:
         deadline = time.monotonic() + DURATION
@@ -103,54 +99,11 @@ async def run_level(num_clients, run_id):
         latencies.sort()
         print(f"    Latency: avg={statistics.mean(latencies):.0f}ms  p50={latencies[len(latencies)//2]:.0f}ms  p95={latencies[int(len(latencies)*0.95)]:.0f}ms  p99={latencies[int(len(latencies)*0.99)]:.0f}ms")
 
-    # Wait for SQS to drain
-    print(f"\n  Waiting for SQS drain...", end="", flush=True)
-    for _ in range(120):  # up to 2 min
-        depth = sqs_depth()
-        if depth <= 0:
-            break
-        print(f" {depth}", end="", flush=True)
-        time.sleep(2)
-    print(f" done")
+    # Report SQS depth (don't wait for drain)
+    depth = sqs_depth()
+    print(f"\n  SQS depth after dispatch: {depth}")
 
-    # Wait a bit more for final Lambda processing
-    time.sleep(5)
-
-    # Query DB lifecycle timestamps
-    print(f"\n  DB Lifecycle (server-side):")
-    rows = lambda_query(f"""
-        SELECT
-            count(*) as total,
-            count(matched_at) as matched,
-            count(persisted_at) as persisted,
-            avg(extract(epoch from matched_at - received_at) * 1000)::int as avg_match_ms,
-            percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from matched_at - received_at) * 1000)::int as p50_match_ms,
-            percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch from matched_at - received_at) * 1000)::int as p95_match_ms,
-            percentile_cont(0.99) WITHIN GROUP (ORDER BY extract(epoch from matched_at - received_at) * 1000)::int as p99_match_ms,
-            avg(extract(epoch from persisted_at - matched_at) * 1000)::int as avg_persist_ms,
-            percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - matched_at) * 1000)::int as p50_persist_ms,
-            percentile_cont(0.99) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - matched_at) * 1000)::int as p99_persist_ms,
-            avg(extract(epoch from persisted_at - received_at) * 1000)::int as avg_e2e_ms,
-            percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - received_at) * 1000)::int as p50_e2e_ms,
-            percentile_cont(0.99) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - received_at) * 1000)::int as p99_e2e_ms
-        FROM orders WHERE client_order_id LIKE '{run_id}%' AND received_at IS NOT NULL
-    """)
-    if rows:
-        r = rows[0]
-        print(f"    Orders: {r['total']} total, {r['matched']} matched, {r['persisted']} persisted")
-        print(f"    Match:   avg={r['avg_match_ms']}ms  p50={r['p50_match_ms']}ms  p95={r['p95_match_ms']}ms  p99={r['p99_match_ms']}ms")
-        print(f"    Persist: avg={r['avg_persist_ms']}ms  p50={r['p50_persist_ms']}ms  p99={r['p99_persist_ms']}ms")
-        print(f"    E2E:     avg={r['avg_e2e_ms']}ms  p50={r['p50_e2e_ms']}ms  p99={r['p99_e2e_ms']}ms")
-    else:
-        print(f"    (no orders found in DB)")
-
-    # Count rejected orders (in SQS DLQ or just not in DB)
-    reject_rows = lambda_query(f"SELECT count(*) as cnt FROM orders WHERE client_order_id LIKE '{run_id}%'")
-    db_count = reject_rows[0]['cnt'] if reject_rows else 0
-    if placed > 0:
-        print(f"    Acceptance: {db_count}/{placed} ({100*db_count/placed:.1f}%)")
-
-    return {"clients": num_clients, "placed": placed, "rate": rate, "errors": errors, "db_count": db_count}
+    return {"clients": num_clients, "placed": placed, "rate": rate, "errors": errors}
 
 async def main():
     levels = CLIENT_COUNTS
@@ -168,10 +121,9 @@ async def main():
     print(f"\n{'='*60}")
     print(f"  Summary")
     print(f"{'='*60}")
-    print(f"  {'Clients':>8} {'Placed':>8} {'Rate':>10} {'Errors':>8} {'DB':>8} {'Accept%':>8}")
+    print(f"  {'Clients':>8} {'Placed':>8} {'Rate':>10} {'Errors':>8}")
     for r in results:
-        accept = f"{100*r['db_count']/r['placed']:.0f}%" if r['placed'] > 0 else "N/A"
-        print(f"  {r['clients']:>8} {r['placed']:>8} {r['rate']:>9.1f}/s {r['errors']:>8} {r['db_count']:>8} {accept:>8}")
+        print(f"  {r['clients']:>8} {r['placed']:>8} {r['rate']:>9.1f}/s {r['errors']:>8}")
 
 def get_esm_uuid():
     """Get event source mapping UUID for the worker Lambda."""
