@@ -40,6 +40,11 @@ Parameters:
     Default: 'stv1i47uzrgunmx4.rmmdxf.ng.0001.use1.cache.amazonaws.com'
     Description: Valkey/ElastiCache endpoint (managed outside CF).
 
+  RDSProxyEndpoint:
+    Type: String
+    Default: 'sme-proxy-v2.proxy-cp3apgpybbhw.us-east-1.rds.amazonaws.com'
+    Description: RDS Proxy endpoint for connection pooling.
+
   # Network inputs (passed from root template via nested stack outputs)
   VpcId:
     Type: AWS::EC2::VPC::Id
@@ -316,7 +321,8 @@ Resources:
         Variables:
           # Cache: ElastiCache Valkey
           REDIS_URL: !Sub 'redis://${ValkeyEndpoint}:6379'
-          DATABASE_URL: !Sub 'postgres://sme:${DBPassword}@${RDSInstance.Endpoint.Address}:5432/matching_engine'
+          # Using RDS Proxy endpoint (not direct RDS) for connection pooling
+          DATABASE_URL: !Sub 'postgres://sme:${DBPassword}@${RDSProxyEndpoint}:5432/matching_engine'
           RUST_LOG: info
           WS_API_ENDPOINT: !Sub 'https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/ws'
       Tags:
