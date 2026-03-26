@@ -28,7 +28,7 @@ Client → API GW → Gateway Lambda (validate) → SQS FIFO → Worker Lambda (
 API Gateway routes `POST /api/orders` directly to SQS FIFO via a native AWS integration. Gateway Lambda is bypassed entirely for the order submission path. All other routes (`GET /api/pairs`, `/api/orderbook`, etc.) still go through Gateway Lambda via the `$default` route.
 
 ```
-Client → API GW ──POST /api/orders──► SQS FIFO → Worker Lambda (ESM)
+Client → API GW ──POST /api/orders──► SQS Standard → Worker Lambda (ESM, MaxConcurrency=50)
                 └──all other routes─► Gateway Lambda
 ```
 
@@ -44,16 +44,16 @@ Client → API GW ──POST /api/orders──► SQS FIFO → Worker Lambda (ES
 
 ## Implementation Details
 
-### SQS FIFO Queue
-- **Name:** `serverless-matching-engine-orders.fifo`
+### SQS Queue
+- **Name:** `serverless-matching-engine-orders` (Standard queue — switched from FIFO on 2026-03-26)
 - **CF-managed:** Yes, conditional on `sqs-direct` mode (parameter `OrderDispatchMode`)
-- **MessageGroupId:** `pair_id` — ensures per-pair FIFO ordering
-- **MessageDeduplicationId:** order `id` (UUID) — prevents duplicate processing
-- **VisibilityTimeout:** Must be ≥ Worker Lambda timeout (120s). Set to 120s.
+- **VisibilityTimeout:** Must be ≥ Worker Lambda timeout (180s)
+- **Why Standard over FIFO:** FIFO serializes processing per MessageGroupId (~20 ord/s drain with single group). Atomicity is already guaranteed by Valkey Lua EVAL, not message ordering. Standard SQS enables parallel Lambda consumption → ~170-230 ord/s drain with MaxConcurrency=50.
 
 ### Worker Lambda (SQS event source mapping)
-- Batch size: 1–10 records per invocation
-- Worker processes each record in the batch sequentially (per-pair ordering preserved within a MessageGroup)
+- Batch size: 10, batching window: 1s
+- MaximumConcurrency: 50 (parallel Lambda invocations)
+- Worker processes each record in the batch sequentially
 - On partial batch failure, only failed records return to the queue
 
 ### Worker validation in `sqs-direct` mode
@@ -78,8 +78,13 @@ This is the **accept-then-reject** model: API Gateway always returns 200 OK (SQS
 - No per-order synchronous validation feedback (client can't know if order was malformed until it's rejected in Worker)
 - Requires SQS VPC endpoint in the network stack (for Lambda ESM in VPC)
 
+### Timestamp handling
+- Worker uses SQS `attributes.SentTimestamp` as `received_at` — captures when the message entered SQS, not when the worker picks it up
+- `persisted_at` is set by Postgres `NOW()` in the INSERT statement
+- This gives true E2E measurement including queue wait time
+
 ### Infrastructure
-- SQS FIFO queue: CF-managed in `backend.yaml`, conditional on `OrderDispatchMode=sqs-direct`
+- SQS Standard queue: CF-managed in `backend.yaml`, conditional on `OrderDispatchMode=sqs-direct`
 - SQS VPC endpoint: added to `network.yaml` (required for Lambda ESM in VPC)
 - Worker Lambda timeout: 120s (increased from 30s to accommodate batch SQS processing)
 
@@ -98,4 +103,4 @@ This is the **accept-then-reject** model: API Gateway always returns 200 OK (SQS
 
 ---
 
-_SQS-direct is the current production mode as of 2026-03-26. `queue` mode remains in code for local dev and testing._
+_SQS-direct is the current production mode as of 2026-03-26. Uses Standard SQS (not FIFO) with MaxConcurrency=50. `queue` mode remains in code for local dev and testing._

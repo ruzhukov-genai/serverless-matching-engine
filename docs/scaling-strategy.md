@@ -13,7 +13,7 @@
 | RDS Proxy | `sme-proxy-v2` | $22 |
 | Lambda Gateway | 512MB, unreserved | pay-per-use |
 | Lambda Worker | 1024MB, 120s timeout, unreserved | pay-per-use |
-| SQS FIFO | `serverless-matching-engine-orders.fifo` | pay-per-use (~$0) |
+| SQS Standard | `serverless-matching-engine-orders` (MaxConcurrency=50) | pay-per-use (~$0) |
 | API Gateway | HTTP API | pay-per-use |
 | **Total fixed** | | **~$55/mo** |
 
@@ -27,7 +27,19 @@
 | Persist p50 | 0.3ms | ~1ms | 2.7ms |
 | Errors | 0 | 0 | 0 |
 
-**Queue mode:**
+**SQS-direct mode (Standard SQS, MaxConcurrency=50):**
+
+| Metric | c=10 | c=50 | c=100 |
+|--------|------|------|-------|
+| Dispatch rate | 868/s | 2,345/s | 2,327/s |
+| Dispatch p50 | 9ms | 19ms | 39ms |
+| Errors | 0 | 0 | 0 |
+
+Worker drain: ~170-230 ord/s (50 concurrent Lambdas × batch 10)
+Match p50=2ms, Persist p50=8ms (server-side, excludes queue wait)
+True E2E (with queue wait): p50=~3min when dispatch >> drain
+
+**Queue mode (legacy):**
 
 | Metric | Value |
 |--------|-------|
@@ -38,11 +50,11 @@
 - 10 users: persist p99 = 29ms
 - 100 users: persist p99 = 15ms (less row-level lock contention)
 
-**Bottleneck chain (in order, sync mode):**
-1. **PG persist latency** — p50=2.7ms at c=40; row-level lock contention eases with 100+ users
-2. **Balance contention** — fewer distinct users = more lock wait; use `{"users": 100}` for benchmarks
-3. **Valkey single-thread** — Lua EVAL is ~17ms (includes network RTT); theoretical max ~60 EVAL/s per shard at this latency
-4. **Queue mode ceiling** — ~220 ord/s gateway dispatch; worker drain ~100 ord/s (SQS-direct bypasses this)
+**Bottleneck chain (current, sqs-direct mode):**
+1. **Worker drain rate** — ~200 ord/s with MaxConcurrency=50 (RDS + Valkey throughput ceiling)
+2. **RDS persist latency** — p50=8ms, p99=83ms at high concurrency (db.t4g.small, ~52 conns)
+3. **Valkey single-thread** — Lua EVAL p50=2ms; theoretical max ~500 EVAL/s per shard
+4. **Dispatch is NOT the bottleneck** — 2,345/s at c=50, ~10× faster than drain
 
 ### Throughput Formula
 
@@ -216,7 +228,7 @@ At 25K/s across 10 pairs, the hottest pair might see 5K EVAL/s. Single Valkey no
 
 | Tier | Target | Workers | RDS | Valkey | Monthly Cost | Key Change |
 |------|--------|---------|-----|--------|-------------|------------|
-| 0 | ~220/s (queue) | — | t4g.small + Proxy | t4g.micro | $55 | **Current** (sqs-direct deployed) |
+| 0 | ~200/s drain, 2345/s dispatch | 50 (MaxConc) | t4g.small + Proxy | t4g.micro | $55 | **Current** (sqs-direct, Standard SQS) |
 | 1 | 500/s | 20 | t4g.medium | t4g.micro | $81 | Bigger RDS + fire-and-forget |
 | 2 | 2,000/s | 40 | t4g.large | t4g.small | $142 | Batch persist (SQS already done) |
 | 3 | 5,000/s | 100 | r7g.large (Multi-AZ) | t4g.medium | $474 | Production hardening |

@@ -26,12 +26,12 @@ template.yaml (root)
                 │ POST /api/orders      │ all other routes
                 │ (sqs-direct mode)     │
       ┌─────────┴───────┐   ┌──────────┴──────────────┐
-      │   SQS FIFO       │   │  Gateway Lambda (x86_64) │
-      │ orders.fifo      │   │  512MB, LWA (buffered)   │
+      │   SQS Standard   │   │  Gateway Lambda (x86_64) │
+      │ orders            │   │  512MB, LWA (buffered)   │
       │ (CF-managed)     │   │  Reads Valkey cache,     │
       └─────────┬───────┘   │  serves REST API         │
                 │ ESM        └─────────────────────────┘
-                │ batch 1-10
+                │ batch 10, MaxConcurrency=50
               ┌─┴──────────────────────────────┐
               │     Worker Lambda (x86_64)      │
               │  1024MB, 120s, native Rust      │
@@ -105,17 +105,17 @@ template.yaml (root)
 - **VPC:** Private subnets A+B
 - **Pool config:** PG max_connections(1), min_connections(0), connect_lazy()
 - **Valkey pool:** 2 connections
-- **SQS trigger:** Event source mapping, batch size 10, VisibilityTimeout 120s
+- **SQS trigger:** Event source mapping, batch size 10, MaxConcurrency=50, batching window 1s
+- **Timestamps:** Uses SQS `attributes.SentTimestamp` for `received_at` (true queue arrival time); `persisted_at` set by Postgres `NOW()`
 - **Validation (sqs-direct):** Worker generates UUID if `id` missing, accepts `time_in_force` alias for `tif`, validates quantity/price constraints. Cache update failures are non-fatal (warn-and-continue).
 
-### SQS FIFO Queue
-- **Name:** `serverless-matching-engine-orders.fifo`
-- **Type:** FIFO with content-based deduplication
+### SQS Standard Queue
+- **Name:** `serverless-matching-engine-orders`
+- **Type:** Standard (switched from FIFO on 2026-03-26 — FIFO serialized to ~20 ord/s per MessageGroupId)
 - **CF-managed:** Yes, conditional on `OrderDispatchMode=sqs-direct` parameter
-- **MessageGroupId:** `pair_id` — per-pair FIFO ordering
-- **MessageDeduplicationId:** order `id` (UUID)
-- **VisibilityTimeout:** 120s (must be ≥ Worker Lambda timeout)
+- **VisibilityTimeout:** 180s (must be ≥ Worker Lambda timeout)
 - **API GW integration:** Native AWS service integration routes `POST /api/orders` directly to SQS (bypasses Gateway Lambda)
+- **Why Standard:** Atomicity guaranteed by Valkey Lua EVAL, not message ordering. Standard enables parallel Lambda consumption with MaxConcurrency=50 → ~170-230 ord/s drain.
 
 ### API Gateway
 - **HTTP API:** `kpvhsf0ub8` — REST proxy to Gateway Lambda (`$default` route) + native SQS integration (`POST /api/orders` in sqs-direct mode)
@@ -200,6 +200,29 @@ aws lambda invoke --function-name serverless-matching-engine-worker \
 
 Match latency (Lua EVAL) is stable at ~17ms across all concurrency levels. Persist latency scales mildly with concurrency due to PG row-level locking.
 
+### SQS-direct mode (Standard SQS, MaxConcurrency=50)
+
+**Dispatch (API GW → SQS, zero Lambda in path):**
+
+| Concurrency | Rate | p50 | p95 | Errors |
+|-------------|------|-----|-----|--------|
+| c=10 | 868/s | 9ms | 28ms | 0 |
+| c=50 | 2,345/s | 19ms | 32ms | 0 |
+| c=100 | 2,327/s | 39ms | 80ms | 0 |
+
+**Processing (Worker Lambda drain):**
+- ~170-230 orders/sec with MaxConcurrency=50
+- Match p50=2ms (Lua EVAL), Persist p50=8ms (RDS via Proxy)
+- **True E2E (includes queue wait):** p50=~3min, p99=~6min when dispatch >> drain
+
+**Comparison: FIFO vs Standard SQS:**
+
+| Metric | FIFO | Standard |
+|--------|------|----------|
+| Dispatch c=10 | 319/s, 58% errors | 868/s, 0 errors |
+| Dispatch c=50 | 301/s, 85% errors | 2,345/s, 0 errors |
+| Processing | ~20 ord/s | ~170-230 ord/s |
+
 ### Queue mode (Valkey LPUSH + EventBridge drain)
 
 | Metric | Value |
@@ -230,7 +253,7 @@ Match latency (Lua EVAL) is stable at ~17ms across all concurrency levels. Persi
 | RDS db.t4g.small | ~$24 |
 | ElastiCache cache.t4g.micro | ~$9 |
 | RDS Proxy (`sme-proxy-v2`) | ~$22 |
-| SQS FIFO | ~$0 (pay per use, ~$0.50/1M requests) |
+| SQS Standard | ~$0 (pay per use, ~$0.40/1M requests) |
 | Lambda | $0 (pay per use) |
 | API Gateway | $0 (pay per use) |
 | CloudFront | ~$0 |
@@ -283,3 +306,7 @@ Match latency (Lua EVAL) is stable at ~17ms across all concurrency levels. Persi
 - **SQS VisibilityTimeout must be ≥ Lambda timeout** — if the Lambda takes longer than VisibilityTimeout, the message becomes visible again and is processed a second time.
 - **`sqs-direct` returns raw XML** — API Gateway's native SQS integration returns the SQS `SendMessage` XML response to the client, not a clean JSON 202. Clients need to handle this.
 - **SQS VPC endpoint required** — Lambda ESM for SQS in a VPC requires a VPC endpoint for `sqs`. Without it, Lambda can't poll the queue.
+- **Standard SQS over FIFO for parallel processing** — FIFO serializes per MessageGroupId (~20 ord/s). Atomicity is guaranteed by Valkey Lua EVAL, not message ordering. Standard SQS with MaxConcurrency=50 → ~170-230 ord/s.
+- **PurgeQueue has 60s cooldown** — can't purge more than once per minute.
+- **In-flight messages survive purge** — messages with active VisibilityTimeout (180s) are not purged. To fully clear: disable ESM → wait for visibility timeout → purge → wait 65s → re-enable ESM.
+- **`received_at` must use SQS SentTimestamp** — if set by the worker at processing time, queue wait is invisible. Use `attributes.SentTimestamp` from the SQS record for true arrival time.
