@@ -37,7 +37,7 @@ Parameters:
 
   ValkeyEndpoint:
     Type: String
-    Default: 'stv1i47uzrgunmx4.rmmdxf.ng.0001.use1.cache.amazonaws.com'
+    Default: 'sme-valkey.rmmdxf.ng.0001.use1.cache.amazonaws.com'
     Description: Valkey/ElastiCache endpoint (managed outside CF).
 
   RDSProxyEndpoint:
@@ -352,17 +352,16 @@ Resources:
       SourceArn: !GetAtt WorkerDrainScheduleRule.Arn
 
   # =========================================================================
-  # SQS FIFO Queue — order dispatch (alternative to Valkey queue + EventBridge)
+  # SQS Standard Queue — order dispatch (alternative to Valkey queue + EventBridge)
   # Gateway sends orders to SQS when ORDER_DISPATCH_MODE=sqs.
   # Event source mapping triggers worker Lambda automatically per batch.
-  # FIFO with per-pair MessageGroupId preserves per-pair ordering.
+  # Standard (not FIFO) allows parallel Lambda processing — no per-group serialization.
+  # Per-pair ordering is handled by the Lua matching engine (atomic EVAL).
   # =========================================================================
   OrderQueue:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub '${ProjectName}-orders.fifo'
-      FifoQueue: true
-      ContentBasedDeduplication: false
+      QueueName: !Sub '${ProjectName}-orders'
       VisibilityTimeout: 180
       MessageRetentionPeriod: 3600
       ReceiveMessageWaitTimeSeconds: 0
@@ -376,8 +375,10 @@ Resources:
       EventSourceArn: !GetAtt OrderQueue.Arn
       FunctionName: !Ref WorkerLambda
       BatchSize: 10
-      MaximumBatchingWindowInSeconds: 0
+      MaximumBatchingWindowInSeconds: 1
       Enabled: true
+      ScalingConfig:
+        MaximumConcurrency: 10
       FunctionResponseTypes:
         - ReportBatchItemFailures
 
@@ -560,8 +561,6 @@ Resources:
       RequestParameters:
         QueueUrl: !Ref OrderQueue
         MessageBody: $request.body
-        MessageGroupId: $request.body.pair_id
-        MessageDeduplicationId: $context.requestId
       TimeoutInMillis: 5000
 
   SqsDirectRoute:
