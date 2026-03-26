@@ -287,7 +287,7 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, LambdaError> {
                     continue;
                 }
             };
-            let order_value: Value = match serde_json::from_str(body) {
+            let mut order_value: Value = match serde_json::from_str(body) {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::error!(error = %e, "SQS record body parse failed");
@@ -295,6 +295,22 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, LambdaError> {
                     continue;
                 }
             };
+            // Inject received_at from SQS SentTimestamp (epoch ms) if not already set.
+            // This captures when the message entered SQS, not when the worker picked it up.
+            if order_value.get("received_at").and_then(|v| v.as_str()).is_none() {
+                if let Some(sent_ts) = record
+                    .get("attributes")
+                    .and_then(|a| a.get("SentTimestamp"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
+                    let dt = chrono::DateTime::from_timestamp_millis(sent_ts)
+                        .unwrap_or_else(Utc::now);
+                    if let Some(obj) = order_value.as_object_mut() {
+                        obj.insert("received_at".to_string(), Value::String(dt.to_rfc3339()));
+                    }
+                }
+            }
             match process_order(state, &order_value).await {
                 Ok(()) => ok_count += 1,
                 Err(e) => {
