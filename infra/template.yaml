@@ -37,6 +37,12 @@ Parameters:
     Default: ''
     Description: ACM certificate ARN for custom domain (us-east-1).
 
+  OrderDispatchMode:
+    Type: String
+    Default: 'queue'
+    AllowedValues: ['queue', 'sqs', 'sqs-direct', 'lambda']
+    Description: Order dispatch mode (queue/sqs/sqs-direct/lambda).
+
 # ---------------------------------------------------------------------------
 # Resources -- Nested CloudFormation stacks (each is a SAM template)
 # ---------------------------------------------------------------------------
@@ -76,6 +82,7 @@ Resources:
         RDSSecurityGroupId: !GetAtt NetworkStack.Outputs.RDSSecurityGroupId
         ElastiCacheSecurityGroupId: !GetAtt NetworkStack.Outputs.ElastiCacheSecurityGroupId
         PublicSubnetB: !GetAtt NetworkStack.Outputs.PublicSubnetB
+        OrderDispatchMode: !Ref OrderDispatchMode
       Tags:
         - Key: Project
           Value: !Ref ProjectName

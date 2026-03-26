@@ -25,8 +25,15 @@ Parameters:
     Default: '*'
     Description: CORS allowed origin for API Gateway. Use your CloudFront URL in production.
 
-  # ImageUri parameters removed -- SAM builds Docker images via Metadata blocks.
-  # sam build creates ECR images; sam deploy pushes and updates Lambda.
+  OrderDispatchMode:
+    Type: String
+    Default: 'queue'
+    AllowedValues: ['queue', 'sqs', 'sqs-direct', 'lambda']
+    Description: >
+      Order dispatch mode. queue=Valkey LPUSH+EventBridge drain,
+      sqs=gateway Lambda sends to SQS, sqs-direct=API GW sends to SQS
+      directly (bypasses gateway Lambda for POST /api/orders),
+      lambda=sync invoke.
 
   # Network inputs (passed from root template via nested stack outputs)
   VpcId:
@@ -69,6 +76,9 @@ Parameters:
 # ---------------------------------------------------------------------------
 # Resources
 # ---------------------------------------------------------------------------
+Conditions:
+  IsSqsDirect: !Equals [!Ref OrderDispatchMode, 'sqs-direct']
+
 Resources:
 
   # =========================================================================
@@ -249,8 +259,10 @@ Resources:
           # Cache: ElastiCache Valkey
           REDIS_URL: !Sub 'redis://${ValkeyCache.PrimaryEndPoint.Address}:6379'
           RUST_LOG: info
-          # Worker dispatch: queue (Valkey LPUSH, ADR-007), sqs (SQS FIFO), or lambda (sync invoke)
-          ORDER_DISPATCH_MODE: queue
+          # Worker dispatch mode — controlled by OrderDispatchMode parameter.
+          # sqs-direct doesn't need gateway dispatch (API GW sends to SQS directly),
+          # but gateway still handles other routes, so we set it to queue as fallback.
+          ORDER_DISPATCH_MODE: !If [IsSqsDirect, 'queue', !Ref OrderDispatchMode]
           ORDER_QUEUE_URL: !Ref OrderQueue
       Tags:
         Project: !Ref ProjectName
@@ -494,6 +506,57 @@ Resources:
       IntegrationUri: !GetAtt GatewayLambda.Arn
       PayloadFormatVersion: '2.0'
       TimeoutInMillis: 30000
+
+  # =========================================================================
+  # API Gateway → SQS direct integration (POST /api/orders)
+  # Bypasses gateway Lambda entirely for order submission.
+  # Validation moved to worker Lambda (accept-then-reject model).
+  # Feature flag: set OrderDispatchMode parameter to 'sqs-direct' to enable.
+  # =========================================================================
+  ApiGwSqsRole:
+    Type: AWS::IAM::Role
+    Condition: IsSqsDirect
+    Properties:
+      RoleName: !Sub '${ProjectName}-apigw-sqs-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SQSSendMessage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt OrderQueue.Arn
+
+  SqsDirectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: IsSqsDirect
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationSubtype: SQS-SendMessage
+      CredentialsArn: !GetAtt ApiGwSqsRole.Arn
+      PayloadFormatVersion: '1.0'
+      RequestParameters:
+        QueueUrl: !Ref OrderQueue
+        MessageBody: $request.body
+        MessageGroupId: $request.body.pair_id
+        MessageDeduplicationId: $context.requestId
+      TimeoutInMillis: 5000
+
+  SqsDirectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: IsSqsDirect
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /api/orders'
+      Target: !Sub 'integrations/${SqsDirectIntegration}'
 
   HttpApiRoute:
     Type: AWS::ApiGatewayV2::Route
