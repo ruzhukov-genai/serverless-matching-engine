@@ -27,6 +27,11 @@ CONN_MODE = "rest"
 # Run ID prefix for client_order_id tagging — set via --run-id or auto-generated
 RUN_ID = None
 
+# DB access mode: True = docker exec psql, False = direct psql with DB_URL
+DOCKER_MODE = True
+DB_URL = None
+LAMBDA_MODE = False
+
 @dataclass
 class LatencyBucket:
     name: str
@@ -105,13 +110,105 @@ def server_snapshot():
     return snap
 
 def db_stats():
+    sql = "SELECT json_build_object('orders', (SELECT count(*) FROM orders), 'trades', (SELECT count(*) FROM trades), 'pg_conns', (SELECT count(*) FROM pg_stat_activity WHERE datname='matching_engine')) as data"
     try:
-        out = subprocess.check_output([
-            "docker", "exec", "sme-postgres", "psql", "-U", "sme", "-d", "matching_engine", "-t", "-c",
-            "SELECT json_build_object('orders', (SELECT count(*) FROM orders), 'trades', (SELECT count(*) FROM trades), 'pg_conns', (SELECT count(*) FROM pg_stat_activity WHERE datname='matching_engine'));"
-        ], text=True).strip()
-        return json.loads(out)
+        if LAMBDA_MODE:
+            payload = json.dumps({"manage": {"command": "query", "sql": sql}})
+            subprocess.check_output([
+                "aws", "lambda", "invoke",
+                "--function-name", "serverless-matching-engine-worker",
+                "--payload", payload,
+                "/tmp/db_stats.json"
+            ], text=True, stderr=subprocess.DEVNULL)
+            with open("/tmp/db_stats.json") as f:
+                resp = json.load(f)
+            if resp.get("rows") and len(resp["rows"]) > 0:
+                row = resp["rows"][0]
+                return row.get("data", row)
+            return {}
+        else:
+            out = subprocess.check_output([
+                "docker", "exec", "sme-postgres", "psql", "-U", "sme", "-d", "matching_engine", "-t", "-c", sql
+            ], text=True).strip()
+            return json.loads(out)
     except: return {}
+
+LIFECYCLE_SQL_TEMPLATE = """
+    SELECT json_build_object(
+        'total_orders', count(*),
+        'matched_orders', count(matched_at),
+        'persisted_orders', count(persisted_at),
+        'total_trades', (SELECT count(*) FROM trades t JOIN orders o ON (t.buy_order_id = o.id OR t.sell_order_id = o.id) WHERE o.client_order_id LIKE '{prefix}%'),
+        'match_p50_ms', percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from matched_at - received_at) * 1000),
+        'match_p95_ms', percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch from matched_at - received_at) * 1000),
+        'match_p99_ms', percentile_cont(0.99) WITHIN GROUP (ORDER BY extract(epoch from matched_at - received_at) * 1000),
+        'match_avg_ms', avg(extract(epoch from matched_at - received_at) * 1000),
+        'persist_p50_ms', percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - matched_at) * 1000),
+        'persist_p95_ms', percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - matched_at) * 1000),
+        'persist_p99_ms', percentile_cont(0.99) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - matched_at) * 1000),
+        'persist_avg_ms', avg(extract(epoch from persisted_at - matched_at) * 1000),
+        'e2e_p50_ms', percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - received_at) * 1000),
+        'e2e_p95_ms', percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - received_at) * 1000),
+        'e2e_p99_ms', percentile_cont(0.99) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - received_at) * 1000),
+        'e2e_avg_ms', avg(extract(epoch from persisted_at - received_at) * 1000)
+    )
+    FROM orders
+    WHERE client_order_id LIKE '{prefix}%'
+      AND received_at IS NOT NULL
+      AND matched_at IS NOT NULL
+"""
+
+def db_lifecycle(run_id, num_clients, docker_mode=True, db_url=None, lambda_mode=False):
+    """Query order lifecycle timestamps from DB for a specific benchmark level.
+    Returns dict with match/persist/e2e latency percentiles and counts."""
+    prefix = f"{run_id}-n{num_clients}-"
+    sql = LIFECYCLE_SQL_TEMPLATE.format(prefix=prefix)
+    try:
+        if lambda_mode:
+            # Use Lambda manage command for AWS benchmarks
+            payload = json.dumps({"manage": {"command": "query", "sql": sql}})
+            out = subprocess.check_output([
+                "aws", "lambda", "invoke",
+                "--function-name", "serverless-matching-engine-worker",
+                "--payload", payload,
+                "/tmp/lifecycle.json"
+            ], text=True, stderr=subprocess.DEVNULL)
+            with open("/tmp/lifecycle.json") as f:
+                resp = json.load(f)
+            if resp.get("status") == "ok" and resp.get("rows"):
+                # rows is a list of row objects; first row has json_build_object result
+                row = resp["rows"][0]
+                # The column name from json_build_object is "json_build_object"
+                for key, val in row.items():
+                    if isinstance(val, str):
+                        result = json.loads(val)
+                        break
+                    elif isinstance(val, dict):
+                        result = val
+                        break
+                else:
+                    result = row
+            else:
+                print(f"    ⚠️ Lambda query returned: {resp}")
+                return {}
+        elif docker_mode:
+            out = subprocess.check_output([
+                "docker", "exec", "sme-postgres", "psql", "-U", "sme", "-d", "matching_engine", "-t", "-c", sql
+            ], text=True).strip()
+            result = json.loads(out)
+        else:
+            out = subprocess.check_output([
+                "psql", db_url, "-t", "-c", sql
+            ], text=True).strip()
+            result = json.loads(out)
+        # Round all numeric values
+        for k, v in result.items():
+            if isinstance(v, float):
+                result[k] = round(v, 2)
+        return result
+    except Exception as e:
+        print(f"    ⚠️ DB lifecycle query failed: {e}")
+        return {}
 
 def valkey_stats():
     try:
@@ -432,6 +529,57 @@ async def run_benchmark():
         print(f"    TCP conns: {peak_conns}  |  FDs: {peak_fds}  |  PG conns: {db_after.get('pg_conns','?')}")
         print(f"    Valkey clients: {df_after.get('df_clients','?')}")
 
+        # DB lifecycle latency (wait for worker to finish processing)
+        if LAMBDA_MODE:
+            # In Lambda mode, orders sit in Valkey queue until worker drains them.
+            # Fire multiple parallel drain invocations for speed.
+            print(f"\n  ⏳ Draining Lambda queue (parallel)...")
+            total_drained = 0
+            drain_rounds = 0
+            PARALLEL_DRAINS = 5
+            while drain_rounds < 20:  # max 20 rounds
+                # Launch parallel drain invocations
+                procs = []
+                for j in range(PARALLEL_DRAINS):
+                    p = subprocess.Popen([
+                        "aws", "lambda", "invoke",
+                        "--function-name", "serverless-matching-engine-worker",
+                        "--payload", '{"drain_queue": true}',
+                        f"/tmp/drain-{j}.json"
+                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    procs.append(p)
+                # Wait for all to complete
+                for p in procs:
+                    p.wait()
+                # Collect results
+                round_total = 0
+                for j in range(PARALLEL_DRAINS):
+                    try:
+                        with open(f"/tmp/drain-{j}.json") as f:
+                            resp = json.load(f)
+                        round_total += resp.get("orders_processed", 0)
+                    except: pass
+                total_drained += round_total
+                drain_rounds += 1
+                print(f"    Round {drain_rounds}: {round_total} orders ({PARALLEL_DRAINS} parallel)")
+                if round_total == 0:
+                    break
+            print(f"    ✅ Total drained: {total_drained} orders in {drain_rounds} rounds")
+            await asyncio.sleep(2)
+        else:
+            await asyncio.sleep(3)
+        lifecycle = db_lifecycle(RUN_ID, num_clients, docker_mode=DOCKER_MODE, db_url=DB_URL, lambda_mode=LAMBDA_MODE)
+        if lifecycle and lifecycle.get("matched_orders"):
+            mo = lifecycle["matched_orders"]
+            po = lifecycle.get("persisted_orders", 0)
+            tt = lifecycle.get("total_trades", 0)
+            print(f"\n  🗄️  DB Order Processing ({mo} matched, {po} persisted, {tt} trades):")
+            print(f"    Match    (recv→match):   avg={lifecycle.get('match_avg_ms',0):>8.1f}ms  p50={lifecycle.get('match_p50_ms',0):>7.1f}ms  p95={lifecycle.get('match_p95_ms',0):>7.1f}ms  p99={lifecycle.get('match_p99_ms',0):>7.1f}ms")
+            print(f"    Persist  (match→DB):     avg={lifecycle.get('persist_avg_ms',0):>8.1f}ms  p50={lifecycle.get('persist_p50_ms',0):>7.1f}ms  p95={lifecycle.get('persist_p95_ms',0):>7.1f}ms  p99={lifecycle.get('persist_p99_ms',0):>7.1f}ms")
+            print(f"    E2E      (recv→persist): avg={lifecycle.get('e2e_avg_ms',0):>8.1f}ms  p50={lifecycle.get('e2e_p50_ms',0):>7.1f}ms  p95={lifecycle.get('e2e_p95_ms',0):>7.1f}ms  p99={lifecycle.get('e2e_p99_ms',0):>7.1f}ms")
+        elif lifecycle:
+            print(f"\n  🗄️  DB: {lifecycle.get('total_orders',0)} orders submitted, {lifecycle.get('matched_orders',0)} matched (worker may still be processing)")
+
         all_results.append({
             "clients": num_clients,
             "orders": o,
@@ -447,17 +595,34 @@ async def run_benchmark():
             "pg_conns": db_after.get("pg_conns", "?"),
             "df_clients": df_after.get("df_clients", "?"),
             "rest": {ep.split("?")[0]: merged.rest_apis[ep].summary() for ep in REST_ENDPOINTS if ep in merged.rest_apis},
+            "lifecycle": lifecycle,
         })
 
     # ── Summary table ─────────────────────────────────────────────────────
     print(f"\n{'═' * 70}")
-    print("  BENCHMARK SUMMARY")
+    print("  BENCHMARK SUMMARY — Client Metrics")
     print(f"{'═' * 70}")
     print(f"{'Clients':>8} {'Ord/s':>7} {'Trd/s':>7} {'Ord avg':>9} {'Ord p95':>9} {'WS msgs':>8} {'CPU':>6} {'Mem MB':>7} {'PG':>4} {'DF':>4} {'FDs':>5}")
     print(f"{'─' * 70}")
     for r in all_results:
         o = r["orders"]
         print(f"{r['clients']:>8} {r['ord_rate']:>7.1f} {r['trade_rate']:>7.1f} {o.get('avg_ms',0):>8.1f}ms {o.get('p95_ms',0):>8.1f}ms {r['ws_messages']:>8} {r['peak_cpu']:>5}% {r['peak_mem']:>7} {r['pg_conns']:>4} {r['df_clients']:>4} {r['peak_fds']:>5}")
+
+    # ── DB Lifecycle Summary ──────────────────────────────────────────────
+    has_lifecycle = any(r.get("lifecycle", {}).get("matched_orders") for r in all_results)
+    if has_lifecycle:
+        print(f"\n{'═' * 90}")
+        print("  DB ORDER LIFECYCLE (server-side timestamps)")
+        print(f"{'═' * 90}")
+        print(f"{'Clients':>8} {'Matched':>8} {'Trades':>7} {'Match p50':>10} {'Match p99':>10} {'Persist p50':>12} {'Persist p99':>12} {'E2E p50':>9} {'E2E p99':>9}")
+        print(f"{'─' * 90}")
+        for r in all_results:
+            lc = r.get("lifecycle", {})
+            if lc and lc.get("matched_orders"):
+                print(f"{r['clients']:>8} {lc.get('matched_orders',0):>8} {lc.get('total_trades',0):>7} "
+                      f"{lc.get('match_p50_ms',0):>9.1f}ms {lc.get('match_p99_ms',0):>9.1f}ms "
+                      f"{lc.get('persist_p50_ms',0):>11.1f}ms {lc.get('persist_p99_ms',0):>11.1f}ms "
+                      f"{lc.get('e2e_p50_ms',0):>8.1f}ms {lc.get('e2e_p99_ms',0):>8.1f}ms")
 
     # ── Bottleneck analysis ───────────────────────────────────────────────
     print(f"\n{'═' * 70}")
@@ -511,6 +676,12 @@ if __name__ == "__main__":
     parser.add_argument("--clients", type=str, default=None, help="Comma-separated client counts (e.g. '1,10,50,100')")
     parser.add_argument("--run-id", type=str, default=None,
                         help="Run ID prefix for client_order_id (default: auto-generated bench-YYYYMMDD-HHMM)")
+    parser.add_argument("--db-url", type=str, default=None,
+                        help="Direct PG connection URL for lifecycle queries (default: docker exec psql)")
+    parser.add_argument("--api", type=str, default=None, help="API base URL (e.g. https://...amazonaws.com)")
+    parser.add_argument("--ws-url", type=str, default=None, help="WebSocket base URL (e.g. wss://...)")
+    parser.add_argument("--lambda", dest="lambda_mode", action="store_true",
+                        help="Use Lambda manage:query for DB lifecycle queries (AWS mode)")
     args = parser.parse_args()
 
     if args.ws:
@@ -519,6 +690,15 @@ if __name__ == "__main__":
         TEST_DURATION = args.duration
     if args.clients:
         CLIENT_COUNTS = [int(x.strip()) for x in args.clients.split(",")]
+    if args.api:
+        BASE_URL = args.api
+    if args.ws_url:
+        WS_BASE = args.ws_url
+    if args.db_url:
+        DOCKER_MODE = False
+        DB_URL = args.db_url
+    if args.lambda_mode:
+        LAMBDA_MODE = True
 
     # Auto-generate RUN_ID if not provided
     from datetime import datetime

@@ -27,7 +27,7 @@ use once_cell::sync::OnceCell;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::{Row, QueryBuilder, Postgres};
+use sqlx::{Row, Column, QueryBuilder, Postgres};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -300,10 +300,32 @@ async fn handle_manage(command: &str, args: &Value) -> Result<Value, LambdaError
             let sql = args.get("sql").and_then(|v| v.as_str())
                 .unwrap_or("SELECT count(*) as cnt FROM orders");
             let pg = standalone_pg().await?;
-            let row = sqlx::query(sql).fetch_one(&pg).await
+            let rows = sqlx::query(sql).fetch_all(&pg).await
                 .map_err(|e| LambdaError::from(e.to_string()))?;
-            let cnt: i64 = row.try_get("cnt").unwrap_or(0);
-            Ok(json!({"status": "ok", "command": "query", "result": cnt}))
+            // Build JSON array of row objects
+            let mut result_rows = Vec::new();
+            for row in &rows {
+                let mut obj = serde_json::Map::new();
+                for col in row.columns() {
+                    let name = col.name();
+                    // Try common types in order
+                    if let Ok(v) = row.try_get::<i64, _>(name) {
+                        obj.insert(name.to_string(), json!(v));
+                    } else if let Ok(v) = row.try_get::<f64, _>(name) {
+                        obj.insert(name.to_string(), json!(v));
+                    } else if let Ok(v) = row.try_get::<String, _>(name) {
+                        obj.insert(name.to_string(), json!(v));
+                    } else if let Ok(v) = row.try_get::<bool, _>(name) {
+                        obj.insert(name.to_string(), json!(v));
+                    } else if let Ok(v) = row.try_get::<serde_json::Value, _>(name) {
+                        obj.insert(name.to_string(), v);
+                    } else {
+                        obj.insert(name.to_string(), json!(null));
+                    }
+                }
+                result_rows.push(json!(obj));
+            }
+            Ok(json!({"status": "ok", "command": "query", "rows": result_rows, "count": result_rows.len()}))
         }
 
         // ── Stateful (needs Valkey + PG via get_state) ────────────
@@ -338,10 +360,11 @@ async fn handle_manage(command: &str, args: &Value) -> Result<Value, LambdaError
                     .arg(format!("orderbook:{}:bids", pair))
                     .arg(format!("orderbook:{}:asks", pair))
                     .arg(format!("version:{}", pair))
+                    .arg(format!("queue:orders:{}", pair))
                     .query_async(&mut *conn).await
                     .unwrap_or(());
             }
-            tracing::info!("manage: orders truncated, book cache cleared");
+            tracing::info!("manage: orders truncated, book + queue cache cleared");
             Ok(json!({"status": "ok", "command": "truncate_orders"}))
         }
         "reset_all" => {
@@ -369,6 +392,7 @@ async fn handle_manage(command: &str, args: &Value) -> Result<Value, LambdaError
                     .arg(format!("orderbook:{}:bids", pair))
                     .arg(format!("orderbook:{}:asks", pair))
                     .arg(format!("version:{}", pair))
+                    .arg(format!("queue:orders:{}", pair))
                     .query_async(&mut *conn).await
                     .unwrap_or(());
             }
@@ -395,7 +419,7 @@ async fn standalone_pg() -> Result<sqlx::PgPool, LambdaError> {
 /// Queue drain mode (ADR-007): RPOP from all pair queues, process each order.
 /// Called by EventBridge schedule or explicit {"drain_queue": true}.
 /// Drains up to MAX_DRAIN_BATCH orders per invocation across all pairs.
-const MAX_DRAIN_BATCH: usize = 50;
+const MAX_DRAIN_BATCH: usize = 100;
 const PAIRS: &[&str] = &["BTC-USDT", "ETH-USDT", "SOL-USDT"];
 
 async fn drain_order_queues(state: &WorkerState) -> Result<Value, LambdaError> {

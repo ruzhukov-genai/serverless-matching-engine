@@ -296,20 +296,18 @@ pub async fn create_order(
     // Dispatch order to worker — mode selected by ORDER_DISPATCH_MODE env var
     match s.dispatch_mode {
         crate::DispatchMode::Lambda => {
-            // Async Lambda invoke — must await inline.
-            // tokio::spawn does NOT work here: Lambda Web Adapter freezes the runtime
-            // immediately after the HTTP response, killing in-flight spawned tasks.
-            // InvocationType::Event means the Lambda service returns 202 quickly (~55ms)
-            // without waiting for the worker to execute.
+            // Synchronous Lambda invoke — gateway waits for worker to complete.
+            // InvocationType::RequestResponse blocks until worker finishes matching + persist.
+            // This gives true E2E latency: client sees the full processing time.
             if let Some(ref lambda_client) = s.lambda_client {
                 let payload = aws_sdk_lambda::primitives::Blob::new(order_str.into_bytes());
                 tracing::info!(
                     order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
-                    arn = %s.worker_lambda_arn, "invoking Worker Lambda"
+                    arn = %s.worker_lambda_arn, "invoking Worker Lambda (sync)"
                 );
                 match lambda_client.invoke()
                     .function_name(&s.worker_lambda_arn)
-                    .invocation_type(aws_sdk_lambda::types::InvocationType::Event)
+                    .invocation_type(aws_sdk_lambda::types::InvocationType::RequestResponse)
                     .payload(payload)
                     .send()
                     .await
@@ -317,7 +315,7 @@ pub async fn create_order(
                     Ok(resp) => tracing::info!(
                         order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
                         status_code = resp.status_code(),
-                        "order dispatched to Worker Lambda"
+                        "order matched by Worker Lambda"
                     ),
                     Err(e) => tracing::error!(
                         order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
