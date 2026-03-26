@@ -31,6 +31,7 @@ RUN_ID = None
 DOCKER_MODE = True
 DB_URL = None
 LAMBDA_MODE = False
+NUM_USERS = 100
 
 @dataclass
 class LatencyBucket:
@@ -333,7 +334,7 @@ async def place_orders(session, stats, client_id, num_clients, deadline):
     seq = 0
     while time.monotonic() < deadline:
         pattern = seq % 4
-        user = f"user-{(client_id % 10) + 1}"
+        user = f"user-{(client_id % NUM_USERS) + 1}"
         if pattern == 0:   side, price, tif = "Sell", "70800.00", "GTC"
         elif pattern == 1: side, price, tif = "Buy",  "70800.00", "GTC"
         elif pattern == 2: side, price, tif = "Buy",  "70600.00", "GTC"
@@ -375,7 +376,7 @@ async def seed_liquidity(num_levels=10, orders_per_level=5):
             bid_price = f"{bid_base - level * 100:.2f}"
             ask_price = f"{ask_base + level * 100:.2f}"
             for i in range(orders_per_level):
-                user = f"user-{(i % 10) + 1}"
+                user = f"user-{(i % NUM_USERS) + 1}"
                 for side, price in [("Buy", bid_price), ("Sell", ask_price)]:
                     body = {
                         "user_id": user, "pair_id": PAIR, "side": side,
@@ -396,7 +397,7 @@ async def seed_liquidity(num_levels=10, orders_per_level=5):
         active_levels = [("Buy", "70600.00"), ("Sell", "70800.00")]
         for side, price in active_levels:
             for i in range(20):  # 20 orders per side = 40 crossable resting orders
-                user = f"user-{(i % 10) + 1}"
+                user = f"user-{(i % NUM_USERS) + 1}"
                 body = {
                     "user_id": user, "pair_id": PAIR, "side": side,
                     "order_type": "Limit", "tif": "GTC",
@@ -418,7 +419,7 @@ async def run_client(client_id, num_clients, deadline):
     connector = aiohttp.TCPConnector(limit=10, force_close=False)
     async with aiohttp.ClientSession(connector=connector) as session:
         await fetch_static(session, stats)
-        user_id = f"user-{(client_id % 10) + 1}"
+        user_id = f"user-{(client_id % NUM_USERS) + 1}"
 
         if CONN_MODE == "ws":
             # WS-only mode: 1 snapshot + 1 mux WS + orders
@@ -682,6 +683,8 @@ if __name__ == "__main__":
     parser.add_argument("--ws-url", type=str, default=None, help="WebSocket base URL (e.g. wss://...)")
     parser.add_argument("--lambda", dest="lambda_mode", action="store_true",
                         help="Use Lambda manage:query for DB lifecycle queries (AWS mode)")
+    parser.add_argument("--users", type=int, default=100,
+                        help="Number of test users (default: 100)")
     args = parser.parse_args()
 
     if args.ws:
@@ -699,6 +702,7 @@ if __name__ == "__main__":
         DB_URL = args.db_url
     if args.lambda_mode:
         LAMBDA_MODE = True
+    NUM_USERS = args.users
 
     # Auto-generate RUN_ID if not provided
     from datetime import datetime

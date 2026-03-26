@@ -331,8 +331,9 @@ async fn handle_manage(command: &str, args: &Value) -> Result<Value, LambdaError
         // ── Stateful (needs Valkey + PG via get_state) ────────────
         "reset_balances" => {
             let state = get_state().await?;
-            tracing::info!("manage: resetting balances");
-            for i in 1..=10 {
+            let num_users = args.get("users").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
+            tracing::info!(num_users, "manage: resetting balances");
+            for i in 1..=num_users {
                 let user = format!("user-{}", i);
                 sqlx::query(
                     "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'BTC', 10, 0)
@@ -345,8 +346,8 @@ async fn handle_manage(command: &str, args: &Value) -> Result<Value, LambdaError
             }
             cache::init_balances_from_pg(&state.redis, &state.pg).await
                 .map_err(|e| LambdaError::from(e.to_string()))?;
-            tracing::info!("manage: balances reset for 10 users");
-            Ok(json!({"status": "ok", "command": "reset_balances", "users": 10}))
+            tracing::info!(num_users, "manage: balances reset");
+            Ok(json!({"status": "ok", "command": "reset_balances", "users": num_users}))
         }
         "truncate_orders" => {
             let state = get_state().await?;
@@ -369,10 +370,11 @@ async fn handle_manage(command: &str, args: &Value) -> Result<Value, LambdaError
         }
         "reset_all" => {
             let state = get_state().await?;
-            tracing::info!("manage: full reset");
+            let num_users = args.get("users").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
+            tracing::info!(num_users, "manage: full reset");
             sqlx::query("TRUNCATE orders CASCADE").execute(&state.pg).await
                 .map_err(|e| LambdaError::from(e.to_string()))?;
-            for i in 1..=10 {
+            for i in 1..=num_users {
                 let user = format!("user-{}", i);
                 sqlx::query(
                     "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'BTC', 10, 0)
@@ -396,8 +398,8 @@ async fn handle_manage(command: &str, args: &Value) -> Result<Value, LambdaError
                     .query_async(&mut *conn).await
                     .unwrap_or(());
             }
-            tracing::info!("manage: full reset complete");
-            Ok(json!({"status": "ok", "command": "reset_all", "users": 10}))
+            tracing::info!(num_users, "manage: full reset complete");
+            Ok(json!({"status": "ok", "command": "reset_all", "users": num_users}))
         }
         _ => Err(LambdaError::from(format!("unknown manage command: {command}")))
     }
