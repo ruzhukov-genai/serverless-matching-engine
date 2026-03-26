@@ -729,8 +729,7 @@ async fn process_order(state: &WorkerState, payload: &Value) -> Result<()> {
     persist_order(state, &order, &trades, &lua_result.trades).await
         .map_err(|e| { tracing::error!(error = %e, order_id = %order.id, "persist_order detail"); e })
         .context("DB persist failed")?;
-    let persisted_at = Utc::now();
-    order.persisted_at = Some(persisted_at);
+    // persisted_at is set by Postgres NOW() inside the INSERT — not Rust-side
     let persist_ms = persist_start.elapsed().as_millis() as u64;
 
     // 8. Update cache keys (orderbook, trades, ticker, portfolio)
