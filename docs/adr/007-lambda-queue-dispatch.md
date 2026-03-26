@@ -4,6 +4,8 @@
 **Date:** 2026-03-25  
 **Decision makers:** Roman Zhukov
 
+> **See also:** ADR-008 for SQS-based dispatch modes (`sqs` and `sqs-direct`).
+
 ## Context
 
 The gateway Lambda currently invokes the worker Lambda directly (synchronous SDK call) for each order. This has several problems:
@@ -35,13 +37,12 @@ The local `sme-api` worker already uses Valkey queues with BRPOP + batch drain (
 - **Consistent architecture** — same queue pattern as local `sme-api` worker
 
 ### Trade-offs:
-- **Added latency** — orders wait up to polling interval (1s) before processing starts
-- **Polling cost** — Lambda invoked every 1s even when idle (~2.6M invocations/month at 1s rate)
+- **Added latency** — orders wait up to polling interval (up to 1 minute) before processing starts
+- **Polling cost** — Lambda invoked every minute even when idle
 - **Queue visibility** — harder to trace individual order → invocation mapping (mitigated by client_order_id tagging)
 
 ### Tuning:
-- Start with EventBridge `rate(1 minute)` + SQS dead-letter for the queue
-- Can reduce to `rate(1 second)` or use Valkey keyspace notifications for lower latency
+- EventBridge schedule: `rate(1 minute)` — see ADR-008 for lower-latency SQS alternatives
 - Batch size: up to 50 per invocation (matches existing `process_persist_batch` limit)
 
 ## Consequences

@@ -22,40 +22,46 @@ template.yaml (root)
          ┌─────────────────────┴─────────────────────┐
          │         API Gateway (HTTP + WebSocket)      │
          │   HTTP: kpvhsf0ub8  WS: 2shnq9yk0c         │
-         └─────────────────────┬─────────────────────┘
-                               │
-              ┌────────────────┴────────────────┐
-              │    Gateway Lambda (x86_64)       │
-              │  512MB, Rust + Lambda Web Adapter│
-              │  Reads Valkey cache, serves      │
-              │  REST API, dispatches orders     │
-              │  to Worker Lambda (inline await) │
-              └────────────────┬────────────────┘
-                               │ (async Lambda invoke)
-              ┌────────────────┴────────────────┐
-              │     Worker Lambda (x86_64)       │
-              │  1024MB, native Rust runtime     │
-              │  Lua EVAL match (Valkey),        │
-              │  persist trades (PG via Proxy),  │
-              │  update cache                    │
+         └──────┬──────────────────────┬─────────────┘
+                │ POST /api/orders      │ all other routes
+                │ (sqs-direct mode)     │
+      ┌─────────┴───────┐   ┌──────────┴──────────────┐
+      │   SQS FIFO       │   │  Gateway Lambda (x86_64) │
+      │ orders.fifo      │   │  512MB, LWA (buffered)   │
+      │ (CF-managed)     │   │  Reads Valkey cache,     │
+      └─────────┬───────┘   │  serves REST API         │
+                │ ESM        └─────────────────────────┘
+                │ batch 1-10
+              ┌─┴──────────────────────────────┐
+              │     Worker Lambda (x86_64)      │
+              │  1024MB, 120s, native Rust      │
+              │  validate + Lua EVAL match,     │
+              │  persist trades (PG via Proxy), │
+              │  update cache                   │
               └────────┬───────────┬────────────┘
                        │           │
           ┌────────────┴──┐  ┌────┴──────────────┐
           │ ElastiCache    │  │  RDS PostgreSQL    │
-          │ Valkey 8.1     │  │  db.t4g.small      │
+          │ Valkey 8.0     │  │  db.t4g.small      │
           │ cache.t4g.micro│  │  via RDS Proxy     │
+          │ (sme-valkey,   │  │  (sme-proxy-v2)    │
+          │  manual)       │  │                    │
           └───────────────┘  └────────────────────┘
 ```
+
+**Note:** Diagram shows the current `sqs-direct` deployment. In `queue` mode, API GW routes all requests through Gateway Lambda, which does LPUSH to Valkey; EventBridge `rate(1 minute)` triggers Worker drain. In `sqs` mode, Gateway Lambda sends to SQS instead of Valkey.
 
 ## Infrastructure Components
 
 ### ElastiCache Valkey (cache.t4g.micro)
-- **Engine:** Valkey 8.1.0
+- **Engine:** Valkey 8.0
 - **Node type:** cache.t4g.micro (2 vCPU, 0.5GB)
-- **CF resource:** `ValkeyCache` (ReplicationGroup, single-node, no automatic failover)
+- **Cluster name:** `sme-valkey`
+- **CF resource:** ~~`ValkeyCache`~~ — **not CF-managed**. The cluster was accidentally deleted when `ValkeyCache` was removed from `backend.yaml`. It was manually recreated with no TLS and no automatic failover.
+- **Endpoint:** `sme-valkey.rmmdxf.ng.0001.use1.cache.amazonaws.com` (CF Parameter `ValkeyEndpoint`, not `!GetAtt`)
+- **TLS:** Disabled (ElastiCache defaults to TLS-on for Valkey 8.0; must explicitly disable at creation)
 - **Purpose:** Order book cache (sorted sets), Lua atomic matching, balance cache,
   pub/sub for real-time feeds, metrics storage
-- **Endpoint:** dynamically assigned by CloudFormation (output: `ElastiCacheEndpoint`)
 
 ### RDS PostgreSQL (db.t4g.small)
 - **Engine:** PostgreSQL 16.6
@@ -66,18 +72,20 @@ template.yaml (root)
 ### RDS Proxy
 - **Name:** `sme-proxy-v2`
 - **Purpose:** Connection pooling for Lambda burst scaling
-- **Endpoint:** `sme-proxy-v2.proxy-cp3apgpybbhw.us-east-1.rds.amazonaws.com`
+- **Endpoint:** `sme-proxy-v2.proxy-cp3apgpybbhw.us-east-1.rds.amazonaws.com` (CF Parameter `RDSProxyEndpoint`, not `!GetAtt`)
 - **Key benefit:** Prevents connection stampede when 40+ Lambdas cold-start simultaneously
+- **SG note:** Proxy shares SG `sg-09224456f3c4aa7ea` with the RDS instance. The SG requires a self-referencing egress rule on port 5432; without it the Proxy can authenticate clients but cannot reach RDS backend.
 
 ### Gateway Lambda
 - **Architecture:** x86_64
 - **Memory:** 512 MB
 - **Timeout:** 30s
 - **Handler:** Lambda Web Adapter (buffered mode, runs Rust axum server on port 3001)
-- **Env vars:** `REDIS_URL`, `ORDER_DISPATCH_MODE=lambda`, `WORKER_LAMBDA_ARN`
+- **Env vars:** `REDIS_URL`, `ORDER_DISPATCH_MODE` (`queue` / `sqs` / `sqs-direct`)
 - **VPC:** Private subnets A+B
 - **Key insight:** Uses `lambda-adapter` extension to run a standard axum HTTP server
 - **Constraint:** `tokio::spawn` does NOT work — LWA freezes runtime after response. All async work must complete inline.
+- **Note (sqs-direct):** In `sqs-direct` mode, Gateway Lambda is NOT in the `POST /api/orders` path. It still handles all other routes via the `$default` route.
 
 ### WS Handler Lambda
 - **Architecture:** x86_64
@@ -91,15 +99,26 @@ template.yaml (root)
 ### Worker Lambda
 - **Architecture:** x86_64
 - **Memory:** 1024 MB
-- **Timeout:** 30s
+- **Timeout:** 120s (increased from 30s to safely process SQS batches within VisibilityTimeout)
 - **Handler:** `bootstrap` (native Rust Lambda runtime via `lambda_runtime` crate)
-- **Env vars:** `DATABASE_URL` (RDS Proxy endpoint), `REDIS_URL` (ElastiCache)
+- **Env vars:** `DATABASE_URL` (RDS Proxy endpoint), `REDIS_URL` (ElastiCache), `ORDER_DISPATCH_MODE`
 - **VPC:** Private subnets A+B
 - **Pool config:** PG max_connections(1), min_connections(0), connect_lazy()
 - **Valkey pool:** 2 connections
+- **SQS trigger:** Event source mapping, batch size 10, VisibilityTimeout 120s
+- **Validation (sqs-direct):** Worker generates UUID if `id` missing, accepts `time_in_force` alias for `tif`, validates quantity/price constraints. Cache update failures are non-fatal (warn-and-continue).
+
+### SQS FIFO Queue
+- **Name:** `serverless-matching-engine-orders.fifo`
+- **Type:** FIFO with content-based deduplication
+- **CF-managed:** Yes, conditional on `OrderDispatchMode=sqs-direct` parameter
+- **MessageGroupId:** `pair_id` — per-pair FIFO ordering
+- **MessageDeduplicationId:** order `id` (UUID)
+- **VisibilityTimeout:** 120s (must be ≥ Worker Lambda timeout)
+- **API GW integration:** Native AWS service integration routes `POST /api/orders` directly to SQS (bypasses Gateway Lambda)
 
 ### API Gateway
-- **HTTP API:** `kpvhsf0ub8` — REST proxy to Gateway Lambda
+- **HTTP API:** `kpvhsf0ub8` — REST proxy to Gateway Lambda (`$default` route) + native SQS integration (`POST /api/orders` in sqs-direct mode)
 - **WebSocket API:** `2shnq9yk0c` — Real-time orderbook and trade feeds
 
 ### CloudFront + S3
@@ -114,6 +133,11 @@ template.yaml (root)
 - **Private Subnet B:** 10.0.3.0/24 (us-east-1b) — Lambda ENIs (AZ redundancy), RDS
 
 Lambda functions are VPC-attached to reach ElastiCache and RDS on private IPs.
+
+**VPC Endpoints (CF-managed Interface endpoints):**
+- `com.amazonaws.us-east-1.lambda` — Lambda SDK calls (gateway → worker in `sqs`/`lambda` modes)
+- `com.amazonaws.us-east-1.sts` — IAM token refresh
+- `com.amazonaws.us-east-1.sqs` — SQS API access from Lambda (required for Worker SQS ESM in VPC)
 
 ## Deploy Process
 
@@ -164,18 +188,31 @@ aws lambda invoke --function-name serverless-matching-engine-worker \
 - **Create new:** `tools/new_migration.sh "add_user_roles"`
 - **Run:** `tools/deploy.sh --migrate-only` or `manage:run_migrations`
 
-## Performance (Benchmark: c=40, 60s)
+## Performance (Benchmarks as of March 26, 2026)
+
+### Sync mode (direct Lambda dispatch)
+
+| Concurrency | Match p50 | Persist p50 | Errors |
+|-------------|-----------|-------------|--------|
+| c=1 | ~17ms | 0.3ms | 0 |
+| c=10 | ~17ms | ~1ms | 0 |
+| c=40 | ~17ms | 2.7ms | 0 |
+
+Match latency (Lua EVAL) is stable at ~17ms across all concurrency levels. Persist latency scales mildly with concurrency due to PG row-level locking.
+
+### Queue mode (Valkey LPUSH + EventBridge drain)
 
 | Metric | Value |
 |--------|-------|
-| Client dispatch rate | 558 orders/sec |
-| Client latency p50/p95/p99 | 71 / 83 / 111 ms |
-| Worker Lua EVAL p50 | 1-2ms |
-| Worker persist p50 | 860ms |
-| Worker total p50 | 2,894ms |
-| Cold start (init) | ~1s |
-| Errors | 0 |
-| Timeouts | 0 |
+| Gateway ceiling | ~220 ord/s |
+| Worker drain rate | ~100 ord/s (5 parallel Lambda × 20 ord/s) |
+| EventBridge schedule | `rate(1 minute)` |
+
+**Note on cache update errors (fixed):** At high concurrency, Worker's post-match cache update was causing ~13% error rate. Fixed by making cache update non-fatal (warn-and-continue). Stale cache is acceptable — next successful order refresh wins.
+
+### Configurable user count
+- `reset_all`/`reset_balances` accept `{"users": N}` (default 100)
+- 100 users vs 10 users: persist p99 dropped from 29ms → 15ms (less balance contention)
 
 ## Endpoints
 
@@ -192,7 +229,8 @@ aws lambda invoke --function-name serverless-matching-engine-worker \
 |---------|---------|
 | RDS db.t4g.small | ~$24 |
 | ElastiCache cache.t4g.micro | ~$9 |
-| RDS Proxy | ~$22 |
+| RDS Proxy (`sme-proxy-v2`) | ~$22 |
+| SQS FIFO | ~$0 (pay per use, ~$0.50/1M requests) |
 | Lambda | $0 (pay per use) |
 | API Gateway | $0 (pay per use) |
 | CloudFront | ~$0 |
@@ -205,12 +243,14 @@ aws lambda invoke --function-name serverless-matching-engine-worker \
 - `connect_lazy()` is essential — `connect()` blocks on TCP handshake; 40+ concurrent Lambdas all blocking = proxy exhaustion
 - PG pool `max_connections(1)` for worker Lambda — one Lambda = one order = one connection
 - RDS Proxy SG rules need both inbound (from Lambda) AND outbound (to RDS + Secrets Manager)
+- **RDS Proxy SG egress trap** — if Proxy shares SG with RDS instance and the SG has egress locked to `127.0.0.1/32`, the Proxy can authenticate clients but can't reach RDS. Fix: add self-referencing egress rule on port 5432 to the shared SG.
 
 ### Docker Builds
 - All 3 Lambdas are x86_64 — no cross-compilation needed on x86_64 build hosts
 - SAM uses legacy Docker builder (no BuildKit) — don't use `COPY --chmod`, use `COPY` + `RUN chmod`
 - `cargo-chef` caches dependency layers — rebuild after dep changes takes ~15min (full) vs ~1min (code-only)
 - `docker system prune -af --volumes` reclaims massive space (78GB+) — run periodically
+- **SAM build always regenerates templates from source** — manual edits to the built `template.yaml` are overwritten. Always edit `infra/stacks/*.yaml`.
 
 ### Lambda Container Recycling
 - SAM deploy automatically creates new image tags — all warm instances get replaced on next invoke
@@ -228,3 +268,18 @@ aws lambda invoke --function-name serverless-matching-engine-worker \
 ### Trade FK Constraints
 - Dropped via migration 005 — concurrent Lambdas match against each other's orders not yet persisted to PG
 - Referential integrity guaranteed by Lua matching engine in Valkey (atomic operations)
+
+### CloudFormation Resource Deletion Trap
+- **Removing a resource from a CF/SAM template causes CF to delete the physical resource** on next deploy.
+- This happened with `ValkeyCache` — removing it from `backend.yaml` destroyed the ElastiCache cluster.
+- Mitigation: before removing a CF resource, either (a) add `DeletionPolicy: Retain`, or (b) move the resource's config to a Parameter before the deploy that removes it.
+- `sme-valkey` cluster was manually recreated; `ValkeyEndpoint` and `RDSProxyEndpoint` are now CF Parameters.
+
+### ElastiCache / Valkey
+- **TLS enabled by default on Valkey 8.0** — AWS enables `TransitEncryptionEnabled=true` by default. If the Redis client URL doesn't have TLS (`rediss://`), connection will fail silently.
+- **AWS CLI v1 doesn't support `--no-transit-encryption-enabled`** — use `--transit-encryption-enabled false` or create via Console.
+
+### SQS + Lambda ESM
+- **SQS VisibilityTimeout must be ≥ Lambda timeout** — if the Lambda takes longer than VisibilityTimeout, the message becomes visible again and is processed a second time.
+- **`sqs-direct` returns raw XML** — API Gateway's native SQS integration returns the SQS `SendMessage` XML response to the client, not a clean JSON 202. Clients need to handle this.
+- **SQS VPC endpoint required** — Lambda ESM for SQS in a VPC requires a VPC endpoint for `sqs`. Without it, Lambda can't poll the queue.

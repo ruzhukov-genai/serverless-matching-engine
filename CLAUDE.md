@@ -31,9 +31,20 @@ docs/
   adr/          → Architecture Decision Records (READ THESE FIRST)
 ```
 
-**Core flow (queue dispatch — ADR-007):**
+**Core flow — three dispatch modes (see ADR-007, ADR-008):**
+
+`queue` mode (local dev default):
 `POST /api/orders` → gateway validates → `LPUSH queue:orders:{pair_id}` (Valkey) → 202 Accepted
-→ EventBridge schedule (1 min) → Worker Lambda drains queue (up to 50 orders) → Lua EVAL match → persist (PG) → update cache
+→ EventBridge schedule (`rate(1 minute)`) → Worker Lambda drains queue (up to 50 orders) → Lua EVAL match → persist (PG) → update cache
+
+`sqs` mode:
+`POST /api/orders` → gateway validates → SQS FIFO enqueue → 202 Accepted
+→ Worker Lambda (ESM, batch 1–10) → Lua EVAL match → persist (PG) → update cache
+
+`sqs-direct` mode (**currently deployed**):
+`POST /api/orders` → API GW native SQS integration → SQS FIFO (bypasses gateway Lambda)
+→ Worker Lambda (ESM, batch 1–10) → validate + Lua EVAL match → persist (PG) → update cache
+All other routes → gateway Lambda via `$default`
 
 **Local dev flow (identical queue pattern):**
 `POST /api/orders` → gateway validates → `LPUSH queue:orders:{pair_id}` → 202 Accepted
@@ -49,6 +60,7 @@ docs/
 - Per-pair queues with bounded concurrency, sem=3 (ADR-005)
 - WebSocket API Gateway for real-time feeds (ADR-006)
 - Queue-based Lambda dispatch replaces direct invoke (ADR-007)
+- SQS dispatch modes: `sqs` and `sqs-direct` (ADR-008); `sqs-direct` currently deployed
 
 ## Stack
 
@@ -254,11 +266,15 @@ All admin operations via direct invocation:
 ```json
 {"manage": {"command": "run_migrations"}}
 {"manage": {"command": "reset_all"}}
+{"manage": {"command": "reset_all", "users": 100}}
 {"manage": {"command": "reset_balances"}}
+{"manage": {"command": "reset_balances", "users": 100}}
 {"manage": {"command": "truncate_orders"}}
 {"manage": {"command": "exec_sql", "sql": "..."}}
 {"manage": {"command": "query", "sql": "..."}}
 ```
+`reset_all` and `reset_balances` accept an optional `"users": N` parameter (default 100).
+More users = less balance contention under load (persist p99 dropped from 29ms at 10 users → 15ms at 100 users).
 
 ### Queue Drain (Worker Lambda — ADR-007)
 Worker is invoked by EventBridge schedule (`rate(1 minute)`). Also supports manual trigger:
@@ -276,6 +292,10 @@ EventBridge events (with `"source": "aws.events"`) trigger drain mode automatica
 - **VPC endpoint SGs must include ALL calling Lambda SGs** — if gateway and worker use different SGs, the VPC endpoint SG must allow both. Symptom: Lambda SDK calls timeout with "dispatch failure" while data connections (Valkey) work fine.
 - **CF SG description must be ASCII only** — em dashes and other non-ASCII chars in `GroupDescription` cause `CREATE_FAILED`.
 - **CF cleanup hangs when old SGs have external references** — manually created VPC endpoints, RDS Proxy, or Lambda ENIs referencing old SGs block CF from deleting them. Fix: update the referencing resources to use new SGs.
+- **CF deletion trap** — removing a resource from a CF/SAM template causes CF to **delete the physical resource** on next deploy. Happened with `ValkeyCache`: removing it from `backend.yaml` destroyed the ElastiCache cluster. Recreated manually as `sme-valkey`; endpoint is now a CF Parameter. Always move sensitive resources to Parameters before removing them from the template.
+- **SAM build always regenerates templates** — `sam build` regenerates `template.yaml` from source. Any manual edits to `infra/template.yaml` are lost on next build. Edit `infra/stacks/*.yaml` instead.
+- **ElastiCache defaults to TransitEncryptionEnabled=true on Valkey 8.0** — AWS CLI v1 doesn't support `--no-transit-encryption-enabled`. Use `--transit-encryption-enabled false` or create via Console. If TLS is unintentionally enabled, the Redis client will fail with a connection error (no TLS in URL).
+- **RDS Proxy SG egress trap** — the Proxy's SG must have egress to the RDS instance on port 5432. If the SG's egress is locked to `127.0.0.1/32` (localhost only), the Proxy can authenticate clients but can't reach the RDS backend. Fix: add a self-referencing egress rule on port 5432 to the shared SG.
 
 ### Migrations
 - Format: `migrations/YYYYMMDDHHMMSS_description.sql`
@@ -287,14 +307,15 @@ EventBridge events (with `"source": "aws.events"`) trigger drain mode automatica
 ### AWS Infrastructure
 | Component | Service | Spec |
 |-----------|---------|------|
-| Cache | ElastiCache Valkey | `cache.t4g.micro`, Valkey 8.1, ReplicationGroup (CF-managed `ValkeyCache`) |
+| Cache | ElastiCache Valkey | `cache.t4g.micro`, Valkey 8.0, **manually created** as `sme-valkey` (not CF-managed); endpoint is a CF Parameter |
 | Database | RDS PostgreSQL | `db.t4g.small`, PG 16.6 |
-| Connection Pool | RDS Proxy | `sme-proxy-v2` |
-| Gateway | Lambda (x86_64) | 512MB, Lambda Web Adapter (buffered mode), queue dispatch |
-| Worker | Lambda (x86_64) | 1024MB, native Rust runtime, EventBridge drain (1 min) |
+| Connection Pool | RDS Proxy | `sme-proxy-v2`; endpoint is a CF Parameter |
+| Gateway | Lambda (x86_64) | 512MB, Lambda Web Adapter (buffered mode), `ORDER_DISPATCH_MODE` controls dispatch |
+| Worker | Lambda (x86_64) | 1024MB, 120s timeout, native Rust runtime; SQS ESM (batch 10) or EventBridge drain |
 | WS Handler | Lambda (x86_64) | 256MB, native Rust runtime |
-| Scheduling | EventBridge | `rate(1 minute)` → Worker Lambda queue drain |
-| VPC Endpoints | Interface | Lambda + STS (CF-managed, private DNS enabled) |
+| Scheduling | EventBridge | `rate(1 minute)` → Worker Lambda queue drain (queue mode only) |
+| SQS FIFO | SQS | `serverless-matching-engine-orders.fifo`, CF-managed (conditional on `sqs-direct` mode) |
+| VPC Endpoints | Interface | Lambda + STS + SQS (CF-managed, private DNS enabled) |
 | Frontend | CloudFront + S3 | `d3ux5yer0uv7b5.cloudfront.net` |
 | HTTP API | API Gateway | `kpvhsf0ub8` |
 | WebSocket | API Gateway WS | `2shnq9yk0c` |

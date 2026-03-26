@@ -11,3 +11,5 @@ Format: `NNN-title.md`. Status: proposed → accepted → superseded/deprecated.
 | 004 | Atomic Lua matching in Valkey | Accepted | 2026-03-15 |
 | 005 | Per-pair queue consumers with bounded concurrency | Accepted | 2026-03-15 |
 | 006 | API Gateway WebSocket API for real-time feeds | Accepted | 2026-03-23 |
+| 007 | Queue-based Lambda dispatch (replace direct invoke) | Accepted | 2026-03-25 |
+| 008 | SQS-based dispatch modes (sqs and sqs-direct) | Accepted | 2026-03-26 |

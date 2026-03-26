@@ -8,30 +8,41 @@
 ### Infrastructure
 | Component | Spec | Cost/mo |
 |-----------|------|---------|
-| RDS PostgreSQL | `db.t4g.micro` (2 vCPU, 1GB, ~26 conns) | $12 |
-| ElastiCache Valkey | `cache.t4g.micro` (2 vCPU, 0.5GB) | $9 |
+| RDS PostgreSQL | `db.t4g.small` (2 vCPU, 2GB, ~52 conns) | $24 |
+| ElastiCache Valkey | `cache.t4g.micro` (2 vCPU, 0.5GB), manually managed | $9 |
+| RDS Proxy | `sme-proxy-v2` | $22 |
 | Lambda Gateway | 512MB, unreserved | pay-per-use |
-| Lambda Worker | 1024MB, unreserved | pay-per-use |
+| Lambda Worker | 1024MB, 120s timeout, unreserved | pay-per-use |
+| SQS FIFO | `serverless-matching-engine-orders.fifo` | pay-per-use (~$0) |
 | API Gateway | HTTP API | pay-per-use |
-| **Total fixed** | | **~$21/mo** |
+| **Total fixed** | | **~$55/mo** |
 
-### Measured Performance
+### Measured Performance (March 26, 2026)
 
-| Metric | c=10 | c=100 |
-|--------|------|-------|
-| Dispatch throughput | 136/s | 1,374/s |
-| Client latency (avg) | 74ms | 72ms |
-| Worker total (p50) | 51ms | — |
-| Worker total (p99) | 1,233ms | — |
-| PG persist (p50) | 28ms | — |
-| PG persist (p99) | 883ms | — |
-| Lua EVAL (p50) | 1ms | — |
+**Sync mode:**
 
-**Bottleneck chain (in order):**
-1. **PG connections** — `db.t4g.micro` maxes out at ~26 connections; c=100 causes stampede
-2. **PG persist latency** — p99=883ms at c=10 due to row-level lock contention
-3. **Lambda invoke overhead** — 55ms per dispatch (client-visible but not throughput-limiting)
-4. **Valkey single-thread** — Lua EVAL is 1ms but serialized; theoretical max ~1000 EVAL/s per shard
+| Metric | c=1 | c=10 | c=40 |
+|--------|-----|------|------|
+| Match p50 (Lua EVAL) | ~17ms | ~17ms | ~17ms |
+| Persist p50 | 0.3ms | ~1ms | 2.7ms |
+| Errors | 0 | 0 | 0 |
+
+**Queue mode:**
+
+| Metric | Value |
+|--------|-------|
+| Gateway ceiling | ~220 ord/s |
+| Worker drain | ~100 ord/s (5 parallel × 20 ord/s) |
+
+**Balance contention reduction:**
+- 10 users: persist p99 = 29ms
+- 100 users: persist p99 = 15ms (less row-level lock contention)
+
+**Bottleneck chain (in order, sync mode):**
+1. **PG persist latency** — p50=2.7ms at c=40; row-level lock contention eases with 100+ users
+2. **Balance contention** — fewer distinct users = more lock wait; use `{"users": 100}` for benchmarks
+3. **Valkey single-thread** — Lua EVAL is ~17ms (includes network RTT); theoretical max ~60 EVAL/s per shard at this latency
+4. **Queue mode ceiling** — ~220 ord/s gateway dispatch; worker drain ~100 ord/s (SQS-direct bypasses this)
 
 ### Throughput Formula
 
@@ -78,33 +89,35 @@ with cache updates. But PG connections are the hard ceiling.
 
 ### Tier 2: 2,000 orders/sec (Target: Early production)
 
-**Changes required:**
+**SQS dispatch is now implemented** (as of 2026-03-26, ADR-008). `sqs-direct` mode eliminates Gateway Lambda from the order submission path entirely — API Gateway routes `POST /api/orders` directly to SQS FIFO, Worker Lambda picks up via event source mapping (batch size 10).
+
+**Remaining changes for full Tier 2:**
 
 | Change | Why | Cost delta |
 |--------|-----|------------|
 | RDS → `db.t4g.large` | 236 max_connections (supports c=40 × 5) | +$48/mo vs Tier 1 |
-| RDS Proxy | Connection pooling for Lambda burst elasticity | +$22/mo |
 | Worker reserved concurrency = 40 | 40 parallel workers | $0 |
-| SQS between Gateway and Worker | Decouple dispatch, absorb bursts | ~$1/mo |
 | Batch PG persist (multi-row INSERT) | Reduce per-order persist overhead | $0 (code change) |
 | Valkey → `cache.t4g.small` | More memory for larger order books | +$14/mo |
 
+**Already done:**
+- ✅ RDS Proxy (`sme-proxy-v2`) — connection pooling for burst scaling ($22/mo, already in prod)
+- ✅ SQS FIFO dispatch (ADR-008) — `sqs-direct` deployed, Worker ESM batch=10
+
 **Expected result:**
 - 40 workers × (1000/80ms batched) ≈ 500/s baseline, ~2000/s with SQS batching
-- SQS allows workers to pull batches of 10 orders → amortize PG round-trip
+- SQS allows workers to process batches of 10 orders → amortize PG round-trip
 - RDS Proxy handles connection multiplexing for burst to 100+ Lambdas
 
-**Estimated monthly cost:** ~$142/mo (+$85 vs Tier 1)
+**Estimated monthly cost:** ~$142/mo (RDS Proxy already included in current ~$55/mo base)
 
 **What to test:**
-- [ ] SQS batch processing (pull 10 orders, match sequentially, batch INSERT)
-- [ ] Measure batch persist improvement (expect p50: 28ms → 5ms per order)
-- [ ] Verify RDS Proxy doesn't add significant latency
+- [ ] Benchmark `sqs-direct` mode at c=40 sustained
+- [ ] Measure batch persist improvement (expect p50 ≤ 5ms per order with batching)
+- [ ] Verify Worker ESM backpressure (SQS VisibilityTimeout ≥ Lambda timeout=120s ✅)
 - [ ] Load test at c=40 sustained for 5 minutes
 
-**Code changes:**
-- Gateway → SQS (replace Lambda invoke with `sqs.send_message()`)
-- Worker → SQS trigger with `batchSize=10`
+**Remaining code changes:**
 - Worker persist: multi-row INSERT for orders + trades in single statement
 
 ---
@@ -203,9 +216,9 @@ At 25K/s across 10 pairs, the hottest pair might see 5K EVAL/s. Single Valkey no
 
 | Tier | Target | Workers | RDS | Valkey | Monthly Cost | Key Change |
 |------|--------|---------|-----|--------|-------------|------------|
-| 0 | 135/s | 10 | t4g.micro | t4g.micro | $21 | Current |
-| 1 | 500/s | 20 | t4g.medium | t4g.micro | $57 | Bigger RDS + fire-and-forget |
-| 2 | 2,000/s | 40 | t4g.large + Proxy | t4g.small | $142 | SQS + batch persist |
+| 0 | ~220/s (queue) | — | t4g.small + Proxy | t4g.micro | $55 | **Current** (sqs-direct deployed) |
+| 1 | 500/s | 20 | t4g.medium | t4g.micro | $81 | Bigger RDS + fire-and-forget |
+| 2 | 2,000/s | 40 | t4g.large | t4g.small | $142 | Batch persist (SQS already done) |
 | 3 | 5,000/s | 100 | r7g.large (Multi-AZ) | t4g.medium | $474 | Production hardening |
 | 4 | 10,000/s | 200 | r7g.xlarge + PIOPS | r7g.large + replica | $1,051 | Per-pair scaling |
 | 5 | 25,000/s | 500 | r7g.2xlarge + PIOPS | 3-shard cluster | $2,055 | Async persist + cluster |
@@ -255,4 +268,6 @@ FROM orders WHERE received_at IS NOT NULL;
 | Date | Decision | Rationale |
 |------|----------|-----------|
 | 2026-03-24 | Created scaling strategy | Need clear path from POC to 25K/s |
-| | | |
+| 2026-03-26 | Implemented SQS dispatch (ADR-008) | Eliminate gateway Lambda from order path, near-zero dispatch latency |
+| 2026-03-26 | Made cache update non-fatal | 13% error rate at high concurrency traced to cache update; stale cache acceptable |
+| 2026-03-26 | RDS upgraded to db.t4g.small + Proxy | Persistent pool + proxy already in prod; updated cost baseline |
