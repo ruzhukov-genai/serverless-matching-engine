@@ -2,7 +2,7 @@
 
 > A high-performance, stateless order matching engine in **Rust**, deployed as AWS Lambda functions.
 
-Each order invocation acquires a per-pair lock, loads the order book from cache, matches atomically via Lua, persists results, and releases. Fully serverless — scales to zero when idle, scales out automatically under load.
+Orders are queued in Valkey and batch-processed by a Lambda worker on an EventBridge schedule. Matching is atomic via Lua EVAL. Fully serverless — scales to zero when idle, scales out automatically under load.
 
 ## Stack
 
@@ -21,9 +21,13 @@ Each order invocation acquires a per-pair lock, loads the order book from cache,
 ```
 Client → CloudFront → API Gateway → Gateway Lambda (HTTP/WS)
                                          │
-                                    async invoke
+                                    LPUSH to Valkey queue
+                                    (returns 202 instantly)
+                                         │
+                              EventBridge (1 min schedule)
                                          │
                                     Worker Lambda
+                                    (drains up to 50 orders)
                                     ┌────┴────┐
                                     │ Lua EVAL │ ← Valkey (ElastiCache)
                                     │ (match)  │
@@ -34,9 +38,9 @@ Client → CloudFront → API Gateway → Gateway Lambda (HTTP/WS)
                                     PostgreSQL (RDS via Proxy)
 ```
 
-**Core flow:**
-`POST /api/orders` → Gateway validates → async invoke Worker Lambda → 202 Accepted
-→ Worker: lock balance (PG) → Lua EVAL match (Valkey) → persist trades (PG) → update cache
+**Core flow (ADR-007):**
+`POST /api/orders` → Gateway validates → `LPUSH queue:orders:{pair_id}` → 202 Accepted
+→ EventBridge fires → Worker drains queue → Lua EVAL match (Valkey) → persist (PG) → update cache
 
 ## Structure
 

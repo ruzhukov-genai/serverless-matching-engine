@@ -31,11 +31,11 @@ docs/
   adr/          → Architecture Decision Records (READ THESE FIRST)
 ```
 
-**Core flow (gateway → worker Lambda):**
-`POST /api/orders` → gateway validates → async invoke Worker Lambda → 202 Accepted
-→ Worker Lambda → lock balance (PG) → Lua EVAL match (Valkey) → persist trades (PG) → update cache
+**Core flow (queue dispatch — ADR-007):**
+`POST /api/orders` → gateway validates → `LPUSH queue:orders:{pair_id}` (Valkey) → 202 Accepted
+→ EventBridge schedule (1 min) → Worker Lambda drains queue (up to 50 orders) → Lua EVAL match → persist (PG) → update cache
 
-**Legacy flow (local dev):**
+**Local dev flow (identical queue pattern):**
 `POST /api/orders` → gateway validates → `LPUSH queue:orders:{pair_id}` → 202 Accepted
 → worker BRPOP → lock balance (PG) → Lua EVAL match (Valkey) → async persist (PG) → update cache
 
@@ -47,6 +47,8 @@ docs/
 - DB persistence is off the hot path (ADR-003)
 - Matching is atomic Lua in Valkey (ADR-004)
 - Per-pair queues with bounded concurrency, sem=3 (ADR-005)
+- WebSocket API Gateway for real-time feeds (ADR-006)
+- Queue-based Lambda dispatch replaces direct invoke (ADR-007)
 
 ## Stack
 
@@ -192,7 +194,7 @@ python3 tools/benchmark.py
 | `crates/shared/src/cache.rs` | Order book cache (sorted sets + Lua matching) |
 | `crates/shared/src/lua/match_order.lua` | Atomic Lua matching script |
 | `crates/shared/src/lock.rs` | Distributed locking (SET NX EX + fencing) |
-| `crates/shared/src/integration_tests.rs` | 64 integration tests |
+| `crates/shared/src/integration_tests.rs` | 128 integration tests |
 | `tests/smoke/smoke_test.py` | 10 end-to-end smoke tests (Python + Playwright) |
 | `tests/integration/test_orderbook_pairs.sh` | API + WS pair isolation shell tests |
 
@@ -200,7 +202,7 @@ python3 tools/benchmark.py
 | Path | Purpose |
 |------|---------|
 | `docs/aws-architecture.md` | AWS infra: SAM stacks, Lambda, EC2, gotchas |
-| `docs/adr/*.md` | Architecture Decision Records (5 active) |
+| `docs/adr/*.md` | Architecture Decision Records (7 active) |
 | `docs/specs/features.md` | Feature spec (Tier 1/2/3 order types, TIF, STP) |
 | `docs/specs/matching-engine.md` | Matching engine spec |
 | `docs/specs/common-functions.md` | Shared functions spec (locking, cache keys) |
@@ -208,14 +210,14 @@ python3 tools/benchmark.py
 | `docs/planning/tasks.md` | Task backlog |
 | `docs/benchmarks/` | Historical benchmark results (2026-03-14) |
 | `docs/brainstorm/README.md` | Open questions + resolved decisions |
-| `tools/benchmark.py` | Comprehensive load test + server profiling |
+| `tools/benchmark.py` | Load test with client_order_id tagging, liquidity seeding, DB lifecycle queries |
 
 ### Infrastructure
 | Path | Purpose |
 |------|---------|
 | `infra/template.yaml` | Root SAM template (3 nested stacks) |
-| `infra/stacks/network.yaml` | VPC, subnets, security groups |
-| `infra/stacks/backend.yaml` | EC2, Lambda ×2, API Gateway, UserData |
+| `infra/stacks/network.yaml` | VPC, subnets, security groups, VPC endpoints (Lambda + STS) |
+| `infra/stacks/backend.yaml` | Lambda ×3, API Gateway HTTP + WS, EventBridge schedule, ElastiCache |
 | `infra/stacks/frontend.yaml` | S3, CloudFront, OAC |
 | `infra/Dockerfile.gateway` | Gateway Lambda Docker build (x86_64, Lambda Web Adapter) |
 | `infra/Dockerfile.worker` | Worker Lambda Docker build (x86_64, native runtime) |
@@ -258,11 +260,22 @@ All admin operations via direct invocation:
 {"manage": {"command": "query", "sql": "..."}}
 ```
 
+### Queue Drain (Worker Lambda — ADR-007)
+Worker is invoked by EventBridge schedule (`rate(1 minute)`). Also supports manual trigger:
+```json
+{"drain_queue": true}
+```
+Drains up to 50 orders from all pair queues (`queue:orders:{pair_id}`) per invocation.
+EventBridge events (with `"source": "aws.events"`) trigger drain mode automatically.
+
 ### Deploy Gotchas
 - **SAM uses legacy Docker builder** — no BuildKit features (`COPY --chmod`). Use `COPY` + `RUN chmod` instead.
 - **Lambda Web Adapter (buffered mode)**: `tokio::spawn` does NOT work for background tasks — LWA freezes the runtime immediately after the HTTP response. All async work must complete before the handler returns.
 - **CloudFormation cannot change resource types** — if you need to change e.g. `CacheCluster` → `ReplicationGroup`, create a new resource with a different logical name.
 - **ElastiCache ReplicationGroup requires `AutomaticFailoverEnabled: false`** for single-node (`NumCacheClusters: 1`).
+- **VPC endpoint SGs must include ALL calling Lambda SGs** — if gateway and worker use different SGs, the VPC endpoint SG must allow both. Symptom: Lambda SDK calls timeout with "dispatch failure" while data connections (Valkey) work fine.
+- **CF SG description must be ASCII only** — em dashes and other non-ASCII chars in `GroupDescription` cause `CREATE_FAILED`.
+- **CF cleanup hangs when old SGs have external references** — manually created VPC endpoints, RDS Proxy, or Lambda ENIs referencing old SGs block CF from deleting them. Fix: update the referencing resources to use new SGs.
 
 ### Migrations
 - Format: `migrations/YYYYMMDDHHMMSS_description.sql`
@@ -277,9 +290,11 @@ All admin operations via direct invocation:
 | Cache | ElastiCache Valkey | `cache.t4g.micro`, Valkey 8.1, ReplicationGroup (CF-managed `ValkeyCache`) |
 | Database | RDS PostgreSQL | `db.t4g.small`, PG 16.6 |
 | Connection Pool | RDS Proxy | `sme-proxy-v2` |
-| Gateway | Lambda (x86_64) | 512MB, Lambda Web Adapter (buffered mode) |
-| Worker | Lambda (x86_64) | 1024MB, native Rust runtime |
+| Gateway | Lambda (x86_64) | 512MB, Lambda Web Adapter (buffered mode), queue dispatch |
+| Worker | Lambda (x86_64) | 1024MB, native Rust runtime, EventBridge drain (1 min) |
 | WS Handler | Lambda (x86_64) | 256MB, native Rust runtime |
+| Scheduling | EventBridge | `rate(1 minute)` → Worker Lambda queue drain |
+| VPC Endpoints | Interface | Lambda + STS (CF-managed, private DNS enabled) |
 | Frontend | CloudFront + S3 | `d3ux5yer0uv7b5.cloudfront.net` |
 | HTTP API | API Gateway | `kpvhsf0ub8` |
 | WebSocket | API Gateway WS | `2shnq9yk0c` |
