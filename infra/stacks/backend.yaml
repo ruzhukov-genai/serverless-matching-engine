@@ -99,7 +99,18 @@ Resources:
                   - ecr:GetDownloadUrlForLayer
                   - ecr:BatchGetImage
                 Resource: '*'
-        # InvokeWorkerLambda policy removed — gateway uses queue dispatch (ADR-007)
+        # SQS — gateway sends orders, worker receives via event source mapping
+        - PolicyName: SQSOrderQueue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt OrderQueue.Arn
         - PolicyName: ManageWebSocketConnections
           PolicyDocument:
             Version: '2012-10-17'
@@ -238,8 +249,9 @@ Resources:
           # Cache: ElastiCache Valkey
           REDIS_URL: !Sub 'redis://${ValkeyCache.PrimaryEndPoint.Address}:6379'
           RUST_LOG: info
-          # Worker dispatch: queue mode — gateway LPUSH to Valkey, worker drains on schedule (ADR-007)
+          # Worker dispatch: queue (Valkey LPUSH, ADR-007), sqs (SQS FIFO), or lambda (sync invoke)
           ORDER_DISPATCH_MODE: queue
+          ORDER_QUEUE_URL: !Ref OrderQueue
       Tags:
         Project: !Ref ProjectName
 
@@ -312,6 +324,36 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt WorkerDrainScheduleRule.Arn
+
+  # =========================================================================
+  # SQS FIFO Queue — order dispatch (alternative to Valkey queue + EventBridge)
+  # Gateway sends orders to SQS when ORDER_DISPATCH_MODE=sqs.
+  # Event source mapping triggers worker Lambda automatically per batch.
+  # FIFO with per-pair MessageGroupId preserves per-pair ordering.
+  # =========================================================================
+  OrderQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-orders.fifo'
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 3600
+      ReceiveMessageWaitTimeSeconds: 0
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  OrderQueueEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt OrderQueue.Arn
+      FunctionName: !Ref WorkerLambda
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 0
+      Enabled: true
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
 
   # =========================================================================
   # WebSocket API for real-time feeds (ADR-006)

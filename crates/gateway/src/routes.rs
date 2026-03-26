@@ -326,6 +326,34 @@ pub async fn create_order(
                 tracing::error!("dispatch_mode=lambda but lambda_client is None");
             }
         }
+        crate::DispatchMode::Sqs => {
+            // Send to SQS — Lambda event source mapping triggers worker automatically
+            if let Some(ref sqs_client) = s.sqs_client {
+                tracing::info!(
+                    order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
+                    "sending order to SQS"
+                );
+                match sqs_client.send_message()
+                    .queue_url(&s.order_queue_url)
+                    .message_body(&order_str)
+                    .message_group_id(&req.pair_id)
+                    .message_deduplication_id(&order_id.to_string())
+                    .send()
+                    .await
+                {
+                    Ok(_) => tracing::info!(
+                        order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
+                        "order sent to SQS"
+                    ),
+                    Err(e) => tracing::error!(
+                        order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
+                        error = %e, "SQS send failed"
+                    ),
+                }
+            } else {
+                tracing::error!("dispatch_mode=sqs but sqs_client is None");
+            }
+        }
         crate::DispatchMode::Queue => {
             // LPUSH to Valkey queue (local dev / EC2 worker)
             let mut conn = s.redis.get().await?;

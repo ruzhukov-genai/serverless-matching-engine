@@ -1,10 +1,13 @@
-//! Worker Lambda — processes orders via queue drain or direct invocation.
+//! Worker Lambda — processes orders via SQS, queue drain, or direct invocation.
 //!
-//! Two modes (ADR-007):
-//!   1. **Queue drain** (primary): Invoked by EventBridge schedule (rate(1 minute)).
+//! Three modes:
+//!   1. **SQS batch** (preferred): Triggered by SQS event source mapping.
+//!      Gateway sends order JSON to SQS (FIFO, per-pair message group).
+//!      Lambda processes batch of 1-10 records. Set `ORDER_DISPATCH_MODE=sqs` on gateway.
+//!   2. **Queue drain** (ADR-007): Invoked by EventBridge schedule (rate(1 minute)).
 //!      RPOP from all `queue:orders:{pair_id}` queues, process up to 50 orders per invocation.
 //!      Gateway pushes to Valkey queue (LPUSH) and returns 202 immediately.
-//!   2. **Direct invoke** (legacy): Single order in Lambda event payload.
+//!   3. **Direct invoke** (legacy): Single order in Lambda event payload.
 //!      Used when `ORDER_DISPATCH_MODE=lambda` in gateway.
 //!
 //! Flow per order:
@@ -257,6 +260,51 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, LambdaError> {
         let state = get_state().await?;
         let result = drain_order_queues(state).await?;
         return Ok(result);
+    }
+
+    // ── SQS event mode ─────────────────────────────────────────────
+    // SQS event source mapping: {"Records": [{"body": "<order JSON>", ...}, ...]}
+    // Each record.body is an order JSON string.
+    if let Some(records) = payload.get("Records").and_then(|v| v.as_array()) {
+        let state = get_state().await?;
+        let total = records.len();
+        let mut ok_count = 0usize;
+        let mut err_count = 0usize;
+        tracing::info!(count = total, "processing SQS batch");
+
+        for record in records {
+            let body = match record.get("body").and_then(|v| v.as_str()) {
+                Some(b) => b,
+                None => {
+                    tracing::warn!("SQS record missing body, skipping");
+                    err_count += 1;
+                    continue;
+                }
+            };
+            let order_value: Value = match serde_json::from_str(body) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(error = %e, "SQS record body parse failed");
+                    err_count += 1;
+                    continue;
+                }
+            };
+            match process_order(state, &order_value).await {
+                Ok(()) => ok_count += 1,
+                Err(e) => {
+                    tracing::error!(error = %e, "SQS order processing failed");
+                    err_count += 1;
+                }
+            }
+        }
+
+        tracing::info!(total, ok_count, err_count, "SQS batch complete");
+        return Ok(json!({
+            "mode": "sqs_batch",
+            "total": total,
+            "ok": ok_count,
+            "errors": err_count,
+        }));
     }
 
     // ── Direct invoke mode (legacy) ──────────────────────────────────

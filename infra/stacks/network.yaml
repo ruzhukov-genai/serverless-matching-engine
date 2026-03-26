@@ -380,6 +380,19 @@ Resources:
       SecurityGroupIds:
         - !Ref VpcEndpointSecurityGroup
 
+  SqsVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sqs'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
 # ---------------------------------------------------------------------------
 # Outputs
 # ---------------------------------------------------------------------------
