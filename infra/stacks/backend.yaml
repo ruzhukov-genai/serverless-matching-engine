@@ -378,7 +378,7 @@ Resources:
       MaximumBatchingWindowInSeconds: 1
       Enabled: true
       ScalingConfig:
-        MaximumConcurrency: 10
+        MaximumConcurrency: 50
       FunctionResponseTypes:
         - ReportBatchItemFailures
 
