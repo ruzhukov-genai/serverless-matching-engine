@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 API_URL = "https://kpvhsf0ub8.execute-api.us-east-1.amazonaws.com"
 WORKER_LAMBDA = "serverless-matching-engine-worker"
-SQS_URL = "https://queue.amazonaws.com/210352747749/serverless-matching-engine-orders.fifo"
+SQS_URL = "https://queue.amazonaws.com/210352747749/serverless-matching-engine-orders"
 PAIR = "BTC-USDT"
 DURATION = 30
 NUM_USERS = 100
@@ -173,5 +173,56 @@ async def main():
         accept = f"{100*r['db_count']/r['placed']:.0f}%" if r['placed'] > 0 else "N/A"
         print(f"  {r['clients']:>8} {r['placed']:>8} {r['rate']:>9.1f}/s {r['errors']:>8} {r['db_count']:>8} {accept:>8}")
 
+def get_esm_uuid():
+    """Get event source mapping UUID for the worker Lambda."""
+    try:
+        return subprocess.check_output([
+            "aws", "lambda", "list-event-source-mappings",
+            "--function-name", WORKER_LAMBDA,
+            "--query", "EventSourceMappings[0].UUID", "--output", "text"
+        ], stderr=subprocess.DEVNULL).decode().strip()
+    except:
+        return None
+
+def purge_queue():
+    """Purge remaining SQS messages after benchmark completes."""
+    depth = sqs_depth()
+    if depth <= 0:
+        print(f"\n  Queue empty, no purge needed.")
+        return
+
+    print(f"\n  Purging SQS queue ({depth} messages)...", flush=True)
+    try:
+        esm_uuid = get_esm_uuid()
+        if esm_uuid and esm_uuid != "None":
+            # Disable ESM to stop re-delivery during purge
+            subprocess.check_output([
+                "aws", "lambda", "update-event-source-mapping",
+                "--uuid", esm_uuid, "--no-enabled"
+            ], stderr=subprocess.DEVNULL)
+            print("    ESM disabled. Waiting for in-flight messages...", flush=True)
+            # Wait for visibility timeout (180s) + buffer
+            time.sleep(200)
+
+        subprocess.check_output([
+            "aws", "sqs", "purge-queue", "--queue-url", SQS_URL
+        ], stderr=subprocess.DEVNULL)
+        print("    Purge requested. Waiting for completion...", flush=True)
+        time.sleep(65)
+
+        if esm_uuid and esm_uuid != "None":
+            subprocess.check_output([
+                "aws", "lambda", "update-event-source-mapping",
+                "--uuid", esm_uuid, "--enabled",
+                "--scaling-config", '{"MaximumConcurrency":50}'
+            ], stderr=subprocess.DEVNULL)
+            print("    ESM re-enabled.", flush=True)
+
+        depth = sqs_depth()
+        print(f"    Final queue depth: {depth}")
+    except Exception as e:
+        print(f"    Purge error: {e}")
+
 if __name__ == "__main__":
     asyncio.run(main())
+    purge_queue()
