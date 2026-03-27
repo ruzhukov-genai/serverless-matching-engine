@@ -27,13 +27,12 @@ Parameters:
 
   OrderDispatchMode:
     Type: String
-    Default: 'queue'
-    AllowedValues: ['queue', 'sqs', 'sqs-direct', 'lambda']
+    Default: 'inline'
+    AllowedValues: ['inline', 'queue', 'sqs', 'sqs-direct']
     Description: >
-      Order dispatch mode. queue=Valkey LPUSH+EventBridge drain,
-      sqs=gateway Lambda sends to SQS, sqs-direct=API GW sends to SQS
-      directly (bypasses gateway Lambda for POST /api/orders),
-      lambda=sync invoke.
+      Order dispatch mode. inline=matching runs in Gateway Lambda (no cross-invoke, default),
+      queue=Valkey LPUSH+EventBridge drain, sqs=gateway Lambda sends to SQS,
+      sqs-direct=API GW sends to SQS directly (bypasses gateway Lambda for POST /api/orders).
 
   ValkeyEndpoint:
     Type: String
@@ -88,6 +87,7 @@ Parameters:
 # ---------------------------------------------------------------------------
 Conditions:
   IsSqsDirect: !Equals [!Ref OrderDispatchMode, 'sqs-direct']
+  IsInline: !Equals [!Ref OrderDispatchMode, 'inline']
 
 Resources:
 
@@ -228,12 +228,6 @@ Resources:
       LogGroupName: !Sub '/aws/lambda/${ProjectName}-gateway'
       RetentionInDays: 14
 
-  WorkerLambdaLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub '/aws/lambda/${ProjectName}-worker'
-      RetentionInDays: 14
-
   # =========================================================================
   # Lambda Function - sme-gateway via AWS Lambda Web Adapter
   # Uses AWS::Serverless::Function with PackageType: Image
@@ -252,7 +246,7 @@ Resources:
       PackageType: Image
       Architectures:
         - x86_64
-      MemorySize: 512
+      MemorySize: 1024
       Timeout: 30
       ReservedConcurrentExecutions: 500
       Role: !GetAtt LambdaRole.Arn
@@ -272,11 +266,13 @@ Resources:
           # Cache: ElastiCache Valkey
           REDIS_URL: !Sub 'redis://${ValkeyEndpoint}:6379'
           RUST_LOG: info
-          # Worker dispatch mode — controlled by OrderDispatchMode parameter.
+          # Inline mode: Gateway runs matching in-process (no Worker Lambda invoke).
           # sqs-direct doesn't need gateway dispatch (API GW sends to SQS directly),
-          # but gateway still handles other routes, so we set it to queue as fallback.
-          ORDER_DISPATCH_MODE: !If [IsSqsDirect, 'queue', !Ref OrderDispatchMode]
+          # but gateway still handles other routes, so we fall back to inline.
+          ORDER_DISPATCH_MODE: !If [IsSqsDirect, 'inline', !Ref OrderDispatchMode]
           ORDER_QUEUE_URL: !Ref OrderQueue
+          # DATABASE_URL required for inline mode (PG connection for matching + persist)
+          DATABASE_URL: !Sub 'postgres://sme:${DBPassword}@${RDSProxyEndpoint}:5432/matching_engine'
       Tags:
         Project: !Ref ProjectName
 
@@ -289,74 +285,10 @@ Resources:
       SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
 
   # =========================================================================
-  # Worker Lambda Function - sme-worker-lambda (native lambda_runtime)
-  # Uses AWS::Serverless::Function with PackageType: Image
-  # SAM builds from infra/Dockerfile.worker with DockerContext = .. (project root)
-  # =========================================================================
-  WorkerLambda:
-    Type: AWS::Serverless::Function
-    DependsOn: WorkerLambdaLogGroup
-    Metadata:
-      DockerTag: latest
-      DockerContext: ../..
-      Dockerfile: infra/Dockerfile.worker
-    Properties:
-      FunctionName: !Sub '${ProjectName}-worker'
-      Description: sme-worker-lambda - order matching, PG persistence, cache updates
-      PackageType: Image
-      Architectures:
-        - x86_64
-      # 1024MB: needs headroom for PG + Valkey connection pools and match logic
-      MemorySize: 1024
-      Timeout: 30
-      # No ReservedConcurrentExecutions - scales freely with order volume
-      Role: !GetAtt LambdaRole.Arn
-      VpcConfig:
-        SubnetIds:
-          - !Ref PrivateSubnetA
-          - !Ref PrivateSubnetB
-        SecurityGroupIds:
-          - !Ref WorkerLambdaSecurityGroupId
-      Environment:
-        Variables:
-          # Cache: ElastiCache Valkey
-          REDIS_URL: !Sub 'redis://${ValkeyEndpoint}:6379'
-          # Using RDS Proxy endpoint (not direct RDS) for connection pooling
-          DATABASE_URL: !Sub 'postgres://sme:${DBPassword}@${RDSProxyEndpoint}:5432/matching_engine'
-          RUST_LOG: info
-          WS_API_ENDPOINT: !Sub 'https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/ws'
-      Tags:
-        Project: !Ref ProjectName
-
-  # =========================================================================
-  # EventBridge Schedule — drain order queues every 1 minute (ADR-007)
-  # Worker Lambda processes all queued orders in a single invocation.
-  # =========================================================================
-  WorkerDrainScheduleRule:
-    Type: AWS::Events::Rule
-    Properties:
-      Name: !Sub '${ProjectName}-worker-drain'
-      Description: Drain Valkey order queues every 1 minute
-      ScheduleExpression: 'rate(1 minute)'
-      State: ENABLED
-      Targets:
-        - Id: WorkerLambdaDrain
-          Arn: !GetAtt WorkerLambda.Arn
-
-  WorkerDrainSchedulePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref WorkerLambda
-      Action: lambda:InvokeFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt WorkerDrainScheduleRule.Arn
-
-  # =========================================================================
-  # SQS Standard Queue — order dispatch (alternative to Valkey queue + EventBridge)
-  # Gateway sends orders to SQS when ORDER_DISPATCH_MODE=sqs.
-  # Event source mapping triggers worker Lambda automatically per batch.
-  # Standard (not FIFO) allows parallel Lambda processing — no per-group serialization.
-  # Per-pair ordering is handled by the Lua matching engine (atomic EVAL).
+  # SQS Standard Queue — order dispatch (used for sqs-direct mode)
+  # In inline mode (default), Gateway processes orders in-process.
+  # In sqs-direct mode, API GW routes POST /api/orders directly to SQS.
+  # The WorkerLambda has been merged into GatewayLambda (inline mode).
   # =========================================================================
   OrderQueue:
     Type: AWS::SQS::Queue
@@ -368,19 +300,6 @@ Resources:
       Tags:
         - Key: Project
           Value: !Ref ProjectName
-
-  OrderQueueEventSourceMapping:
-    Type: AWS::Lambda::EventSourceMapping
-    Properties:
-      EventSourceArn: !GetAtt OrderQueue.Arn
-      FunctionName: !Ref WorkerLambda
-      BatchSize: 10
-      MaximumBatchingWindowInSeconds: 1
-      Enabled: true
-      ScalingConfig:
-        MaximumConcurrency: 50
-      FunctionResponseTypes:
-        - ReportBatchItemFailures
 
   # =========================================================================
   # WebSocket API for real-time feeds (ADR-006)

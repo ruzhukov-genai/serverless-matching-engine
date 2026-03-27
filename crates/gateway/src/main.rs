@@ -10,6 +10,7 @@ use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
 
 mod routes;
+pub mod worker;
 
 /// Per-key cache entry: watch channel for zero-contention reads + broadcast for WS fan-out.
 /// Values stored as Arc<str> — borrow() returns a refcount bump, zero allocation on read path.
@@ -69,10 +70,8 @@ impl CacheBroadcasts {
 pub enum DispatchMode {
     /// LPUSH to Valkey queue (local dev / EC2 worker)
     Queue,
-    /// Synchronous Lambda invoke — blocks until worker finishes (RequestResponse)
-    Lambda,
-    /// Async Lambda invoke — fire and forget, gateway returns 201 immediately (Event)
-    LambdaAsync,
+    /// Process order inline — matching runs in-process, no cross-Lambda invoke
+    Inline,
     /// SQS message — gateway sends to SQS, Lambda triggered by event source mapping
     Sqs,
 }
@@ -86,16 +85,12 @@ pub struct AppState {
     pub cache: CacheBroadcasts,
     /// Per-user TTL cache — avoids Valkey round-trips for orders/portfolio
     pub user_cache: routes::UserCache,
-    /// Order dispatch mode: "queue" (default), "lambda", or "sqs"
+    /// Order dispatch mode: "inline" (default prod), "queue" (local dev), or "sqs"
     pub dispatch_mode: DispatchMode,
-    /// AWS Lambda client — used when dispatch_mode == Lambda
-    pub lambda_client: Option<aws_sdk_lambda::Client>,
     /// AWS SQS client — used when dispatch_mode == Sqs
     pub sqs_client: Option<aws_sdk_sqs::Client>,
     /// SQS queue URL — from ORDER_QUEUE_URL env var
     pub order_queue_url: String,
-    /// Worker Lambda ARN — from WORKER_LAMBDA_ARN env var
-    pub worker_lambda_arn: String,
 }
 
 /// Subscribe to Valkey pub/sub channel for cache updates.
@@ -275,15 +270,11 @@ async fn main() -> Result<()> {
         all_keys,
     ));
 
-    // Order dispatch mode — queue (local dev), lambda, or sqs (AWS production)
+    // Order dispatch mode — inline (prod, matches in-process), queue (local dev), sqs
     let dispatch_mode = match std::env::var("ORDER_DISPATCH_MODE").as_deref() {
-        Ok("lambda") => {
-            tracing::info!("order dispatch mode: lambda (sync RequestResponse)");
-            DispatchMode::Lambda
-        }
-        Ok("lambda-async") => {
-            tracing::info!("order dispatch mode: lambda-async (async Event, fire-and-forget)");
-            DispatchMode::LambdaAsync
+        Ok("inline") => {
+            tracing::info!("order dispatch mode: inline (matching runs in-process, no cross-invoke)");
+            DispatchMode::Inline
         }
         Ok("sqs") => {
             tracing::info!("order dispatch mode: sqs");
@@ -295,23 +286,11 @@ async fn main() -> Result<()> {
         }
     };
 
-    let worker_lambda_arn = std::env::var("WORKER_LAMBDA_ARN").unwrap_or_default();
     let order_queue_url = std::env::var("ORDER_QUEUE_URL").unwrap_or_default();
 
-    let aws_cfg = if dispatch_mode == DispatchMode::Lambda || dispatch_mode == DispatchMode::LambdaAsync || dispatch_mode == DispatchMode::Sqs {
-        Some(aws_config::load_from_env().await)
-    } else {
-        None
-    };
-
-    let lambda_client = if dispatch_mode == DispatchMode::Lambda || dispatch_mode == DispatchMode::LambdaAsync {
-        Some(aws_sdk_lambda::Client::new(aws_cfg.as_ref().unwrap()))
-    } else {
-        None
-    };
-
     let sqs_client = if dispatch_mode == DispatchMode::Sqs {
-        Some(aws_sdk_sqs::Client::new(aws_cfg.as_ref().unwrap()))
+        let aws_cfg = aws_config::load_from_env().await;
+        Some(aws_sdk_sqs::Client::new(&aws_cfg))
     } else {
         None
     };
@@ -322,10 +301,8 @@ async fn main() -> Result<()> {
         cache: cache.clone(),
         user_cache: routes::UserCache::new(),
         dispatch_mode,
-        lambda_client,
         sqs_client,
         order_queue_url,
-        worker_lambda_arn,
     };
 
     let app = Router::new()

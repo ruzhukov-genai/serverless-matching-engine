@@ -16,6 +16,8 @@ rust_decimal.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true }
 anyhow.workspace = true
+once_cell.workspace = true
+sqlx.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "http2", "server", "tokio"] }
@@ -27,8 +29,8 @@ bytes = "1"
 async-stream = "0.3"
 socket2 = { version = "0.5", features = ["all"] }
 aws-config = "1"
-aws-sdk-lambda = "1"
 aws-sdk-sqs = "1"
+aws-sdk-apigatewaymanagement = "1"
 
 [[bin]]
 name = "sme-gateway"

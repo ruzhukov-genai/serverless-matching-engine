@@ -295,65 +295,11 @@ pub async fn create_order(
 
     // Dispatch order to worker — mode selected by ORDER_DISPATCH_MODE env var
     match s.dispatch_mode {
-        crate::DispatchMode::Lambda => {
-            // Synchronous Lambda invoke — gateway waits for worker to complete.
-            // InvocationType::RequestResponse blocks until worker finishes matching + persist.
-            // This gives true E2E latency: client sees the full processing time.
-            if let Some(ref lambda_client) = s.lambda_client {
-                let payload = aws_sdk_lambda::primitives::Blob::new(order_str.into_bytes());
-                tracing::info!(
-                    order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
-                    arn = %s.worker_lambda_arn, "invoking Worker Lambda (sync)"
-                );
-                match lambda_client.invoke()
-                    .function_name(&s.worker_lambda_arn)
-                    .invocation_type(aws_sdk_lambda::types::InvocationType::RequestResponse)
-                    .payload(payload)
-                    .send()
-                    .await
-                {
-                    Ok(resp) => tracing::info!(
-                        order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
-                        status_code = resp.status_code(),
-                        "order matched by Worker Lambda"
-                    ),
-                    Err(e) => tracing::error!(
-                        order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
-                        error = %e, "Worker Lambda invoke failed"
-                    ),
-                }
-            } else {
-                tracing::error!("dispatch_mode=lambda but lambda_client is None");
-            }
-        }
-        crate::DispatchMode::LambdaAsync => {
-            // Async Lambda invoke — fire and forget (InvocationType::Event).
-            // Gateway returns 201 immediately; worker processes in background.
-            // received_at is set here (before invoke) so E2E timestamp is accurate.
-            if let Some(ref lambda_client) = s.lambda_client {
-                let payload = aws_sdk_lambda::primitives::Blob::new(order_str.into_bytes());
-                tracing::info!(
-                    order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
-                    arn = %s.worker_lambda_arn, "invoking Worker Lambda (async)"
-                );
-                match lambda_client.invoke()
-                    .function_name(&s.worker_lambda_arn)
-                    .invocation_type(aws_sdk_lambda::types::InvocationType::Event)
-                    .payload(payload)
-                    .send()
-                    .await
-                {
-                    Ok(_) => tracing::info!(
-                        order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
-                        "order dispatched to Worker Lambda (async)"
-                    ),
-                    Err(e) => tracing::error!(
-                        order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
-                        error = %e, "Worker Lambda async invoke failed"
-                    ),
-                }
-            } else {
-                tracing::error!("dispatch_mode=lambda-async but lambda_client is None");
+        crate::DispatchMode::Inline => {
+            // Process order inline — no cross-Lambda invoke.
+            // Matching runs in-process: eliminates ~800ms Lambda-to-Lambda overhead.
+            if let Err(e) = crate::worker::process_order_inline(&order_json).await {
+                tracing::error!(order_id = %order_id, error = %e, "inline order processing failed");
             }
         }
         crate::DispatchMode::Sqs => {

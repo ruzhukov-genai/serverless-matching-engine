@@ -61,6 +61,27 @@ def drain_once(idx: int) -> int:
     except:
         return 0
 
+# ── Warmup ───────────────────────────────────────────────────────────────────
+def warmup_worker(concurrency=200):
+    """Fire N concurrent Worker Lambda pings to spin up containers before benchmark."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    print(f"  🔥 Warming up Worker Lambda ({concurrency} concurrent pings)...")
+    def ping(i):
+        try:
+            subprocess.check_output([
+                "aws", "lambda", "invoke",
+                "--function-name", WORKER_LAMBDA,
+                "--payload", '{"manage":{"command":"query","sql":"SELECT 1"}}',
+                f"/tmp/_warmup_{i}.json"
+            ], stderr=subprocess.DEVNULL)
+            return True
+        except:
+            return False
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futs = [ex.submit(ping, i) for i in range(concurrency)]
+        ok = sum(1 for f in as_completed(futs) if f.result())
+    print(f"  🔥 Warmup complete: {ok}/{concurrency} workers responded")
+
 # ── Background drainer ────────────────────────────────────────────────────────
 class ContinuousDrainer:
     def __init__(self, parallelism=5):
@@ -251,6 +272,8 @@ async def run():
     for _ in range(3):
         if drain_once(0) == 0:
             break
+    # Warm up Worker Lambda containers
+    warmup_worker(concurrency=100)
 
     all_results = []
 
@@ -370,6 +393,9 @@ async def run_ramp(api_url: str, run_id: str, num_users: int,
         seeded = await seed_liquidity(session, run_id)
     print(f"  📦 Seeded {seeded} resting orders")
 
+    # Warmup AFTER seeding so containers are alive when ramp starts
+    warmup_worker(concurrency=200)
+
     # Token bucket state
     current_rate = step_size
     token_lock = asyncio.Lock()
@@ -403,7 +429,9 @@ async def run_ramp(api_url: str, run_id: str, num_users: int,
     async def sender(worker_id: int):
         nonlocal placed_total, errors_total, tokens, last_refill
         seq = 0
-        async with aiohttp.ClientSession() as session:
+        connector = aiohttp.TCPConnector(limit=0)  # no connection pool limit for sync mode
+        async with aiohttp.ClientSession(connector=connector,
+                                         timeout=aiohttp.ClientTimeout(total=30)) as session:
             while not stop_flag.is_set():
                 # Consume a token
                 got_token = False
@@ -476,8 +504,24 @@ async def run_ramp(api_url: str, run_id: str, num_users: int,
     await asyncio.gather(*tasks, return_exceptions=True)
 
     print(f"\n  ✅ Ramp complete. Placed: {placed_total}, Errors: {errors_total}")
-    print(f"\n  ⏳ Waiting 15s for Worker Lambda to finish processing...")
-    await asyncio.sleep(15)
+    # In async mode, Worker processes after Gateway returns — wait for drain
+    # Poll DB until matched count stabilises or 120s timeout
+    print(f"\n  ⏳ Waiting for Worker Lambda to process all orders (max 120s)...")
+    prefix = f"{run_id}-"
+    last_count = -1
+    stable_rounds = 0
+    for _ in range(24):  # up to 120s (24 × 5s)
+        await asyncio.sleep(5)
+        rows = lambda_query(f"SELECT count(*) as n FROM orders WHERE client_order_id LIKE '{prefix}%' AND matched_at IS NOT NULL")
+        matched_so_far = rows[0].get("n", 0) if rows else 0
+        print(f"    processed so far: {matched_so_far}/{placed_total}")
+        if matched_so_far == last_count:
+            stable_rounds += 1
+            if stable_rounds >= 2:
+                break
+        else:
+            stable_rounds = 0
+        last_count = matched_so_far
 
     # Query lifecycle for the full run
     prefix = f"{run_id}-"
