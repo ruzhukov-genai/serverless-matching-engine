@@ -24,6 +24,7 @@ DURATION = 30  # seconds per level
 DRAIN_PARALLELISM = 5  # concurrent drain Lambdas
 CLIENT_COUNTS = [1, 40, 100]
 RATE_PER_CLIENT = 0  # orders/s per client (0 = unlimited)
+NUM_USERS = 100  # must match reset_all users count
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def lambda_invoke(payload: dict) -> dict:
@@ -97,7 +98,7 @@ async def place_orders(session, num_clients, run_id, deadline):
     placed = 0
     errors = 0
     latencies = []
-    users = [f"user-{(i % 10) + 1}" for i in range(num_clients)]
+    users = [f"user-{(i % NUM_USERS) + 1}" for i in range(num_clients)]
 
     async def client_loop(client_id):
         nonlocal placed, errors
@@ -106,11 +107,12 @@ async def place_orders(session, num_clients, run_id, deadline):
         next_send = time.monotonic()
         while time.monotonic() < deadline:
             # Rate limiting: sleep until next allowed send time
+            # next_send is set BEFORE the request so interval is wall-clock, not request-completion relative
             if interval > 0:
                 now = time.monotonic()
                 if now < next_send:
                     await asyncio.sleep(next_send - now)
-                next_send = time.monotonic() + interval
+            next_send_before = time.monotonic()  # capture before request
 
             user = users[client_id % len(users)]
             side = "Buy" if seq % 2 == 0 else "Sell"
@@ -134,6 +136,9 @@ async def place_orders(session, num_clients, run_id, deadline):
                         errors += 1
             except:
                 errors += 1
+            # Schedule next send relative to when this send started (not when it completed)
+            if interval > 0:
+                next_send = next_send_before + interval
             seq += 1
 
     tasks = [asyncio.create_task(client_loop(i)) for i in range(num_clients)]
@@ -204,7 +209,7 @@ def query_unprocessed(run_id, num_clients):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def run():
-    global API_URL, DURATION, CLIENT_COUNTS, DRAIN_PARALLELISM, RATE_PER_CLIENT
+    global API_URL, DURATION, CLIENT_COUNTS, DRAIN_PARALLELISM, RATE_PER_CLIENT, NUM_USERS
 
     import argparse
     parser = argparse.ArgumentParser(description="AWS Benchmark with continuous drain")
@@ -214,12 +219,14 @@ async def run():
     parser.add_argument("--drain-parallel", type=int, default=DRAIN_PARALLELISM)
     parser.add_argument("--api", type=str, default=API_URL)
     parser.add_argument("--rate", type=float, default=RATE_PER_CLIENT, help="orders/s per client (0=unlimited)")
+    parser.add_argument("--users", type=int, default=NUM_USERS, help="number of users (must match reset_all users count)")
     args = parser.parse_args()
 
     API_URL = args.api
     DURATION = args.duration
     DRAIN_PARALLELISM = args.drain_parallel
     RATE_PER_CLIENT = args.rate
+    NUM_USERS = args.users
     if args.clients:
         CLIENT_COUNTS = [int(x.strip()) for x in args.clients.split(",")]
 
@@ -233,6 +240,7 @@ async def run():
     rate_str = f"{RATE_PER_CLIENT}/s per client" if RATE_PER_CLIENT > 0 else "unlimited"
     print(f"║  Duration: {DURATION}s/level, clients: {CLIENT_COUNTS!s:<28}║")
     print(f"║  Rate:     {rate_str:<48}║")
+    print(f"║  Users:    {NUM_USERS:<48}║")
     print(f"║  Drainers: {DRAIN_PARALLELISM} parallel Lambda invocations{' ':>21}║")
     print("╚══════════════════════════════════════════════════════════════╝")
 
@@ -334,5 +342,215 @@ async def run():
 
     print(f"\n✅ Done. Run ID: {run_id}")
 
+# ── Ramp benchmark ────────────────────────────────────────────────────────────
+async def run_ramp(api_url: str, run_id: str, num_users: int,
+                   step_size: float, step_interval: float, max_rate: float, workers: int):
+    """
+    Ramp benchmark: start at step_size ord/s, add step_size every step_interval seconds.
+    Uses a shared token bucket across `workers` async sender coroutines.
+    Prints per-second stats and stops at max_rate or when errors pile up.
+    """
+    import collections
+
+    print("╔══════════════════════════════════════════════════════════════╗")
+    print("║          AWS Benchmark — Ramp Mode                         ║")
+    print("╠══════════════════════════════════════════════════════════════╣")
+    print(f"║  API:      {api_url:<48}║")
+    print(f"║  Run ID:   {run_id:<48}║")
+    print(f"║  Ramp:     +{step_size}/s every {step_interval}s → max {max_rate}/s{' ':<22}║")
+    print(f"║  Workers:  {workers:<48}║")
+    print(f"║  Users:    {num_users:<48}║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+
+    print("\n  🔄 Resetting AWS data...")
+    lambda_invoke({"manage": {"command": "reset_all"}})
+
+    print(f"  📦 Seeding liquidity...")
+    async with aiohttp.ClientSession() as session:
+        seeded = await seed_liquidity(session, run_id)
+    print(f"  📦 Seeded {seeded} resting orders")
+
+    # Token bucket state
+    current_rate = step_size
+    token_lock = asyncio.Lock()
+    tokens = step_size  # start full
+    last_refill = time.monotonic()
+
+    placed_total = 0
+    errors_total = 0
+    stop_flag = asyncio.Event()
+
+    # Per-second window tracking
+    window = collections.deque()  # (timestamp, success)
+    window_lock = asyncio.Lock()
+
+    async def refill_loop():
+        nonlocal current_rate, tokens, last_refill
+        start = time.monotonic()
+        next_step = start + step_interval
+        while not stop_flag.is_set():
+            await asyncio.sleep(0.01)
+            now = time.monotonic()
+            async with token_lock:
+                elapsed = now - last_refill
+                tokens = min(current_rate, tokens + current_rate * elapsed)
+                last_refill = now
+            # Step up rate
+            if now >= next_step:
+                current_rate = min(max_rate, current_rate + step_size)
+                next_step = now + step_interval
+
+    async def sender(worker_id: int):
+        nonlocal placed_total, errors_total, tokens, last_refill
+        seq = 0
+        async with aiohttp.ClientSession() as session:
+            while not stop_flag.is_set():
+                # Consume a token
+                got_token = False
+                for _ in range(50):  # spin up to 50ms waiting for token
+                    async with token_lock:
+                        if tokens >= 1.0:
+                            tokens -= 1.0
+                            got_token = True
+                            break
+                    await asyncio.sleep(0.001)
+                if not got_token:
+                    await asyncio.sleep(0.005)
+                    continue
+
+                user = f"user-{(worker_id * 31 + seq) % num_users + 1}"
+                side = "Buy" if seq % 2 == 0 else "Sell"
+                coid = f"{run_id}-w{worker_id}-{seq}"
+                body = {
+                    "pair_id": PAIR, "user_id": user, "side": side,
+                    "order_type": "Limit", "price": "70700",
+                    "quantity": "0.001", "time_in_force": "GTC",
+                    "client_order_id": coid
+                }
+                t0 = time.monotonic()
+                try:
+                    async with session.post(f"{api_url}/api/orders", json=body,
+                                            timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        ok = resp.status in (200, 201, 202)
+                        async with window_lock:
+                            window.append((t0, ok))
+                        if ok:
+                            placed_total += 1
+                        else:
+                            errors_total += 1
+                except Exception:
+                    errors_total += 1
+                seq += 1
+
+    async def reporter():
+        """Print one line per second showing current rate and throughput."""
+        print(f"\n  {'Time':>5} {'Target':>8} {'Actual':>8} {'Placed':>8} {'Errors':>7}")
+        print(f"  {'─'*5} {'─'*8} {'─'*8} {'─'*8} {'─'*7}")
+        t_start = time.monotonic()
+        while not stop_flag.is_set():
+            await asyncio.sleep(1.0)
+            now = time.monotonic()
+            elapsed = now - t_start
+            # Count successes in last 1s window
+            cutoff = now - 1.0
+            async with window_lock:
+                while window and window[0][0] < cutoff - 1.0:
+                    window.popleft()
+                recent = [ok for ts, ok in window if ts >= cutoff]
+            actual = sum(recent)
+            async with token_lock:
+                rate_now = current_rate
+            print(f"  {elapsed:>5.1f}s {rate_now:>7.0f}/s {actual:>7.0f}/s {placed_total:>8} {errors_total:>7}")
+
+    # Launch
+    tasks = [asyncio.create_task(refill_loop()),
+             asyncio.create_task(reporter())]
+    tasks += [asyncio.create_task(sender(i)) for i in range(workers)]
+
+    # Run until max_rate sustained for 5s or manual stop
+    total_time = (max_rate / step_size) * step_interval + 10
+    await asyncio.sleep(total_time)
+    stop_flag.set()
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    print(f"\n  ✅ Ramp complete. Placed: {placed_total}, Errors: {errors_total}")
+    print(f"\n  ⏳ Waiting 15s for Worker Lambda to finish processing...")
+    await asyncio.sleep(15)
+
+    # Query lifecycle for the full run
+    prefix = f"{run_id}-"
+    sql = f"""
+    SELECT
+        count(*) as total,
+        count(matched_at) as matched,
+        count(persisted_at) as persisted,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from matched_at - received_at) * 1000) as match_p50,
+        percentile_cont(0.99) WITHIN GROUP (ORDER BY extract(epoch from matched_at - received_at) * 1000) as match_p99,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - received_at) * 1000) as e2e_p50,
+        percentile_cont(0.99) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - received_at) * 1000) as e2e_p99,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - matched_at) * 1000) as persist_p50,
+        percentile_cont(0.99) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - matched_at) * 1000) as persist_p99
+    FROM orders
+    WHERE client_order_id LIKE '{prefix}%'
+      AND received_at IS NOT NULL AND matched_at IS NOT NULL AND persisted_at IS NOT NULL
+    """
+    rows = lambda_query(sql)
+    lc = rows[0] if rows else {}
+
+    matched = lc.get("matched", 0)
+    persisted = lc.get("persisted", 0)
+    e2e_p50 = lc.get("e2e_p50") or 0
+    e2e_p99 = lc.get("e2e_p99") or 0
+    match_p50 = lc.get("match_p50") or 0
+    match_p99 = lc.get("match_p99") or 0
+    persist_p50 = lc.get("persist_p50") or 0
+    persist_p99 = lc.get("persist_p99") or 0
+
+    print(f"\n{'═' * 70}")
+    print(f"  RAMP RESULTS — {run_id}")
+    print(f"{'═' * 70}")
+    print(f"  Dispatched:  {placed_total} orders, {errors_total} errors")
+    print(f"  Processed:   {matched} matched, {persisted} persisted")
+    print(f"  Match    p50={match_p50:.1f}ms  p99={match_p99:.1f}ms")
+    print(f"  Persist  p50={persist_p50:.1f}ms  p99={persist_p99:.1f}ms")
+    print(f"  E2E      p50={e2e_p50:.1f}ms  p99={e2e_p99:.1f}ms  (recv→persist)")
+    print(f"{'═' * 70}")
+
+
+async def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="AWS Benchmark")
+    parser.add_argument("--ramp", action="store_true", help="ramp mode: +N/s every T seconds")
+    parser.add_argument("--ramp-step", type=float, default=10, help="ord/s added per step (default 10)")
+    parser.add_argument("--ramp-interval", type=float, default=1.0, help="seconds per step (default 1)")
+    parser.add_argument("--ramp-max", type=float, default=200, help="max ord/s (default 200)")
+    parser.add_argument("--ramp-workers", type=int, default=50, help="sender coroutines (default 50)")
+    parser.add_argument("--users", type=int, default=NUM_USERS)
+    parser.add_argument("--run-id", type=str, default=None)
+    # passthrough args for non-ramp mode
+    parser.add_argument("--clients", type=str, default=None)
+    parser.add_argument("--duration", type=int, default=DURATION)
+    parser.add_argument("--drain-parallel", type=int, default=DRAIN_PARALLELISM)
+    parser.add_argument("--api", type=str, default=API_URL)
+    parser.add_argument("--rate", type=float, default=RATE_PER_CLIENT)
+    args = parser.parse_args()
+
+    run_id = args.run_id or f"awsbench-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}"
+
+    if args.ramp:
+        await run_ramp(
+            api_url=args.api,
+            run_id=run_id,
+            num_users=args.users,
+            step_size=args.ramp_step,
+            step_interval=args.ramp_interval,
+            max_rate=args.ramp_max,
+            workers=args.ramp_workers,
+        )
+    else:
+        await run()
+
 if __name__ == "__main__":
-    asyncio.run(run())
+    asyncio.run(main())

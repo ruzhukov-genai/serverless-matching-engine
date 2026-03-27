@@ -326,6 +326,36 @@ pub async fn create_order(
                 tracing::error!("dispatch_mode=lambda but lambda_client is None");
             }
         }
+        crate::DispatchMode::LambdaAsync => {
+            // Async Lambda invoke — fire and forget (InvocationType::Event).
+            // Gateway returns 201 immediately; worker processes in background.
+            // received_at is set here (before invoke) so E2E timestamp is accurate.
+            if let Some(ref lambda_client) = s.lambda_client {
+                let payload = aws_sdk_lambda::primitives::Blob::new(order_str.into_bytes());
+                tracing::info!(
+                    order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
+                    arn = %s.worker_lambda_arn, "invoking Worker Lambda (async)"
+                );
+                match lambda_client.invoke()
+                    .function_name(&s.worker_lambda_arn)
+                    .invocation_type(aws_sdk_lambda::types::InvocationType::Event)
+                    .payload(payload)
+                    .send()
+                    .await
+                {
+                    Ok(_) => tracing::info!(
+                        order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
+                        "order dispatched to Worker Lambda (async)"
+                    ),
+                    Err(e) => tracing::error!(
+                        order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
+                        error = %e, "Worker Lambda async invoke failed"
+                    ),
+                }
+            } else {
+                tracing::error!("dispatch_mode=lambda-async but lambda_client is None");
+            }
+        }
         crate::DispatchMode::Sqs => {
             // Send to SQS — Lambda event source mapping triggers worker automatically
             if let Some(ref sqs_client) = s.sqs_client {

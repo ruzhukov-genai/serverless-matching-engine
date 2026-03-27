@@ -69,8 +69,10 @@ impl CacheBroadcasts {
 pub enum DispatchMode {
     /// LPUSH to Valkey queue (local dev / EC2 worker)
     Queue,
-    /// Async Lambda invoke (AWS production)
+    /// Synchronous Lambda invoke — blocks until worker finishes (RequestResponse)
     Lambda,
+    /// Async Lambda invoke — fire and forget, gateway returns 201 immediately (Event)
+    LambdaAsync,
     /// SQS message — gateway sends to SQS, Lambda triggered by event source mapping
     Sqs,
 }
@@ -276,8 +278,12 @@ async fn main() -> Result<()> {
     // Order dispatch mode — queue (local dev), lambda, or sqs (AWS production)
     let dispatch_mode = match std::env::var("ORDER_DISPATCH_MODE").as_deref() {
         Ok("lambda") => {
-            tracing::info!("order dispatch mode: lambda (sync invoke)");
+            tracing::info!("order dispatch mode: lambda (sync RequestResponse)");
             DispatchMode::Lambda
+        }
+        Ok("lambda-async") => {
+            tracing::info!("order dispatch mode: lambda-async (async Event, fire-and-forget)");
+            DispatchMode::LambdaAsync
         }
         Ok("sqs") => {
             tracing::info!("order dispatch mode: sqs");
@@ -292,13 +298,13 @@ async fn main() -> Result<()> {
     let worker_lambda_arn = std::env::var("WORKER_LAMBDA_ARN").unwrap_or_default();
     let order_queue_url = std::env::var("ORDER_QUEUE_URL").unwrap_or_default();
 
-    let aws_cfg = if dispatch_mode == DispatchMode::Lambda || dispatch_mode == DispatchMode::Sqs {
+    let aws_cfg = if dispatch_mode == DispatchMode::Lambda || dispatch_mode == DispatchMode::LambdaAsync || dispatch_mode == DispatchMode::Sqs {
         Some(aws_config::load_from_env().await)
     } else {
         None
     };
 
-    let lambda_client = if dispatch_mode == DispatchMode::Lambda {
+    let lambda_client = if dispatch_mode == DispatchMode::Lambda || dispatch_mode == DispatchMode::LambdaAsync {
         Some(aws_sdk_lambda::Client::new(aws_cfg.as_ref().unwrap()))
     } else {
         None
