@@ -23,6 +23,7 @@ PAIR = "BTC-USDT"
 DURATION = 30  # seconds per level
 DRAIN_PARALLELISM = 5  # concurrent drain Lambdas
 CLIENT_COUNTS = [1, 40, 100]
+RATE_PER_CLIENT = 0  # orders/s per client (0 = unlimited)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def lambda_invoke(payload: dict) -> dict:
@@ -101,7 +102,16 @@ async def place_orders(session, num_clients, run_id, deadline):
     async def client_loop(client_id):
         nonlocal placed, errors
         seq = 0
+        interval = 1.0 / RATE_PER_CLIENT if RATE_PER_CLIENT > 0 else 0
+        next_send = time.monotonic()
         while time.monotonic() < deadline:
+            # Rate limiting: sleep until next allowed send time
+            if interval > 0:
+                now = time.monotonic()
+                if now < next_send:
+                    await asyncio.sleep(next_send - now)
+                next_send = time.monotonic() + interval
+
             user = users[client_id % len(users)]
             side = "Buy" if seq % 2 == 0 else "Sell"
             # Price that will cross with seeded liquidity
@@ -194,7 +204,7 @@ def query_unprocessed(run_id, num_clients):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def run():
-    global API_URL, DURATION, CLIENT_COUNTS, DRAIN_PARALLELISM
+    global API_URL, DURATION, CLIENT_COUNTS, DRAIN_PARALLELISM, RATE_PER_CLIENT
 
     import argparse
     parser = argparse.ArgumentParser(description="AWS Benchmark with continuous drain")
@@ -203,11 +213,13 @@ async def run():
     parser.add_argument("--run-id", type=str, default=None)
     parser.add_argument("--drain-parallel", type=int, default=DRAIN_PARALLELISM)
     parser.add_argument("--api", type=str, default=API_URL)
+    parser.add_argument("--rate", type=float, default=RATE_PER_CLIENT, help="orders/s per client (0=unlimited)")
     args = parser.parse_args()
 
     API_URL = args.api
     DURATION = args.duration
     DRAIN_PARALLELISM = args.drain_parallel
+    RATE_PER_CLIENT = args.rate
     if args.clients:
         CLIENT_COUNTS = [int(x.strip()) for x in args.clients.split(",")]
 
@@ -218,7 +230,9 @@ async def run():
     print("╠══════════════════════════════════════════════════════════════╣")
     print(f"║  API:      {API_URL:<48}║")
     print(f"║  Run ID:   {run_id:<48}║")
+    rate_str = f"{RATE_PER_CLIENT}/s per client" if RATE_PER_CLIENT > 0 else "unlimited"
     print(f"║  Duration: {DURATION}s/level, clients: {CLIENT_COUNTS!s:<28}║")
+    print(f"║  Rate:     {rate_str:<48}║")
     print(f"║  Drainers: {DRAIN_PARALLELISM} parallel Lambda invocations{' ':>21}║")
     print("╚══════════════════════════════════════════════════════════════╝")
 
