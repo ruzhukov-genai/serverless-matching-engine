@@ -1039,6 +1039,7 @@ pub async fn internal_manage(
                         return (StatusCode::INTERNAL_SERVER_ERROR,
                             Json(json!({"error": e.to_string()}))).into_response();
                     }
+                    let mut new_version: u64 = 1;
                     if let Ok(mut conn) = state.redis.get().await {
                         for pair in &["BTC-USDT", "ETH-USDT", "SOL-USDT"] {
                             let _: () = deadpool_redis::redis::cmd("DEL")
@@ -1051,9 +1052,15 @@ pub async fn internal_manage(
                                 .arg(format!("queue:orders:{}", pair))
                                 .query_async(&mut *conn).await.unwrap_or(());
                         }
+                        // Increment reset version — triggers container recycle via get_state() check
+                        new_version = deadpool_redis::redis::cmd("INCR")
+                            .arg("state:reset_version")
+                            .query_async::<u64>(&mut *conn)
+                            .await
+                            .unwrap_or(1);
                     }
-                    tracing::info!("manage: truncate_orders complete");
-                    (StatusCode::OK, Json(json!({"status": "ok", "command": "truncate_orders"}))).into_response()
+                    tracing::info!(new_version, "manage: truncate_orders complete");
+                    (StatusCode::OK, Json(json!({"status": "ok", "command": "truncate_orders", "reset_version": new_version}))).into_response()
                 }
 
                 "exec_sql" => {

@@ -46,10 +46,15 @@ def manage_request(command: str, **kwargs) -> dict:
         return {"error": str(e)}
 
 def pg_reset_all(num_users: int = 100):
-    """Reset all benchmark data via Gateway /internal/manage."""
-    resp = manage_request("reset_all", num_users=num_users)
-    if not resp.get("ok"):
-        print(f"  ⚠️  reset_all failed: {resp}")
+    """Reset all benchmark data via Gateway /internal/manage.
+    Split into truncate_orders + reset_balances to avoid the 60s Lambda timeout
+    that reset_all hits running init_balances_from_pg for 100 users cold."""
+    r1 = manage_request("truncate_orders")
+    if r1.get("status") != "ok":
+        print(f"  ⚠️  truncate_orders failed: {r1}")
+    r2 = manage_request("reset_balances", num_users=num_users)
+    if r2.get("status") != "ok":
+        print(f"  ⚠️  reset_balances failed: {r2}")
 
 def lambda_invoke(payload: dict) -> dict:
     """Synchronous Lambda invoke on the Gateway Lambda, returns parsed response."""

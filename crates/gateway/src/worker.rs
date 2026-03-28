@@ -37,6 +37,8 @@ pub struct WorkerState {
     pub pg: sqlx::PgPool,
     pub pairs_cache: Arc<HashMap<String, PairConfig>>,
     pub pair_keys: Arc<HashMap<String, PairKeys>>,
+    /// Valkey reset_version at time of cold-start — if it changes, container exits for recycle.
+    pub reset_version: u64,
 }
 
 /// Cached pair configuration — loaded once at cold start, never re-queried.
@@ -50,9 +52,27 @@ pub struct PairConfig {
 }
 
 static STATE: OnceCell<WorkerState> = OnceCell::new();
+/// Valkey key incremented by truncate_orders/reset_all to invalidate container state.
+const RESET_VERSION_KEY: &str = "state:reset_version";
 
 pub async fn get_state() -> Result<&'static WorkerState> {
     if let Some(s) = STATE.get() {
+        // Check reset version — if truncate_orders ran since we initialized,
+        // exit so Lambda recycles this container with fresh state.
+        if let Ok(mut conn) = s.redis.get().await {
+            let current_ver: Option<u64> = deadpool_redis::redis::cmd("GET")
+                .arg(RESET_VERSION_KEY)
+                .query_async(&mut *conn)
+                .await
+                .unwrap_or(None);
+            let cached_ver = s.reset_version;
+            if let Some(v) = current_ver {
+                if v != cached_ver {
+                    tracing::warn!(cached_ver, current_ver = v, "reset version changed — exiting for container recycle");
+                    std::process::exit(0);
+                }
+            }
+        }
         return Ok(s);
     }
 
@@ -131,7 +151,19 @@ pub async fn get_state() -> Result<&'static WorkerState> {
         tracing::info!("cache already populated — skipping seed");
     }
 
-    let state = WorkerState { redis, pg, pairs_cache, pair_keys };
+    // Read reset version at cold-start so we can detect invalidation later
+    let reset_version: u64 = {
+        let mut conn = redis.get().await.context("redis get for reset_version")?;
+        deadpool_redis::redis::cmd("GET")
+            .arg(RESET_VERSION_KEY)
+            .query_async::<Option<u64>>(&mut *conn)
+            .await
+            .unwrap_or(None)
+            .unwrap_or(0)
+    };
+    tracing::info!(reset_version, "get_state: reset_version at cold start");
+
+    let state = WorkerState { redis, pg, pairs_cache, pair_keys, reset_version };
 
     // Ignore error if another invocation raced us (OnceCell guarantees only one wins)
     let _ = STATE.set(state);
