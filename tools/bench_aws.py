@@ -152,6 +152,37 @@ async def seed_liquidity(session, run_id):
     return placed
 
 # ── Lifecycle query ───────────────────────────────────────────────────────────
+async def warmup_containers(num_containers: int, timeout: float = 30.0):
+    """Fire N concurrent POST /api/orders to fully initialize Lambda containers
+    (triggers get_state: PG pool + Valkey worker pool setup) before benchmark load."""
+    print(f"  🔥 Warming {num_containers} containers (real orders)...", end="", flush=True)
+    t0 = time.monotonic()
+    ok = 0
+    async def ping(session, idx):
+        nonlocal ok
+        body = {
+            "pair_id": PAIR, "user_id": f"user-{(idx % NUM_USERS) + 1}",
+            "side": "Buy", "order_type": "Limit",
+            "price": "69000",  # below market — won't match, just rests
+            "quantity": "0.001", "time_in_force": "GTC",
+            "client_order_id": f"warmup-{idx}-{int(t0)}"
+        }
+        try:
+            async with session.post(
+                f"{API_URL}/api/orders", json=body,
+                timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as resp:
+                if resp.status in (200, 201, 202):
+                    ok += 1
+        except Exception:
+            pass
+    async with aiohttp.ClientSession() as session:
+        await asyncio.gather(*[ping(session, i) for i in range(num_containers)], return_exceptions=True)
+    elapsed = (time.monotonic() - t0) * 1000
+    print(f" {ok}/{num_containers} responded in {elapsed:.0f}ms")
+    # Brief pause to let containers settle after warmup
+    await asyncio.sleep(2.0)
+
 def query_lifecycle(run_id, num_clients):
     """Query DB lifecycle metrics for a specific benchmark level."""
     prefix = f"{run_id}-n{num_clients}-"
@@ -234,6 +265,9 @@ async def run():
         print(f"\n{'━' * 65}")
         print(f"  ▶ c={num_clients} — {DURATION}s")
         print(f"{'━' * 65}")
+
+        # Warmup containers before this level
+        await warmup_containers(num_clients)
 
         # Seed liquidity
         async with aiohttp.ClientSession() as session:
