@@ -63,9 +63,12 @@ pub async fn get_state() -> Result<&'static WorkerState> {
     let database_url = std::env::var("DATABASE_URL")
         .context("DATABASE_URL env var required")?;
 
-    // Minimal pool for Lambda — each instance processes one order at a time
+    // Pool for inline order processing — needs connections for:
+    //   1. orderbook_snapshot_lua (read)
+    //   2. set_and_publish_batch (write pipeline — 1 connection for all cache keys)
+    // 2 connections is the minimum; use 5 to handle brief contention without blocking.
     tracing::info!("get_state: connecting to Valkey");
-    let redis = cache::create_pool_sized(&redis_url, 2).await
+    let redis = cache::create_pool_sized(&redis_url, 5).await
         .context("failed to create Valkey pool")?;
 
     tracing::info!("get_state: creating PG pool (lazy)");
@@ -696,43 +699,64 @@ async fn update_cache_after_processing(
         return Ok(());
     }
 
-    // Rebuild orderbook snapshot (Lua single round-trip)
+    // ── Phase 1: build all JSON payloads (PG queries, no Valkey connection held) ──
+
+    // Orderbook snapshot — one Valkey round-trip, separate connection checkout
     let (bids, asks) = cache::orderbook_snapshot_lua(&state.redis, &order.pair_id, 50).await
         .context("orderbook_snapshot_lua")?;
-
     let bids_json: Vec<Value> = bids.iter().map(|(p, q)| json!([p, q])).collect();
     let asks_json: Vec<Value> = asks.iter().map(|(p, q)| json!([p, q])).collect();
-
+    let orderbook_key = format!("cache:orderbook:{}", order.pair_id);
     let orderbook_json = serde_json::to_string(&json!({
         "pair": order.pair_id,
         "bids": bids_json,
         "asks": asks_json,
     }))?;
-    cache::set_and_publish(&state.redis, &format!("cache:orderbook:{}", order.pair_id), &orderbook_json).await
-        .context("set_and_publish orderbook")?;
 
-    // Update trades cache from PG (last 50)
-    update_trades_cache(state, &order.pair_id).await
-        .context("update_trades_cache")?;
+    // Trades (PG query)
+    let trades_key = format!("cache:trades:{}", order.pair_id);
+    let trades_json = build_trades_json(state, &order.pair_id).await
+        .context("build_trades_json")?;
 
-    // Update ticker cache from PG
-    update_ticker_cache(state, &order.pair_id).await
-        .context("update_ticker_cache")?;
+    // Ticker (PG query)
+    let ticker_key = format!("cache:ticker:{}", order.pair_id);
+    let ticker_json = build_ticker_json(state, &order.pair_id).await
+        .context("build_ticker_json")?;
 
-    // Update portfolio caches for all affected users
+    // Portfolio for all affected users (PG queries)
     let mut dirty_users = std::collections::HashSet::new();
     dirty_users.insert(order.user_id.clone());
     for trade in trades {
         dirty_users.insert(trade.buyer_id.clone());
         dirty_users.insert(trade.seller_id.clone());
     }
-    update_portfolio_caches(state, &dirty_users).await
-        .context("update_portfolio_caches")?;
+    let mut portfolio_entries: Vec<(String, String)> = Vec::new();
+    for user_id in &dirty_users {
+        let key = format!("cache:portfolio:{}", user_id);
+        let json = build_portfolio_json(state, user_id).await
+            .context("build_portfolio_json")?;
+        portfolio_entries.push((key, json));
+    }
+
+    // ── Phase 2: write everything to Valkey in ONE connection checkout (pipeline) ──
+    let mut batch: Vec<(&str, &str)> = vec![
+        (&orderbook_key, &orderbook_json),
+        (&trades_key, &trades_json),
+    ];
+    if let Some(ref tj) = ticker_json {
+        batch.push((&ticker_key, tj));
+    }
+    for (k, v) in &portfolio_entries {
+        batch.push((k, v));
+    }
+    cache::set_and_publish_batch(&state.redis, &batch).await
+        .context("set_and_publish_batch")?;
 
     Ok(())
 }
 
-async fn update_trades_cache(state: &WorkerState, pair_id: &str) -> Result<()> {
+/// Build trades JSON string from PG (no Valkey writes).
+async fn build_trades_json(state: &WorkerState, pair_id: &str) -> Result<String> {
     let rows = sqlx::query(
         "SELECT id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, sequence, created_at
          FROM trades WHERE pair_id = $1 ORDER BY created_at DESC LIMIT 50",
@@ -755,12 +779,11 @@ async fn update_trades_cache(state: &WorkerState, pair_id: &str) -> Result<()> {
         })
     }).collect();
 
-    let trades_str = serde_json::to_string(&json!({ "pair": pair_id, "trades": trades }))?;
-    cache::set_and_publish(&state.redis, &format!("cache:trades:{}", pair_id), &trades_str).await?;
-    Ok(())
+    Ok(serde_json::to_string(&json!({ "pair": pair_id, "trades": trades }))?)
 }
 
-async fn update_ticker_cache(state: &WorkerState, pair_id: &str) -> Result<()> {
+/// Build ticker JSON string from PG (no Valkey writes). Returns None if no ticker data.
+async fn build_ticker_json(state: &WorkerState, pair_id: &str) -> Result<Option<String>> {
     let ticker_row = sqlx::query(
         "SELECT
             MAX(price) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') as high_24h,
@@ -793,38 +816,28 @@ async fn update_ticker_cache(state: &WorkerState, pair_id: &str) -> Result<()> {
         json!({ "pair": pair_id, "last": last, "high_24h": null, "low_24h": null, "volume_24h": null })
     };
 
-    let ticker_str = serde_json::to_string(&ticker_json)?;
-    cache::set_and_publish(&state.redis, &format!("cache:ticker:{}", pair_id), &ticker_str).await?;
-    Ok(())
+    Ok(Some(serde_json::to_string(&ticker_json)?))
 }
 
-async fn update_portfolio_caches(
-    state: &WorkerState,
-    user_ids: &std::collections::HashSet<String>,
-) -> Result<()> {
-    let mut conn = state.redis.get().await?;
-    for user_id in user_ids {
-        let rows = sqlx::query(
-            "SELECT user_id, asset, available, locked FROM balances WHERE user_id = $1 ORDER BY asset",
-        )
-        .bind(user_id)
-        .fetch_all(&state.pg)
-        .await?;
+/// Build portfolio JSON string for one user from PG (no Valkey writes).
+async fn build_portfolio_json(state: &WorkerState, user_id: &str) -> Result<String> {
+    let rows = sqlx::query(
+        "SELECT user_id, asset, available, locked FROM balances WHERE user_id = $1 ORDER BY asset",
+    )
+    .bind(user_id)
+    .fetch_all(&state.pg)
+    .await?;
 
-        let balances: Vec<Value> = rows.iter().map(|r| {
-            json!({
-                "user_id": r.get::<String, _>("user_id"),
-                "asset": r.get::<String, _>("asset"),
-                "available": r.get::<Decimal, _>("available").to_string(),
-                "locked": r.get::<Decimal, _>("locked").to_string(),
-            })
-        }).collect();
+    let balances: Vec<Value> = rows.iter().map(|r| {
+        json!({
+            "user_id": r.get::<String, _>("user_id"),
+            "asset": r.get::<String, _>("asset"),
+            "available": r.get::<Decimal, _>("available").to_string(),
+            "locked": r.get::<Decimal, _>("locked").to_string(),
+        })
+    }).collect();
 
-        let portfolio_str = serde_json::to_string(&json!({"balances": balances}))?;
-        use deadpool_redis::redis::AsyncCommands;
-        conn.set::<_, _, ()>(format!("cache:portfolio:{}", user_id), &portfolio_str).await?;
-    }
-    Ok(())
+    Ok(serde_json::to_string(&json!({"balances": balances}))?)
 }
 
 // ── Static string helpers ─────────────────────────────────────────────────────

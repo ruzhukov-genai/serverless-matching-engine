@@ -89,6 +89,24 @@ pub async fn set_and_publish(pool: &Pool, key: &str, value: &str) -> Result<()> 
     Ok(())
 }
 
+/// Batch SET + PUBLISH for multiple keys in a single connection checkout.
+/// Each entry: (key, value). All keys are SET then each is PUBLISHed via pipeline.
+/// Use this instead of calling set_and_publish N times to avoid N pool.get() calls.
+pub async fn set_and_publish_batch(pool: &Pool, entries: &[(&str, &str)]) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut conn = pool.get().await.context("pool.get")?;
+    let mut pipe = redis::pipe();
+    for (key, value) in entries {
+        pipe.set(*key, *value).ignore();
+        let msg = format!("{}\n{}", key, value);
+        pipe.publish::<_, _>(CACHE_UPDATES_CHANNEL, msg).ignore();
+    }
+    pipe.query_async::<()>(&mut *conn).await.context("set_and_publish_batch pipeline")?;
+    Ok(())
+}
+
 // ── Health ────────────────────────────────────────────────────────────────────
 
 pub async fn health_check(pool: &Pool) -> Result<()> {
