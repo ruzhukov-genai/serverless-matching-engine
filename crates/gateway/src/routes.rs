@@ -999,6 +999,38 @@ pub async fn internal_manage(
                     (StatusCode::OK, Json(json!({"status": "ok", "command": "reset_balances", "users": n}))).into_response()
                 }
 
+                // Scan book sorted sets for entries whose order hash has expired,
+                // remove them. Safe to run anytime — won't touch live orders.
+                "sweep_stale_orders" => {
+                    tracing::info!("manage: sweep_stale_orders");
+                    let mut removed_total: u64 = 0;
+                    if let Ok(mut conn) = state.redis.get().await {
+                        for pair in &["BTC-USDT", "ETH-USDT", "SOL-USDT"] {
+                            for side in &["bids", "asks"] {
+                                let book_key = format!("book:{}:{}", pair, side);
+                                // Get all order IDs in the book
+                                let members: Vec<String> = deadpool_redis::redis::cmd("ZRANGE")
+                                    .arg(&book_key).arg("0").arg("-1")
+                                    .query_async(&mut *conn).await.unwrap_or_default();
+                                for order_id in members {
+                                    let order_key = format!("order:{}", order_id);
+                                    let exists: bool = deadpool_redis::redis::cmd("EXISTS")
+                                        .arg(&order_key)
+                                        .query_async(&mut *conn).await.unwrap_or(false);
+                                    if !exists {
+                                        let _: () = deadpool_redis::redis::cmd("ZREM")
+                                            .arg(&book_key).arg(&order_id)
+                                            .query_async(&mut *conn).await.unwrap_or(());
+                                        removed_total += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    tracing::info!(removed = removed_total, "manage: sweep_stale_orders complete");
+                    (StatusCode::OK, Json(json!({"ok": true, "removed": removed_total}))).into_response()
+                }
+
                 "truncate_orders" => {
                     tracing::info!("manage: truncate_orders");
                     if let Err(e) = sqlx::query("TRUNCATE orders CASCADE")
