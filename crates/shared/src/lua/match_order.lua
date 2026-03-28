@@ -227,6 +227,8 @@ if tif == 'G' and remaining_i > 0 and status ~= 'C' then
         'ts_ms',       ts_ms,
         'version',     '1'
     )
+    -- TTL: expire resting order hash after 1 hour to prevent stale book accumulation
+    redis.call('EXPIRE', KEYS[4], 3600)
 end
 
 redis.call('INCR', KEYS[3])

@@ -396,12 +396,18 @@ pub async fn process_order(state: &WorkerState, payload: &Value) -> Result<()> {
 
     let trade_count = trades.len();
 
-    // 7. Persist to PG synchronously (ADR-003: off hot-path allowed, but Lambda
-    //    has no background worker, so we do it inline — still fast enough)
+    // 7. Persist to PG synchronously — skip for warmup/test orders (client_order_id
+    //    prefixed with "warmup:") so they don't pollute lifecycle metrics or the DB.
+    let is_warmup = order.client_order_id.as_deref()
+        .map(|id| id.starts_with("warmup:") || id.starts_with("warmup-"))
+        .unwrap_or(false);
+
     let persist_start = std::time::Instant::now();
-    persist_order(state, &order, &trades, &lua_result.trades).await
-        .map_err(|e| { tracing::error!(error = %e, order_id = %order.id, "persist_order detail"); e })
-        .context("DB persist failed")?;
+    if !is_warmup {
+        persist_order(state, &order, &trades, &lua_result.trades).await
+            .map_err(|e| { tracing::error!(error = %e, order_id = %order.id, "persist_order detail"); e })
+            .context("DB persist failed")?;
+    }
     // persisted_at is set by PG NOW() in the INSERT — no extra roundtrip needed
     let persist_ms = persist_start.elapsed().as_millis() as u64;
 
