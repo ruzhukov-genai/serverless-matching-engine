@@ -40,8 +40,8 @@ Parameters:
   OrderDispatchMode:
     Type: String
     Default: 'queue'
-    AllowedValues: ['queue', 'sqs', 'sqs-direct', 'lambda']
-    Description: Order dispatch mode (queue/sqs/sqs-direct/lambda).
+    AllowedValues: ['inline', 'queue', 'sqs', 'sqs-direct', 'lambda']
+    Description: Order dispatch mode (inline/queue/sqs/sqs-direct/lambda).
 
 # ---------------------------------------------------------------------------
 # Resources -- Nested CloudFormation stacks (each is a SAM template)
@@ -136,6 +136,10 @@ Outputs:
   WebSocketUrl:
     Description: WebSocket API URL for real-time feeds
     Value: !GetAtt BackendStack.Outputs.WebSocketUrl
+
+  RDSProxyEndpoint:
+    Description: RDS Proxy endpoint for connection pooling
+    Value: !GetAtt BackendStack.Outputs.RDSProxyEndpoint
 
   ElastiCacheEndpoint:
     Description: ElastiCache Valkey endpoint address

@@ -20,7 +20,7 @@ INFRA_DIR="$PROJECT_ROOT/infra"
 
 STACK_NAME="serverless-matching-engine"
 REGION="${AWS_REGION:-us-east-1}"
-WORKER_LAMBDA="${STACK_NAME}-worker"
+GATEWAY_LAMBDA="${STACK_NAME}-gateway"
 
 SKIP_BUILD=false
 MIGRATE_ONLY=false
@@ -67,8 +67,8 @@ invoke_manage() {
 
 # ── Run migrations ───────────────────────────────────────────────────
 run_migrations() {
-    log "Running database migrations via ${WORKER_LAMBDA}..."
-    invoke_manage "$WORKER_LAMBDA" '{"manage":{"command":"run_migrations"}}'
+    log "Running database migrations via ${GATEWAY_LAMBDA}..."
+    invoke_manage "$GATEWAY_LAMBDA" '{"manage":{"command":"run_migrations"}}'
 }
 
 if $MIGRATE_ONLY; then

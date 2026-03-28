@@ -268,6 +268,30 @@ Resources:
       SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
       Description: PostgreSQL from Worker Lambda
 
+  # RDS SG self-referencing egress — required for RDS Proxy.
+  # Proxy ENIs live in the same SG as RDS; proxy must open TCP to the DB backend.
+  # Without this, proxy authenticates clients fine but hangs on backend connect.
+  RDSEgressSelfPostgres:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref RDSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref RDSSecurityGroup
+      Description: RDS Proxy self-referencing egress to RDS backend
+
+  # RDS Proxy needs HTTPS egress to Secrets Manager for credential retrieval
+  RDSEgressSecretsManager:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref RDSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: HTTPS for RDS Proxy to reach Secrets Manager
+
   # ---- ElastiCache Security Group -----------------------------------------
   ElastiCacheSecurityGroup:
     Type: AWS::EC2::SecurityGroup

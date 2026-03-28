@@ -289,7 +289,7 @@ async fn main() -> Result<()> {
     let order_queue_url = std::env::var("ORDER_QUEUE_URL").unwrap_or_default();
 
     let sqs_client = if dispatch_mode == DispatchMode::Sqs {
-        let aws_cfg = aws_config::load_from_env().await;
+        let aws_cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         Some(aws_sdk_sqs::Client::new(&aws_cfg))
     } else {
         None
@@ -333,6 +333,7 @@ async fn main() -> Result<()> {
         .route("/api/metrics/latency", get(routes::get_latency_percentiles))
         .route("/api/metrics/audit", get(routes::get_audit))
         .route("/api/audit", get(routes::get_audit))
+        .route("/internal/manage", axum::routing::post(routes::internal_manage))
         // Serve static files
         .nest_service("/trading", ServeDir::new("web/trading"))
         .nest_service("/dashboard", ServeDir::new("web/dashboard"))

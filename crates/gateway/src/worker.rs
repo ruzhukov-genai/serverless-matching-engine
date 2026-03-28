@@ -29,6 +29,9 @@ use sme_shared::{
     parse_pair_id,
 };
 
+// AWS SDK imports for WebSocket push (optional, non-critical)
+use aws_sdk_apigatewaymanagement;
+
 pub struct WorkerState {
     pub redis: deadpool_redis::Pool,
     pub pg: sqlx::PgPool,

@@ -39,11 +39,6 @@ Parameters:
     Default: 'sme-valkey.rmmdxf.ng.0001.use1.cache.amazonaws.com'
     Description: Valkey/ElastiCache endpoint (managed outside CF).
 
-  RDSProxyEndpoint:
-    Type: String
-    Default: 'sme-proxy-v2.proxy-cp3apgpybbhw.us-east-1.rds.amazonaws.com'
-    Description: RDS Proxy endpoint for connection pooling.
-
   # Network inputs (passed from root template via nested stack outputs)
   VpcId:
     Type: AWS::EC2::VPC::Id
@@ -188,6 +183,88 @@ Resources:
           Value: !Ref ProjectName
 
   # =========================================================================
+  # Secrets Manager — RDS credentials for proxy auth
+  # =========================================================================
+  RDSSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/rds-proxy-credentials'
+      Description: RDS credentials used by RDS Proxy for connection pooling
+      SecretString: !Sub '{"username":"sme","password":"${DBPassword}"}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =========================================================================
+  # RDS Proxy — connection pooling for Lambda → PostgreSQL
+  # Eliminates connection stampede from concurrent Lambda invocations.
+  # Pool config tuned for Lambda: fast borrow timeout, short idle timeout.
+  # =========================================================================
+  RDSProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-rds-proxy-role-cf'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:GetResourcePolicy
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:ListSecretVersionIds
+                Resource: !Ref RDSSecret
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  RDSProxy:
+    Type: AWS::RDS::DBProxy
+    DependsOn: RDSInstance
+    Properties:
+      DBProxyName: !Sub '${ProjectName}-proxy'
+      EngineFamily: POSTGRESQL
+      RequireTLS: false
+      IdleClientTimeout: 300
+      DebugLogging: false
+      RoleArn: !GetAtt RDSProxyRole.Arn
+      Auth:
+        - AuthScheme: SECRETS
+          SecretArn: !Ref RDSSecret
+          IAMAuth: DISABLED
+      VpcSubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      VpcSecurityGroupIds:
+        - !Ref RDSSecurityGroupId
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-proxy'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  RDSProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Properties:
+      DBProxyName: !Ref RDSProxy
+      TargetGroupName: default
+      DBInstanceIdentifiers:
+        - !Ref RDSInstance
+      ConnectionPoolConfigurationInfo:
+        MaxConnectionsPercent: 100
+        MaxIdleConnectionsPercent: 50
+        ConnectionBorrowTimeout: 15
+
+  # =========================================================================
   # ElastiCache Valkey (single-node, non-cluster mode)
   # Non-cluster mode required: our Lua scripts access keys in different slots (ADR-004)
   # =========================================================================
@@ -272,7 +349,7 @@ Resources:
           ORDER_DISPATCH_MODE: !If [IsSqsDirect, 'inline', !Ref OrderDispatchMode]
           ORDER_QUEUE_URL: !Ref OrderQueue
           # DATABASE_URL required for inline mode (PG connection for matching + persist)
-          DATABASE_URL: !Sub 'postgres://sme:${DBPassword}@${RDSProxyEndpoint}:5432/matching_engine'
+          DATABASE_URL: !Sub 'postgres://sme:${DBPassword}@${RDSProxy.Endpoint}:5432/matching_engine'
       Tags:
         Project: !Ref ProjectName
 
@@ -529,6 +606,10 @@ Outputs:
   RDSPort:
     Description: RDS PostgreSQL port
     Value: !GetAtt RDSInstance.Endpoint.Port
+
+  RDSProxyEndpoint:
+    Description: RDS Proxy endpoint for connection pooling
+    Value: !GetAtt RDSProxy.Endpoint
 
   ElastiCacheEndpoint:
     Description: ElastiCache Valkey endpoint address

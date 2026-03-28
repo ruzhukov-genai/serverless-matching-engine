@@ -19,7 +19,9 @@ from concurrent.futures import ThreadPoolExecutor
 # ── Config ────────────────────────────────────────────────────────────────────
 API_URL = "https://kpvhsf0ub8.execute-api.us-east-1.amazonaws.com"
 WORKER_LAMBDA = "serverless-matching-engine-worker"
+GATEWAY_LAMBDA = "serverless-matching-engine-gateway"
 PAIR = "BTC-USDT"
+DB_DSN = "postgres://sme:sme_prod_9b43c1802d8440e9666be882d925d933@sme-proxy-v2.proxy-cp3apgpybbhw.us-east-1.rds.amazonaws.com:5432/matching_engine"
 DURATION = 30  # seconds per level
 DRAIN_PARALLELISM = 5  # concurrent drain Lambdas
 CLIENT_COUNTS = [1, 40, 100]
@@ -27,23 +29,63 @@ RATE_PER_CLIENT = 0  # orders/s per client (0 = unlimited)
 NUM_USERS = 100  # must match reset_all users count
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def lambda_invoke(payload: dict) -> dict:
-    """Synchronous Lambda invoke, returns parsed response."""
+def manage_request(command: str, **kwargs) -> dict:
+    """Send a manage command to the Gateway's internal /internal/manage endpoint."""
+    import urllib.request
+    payload = {"command": command, **kwargs}
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"{API_URL}/internal/manage",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        print(f"  ⚠️  manage_request failed: {e}")
+        return {"error": str(e)}
+
+def pg_reset_all(num_users: int = 100):
+    """Reset all benchmark data via Gateway /internal/manage."""
+    resp = manage_request("reset_all", num_users=num_users)
+    if not resp.get("ok"):
+        print(f"  ⚠️  reset_all failed: {resp}")
+
+def lambda_invoke(payload: dict, function: str = None) -> dict:
+    """Synchronous Lambda invoke, returns parsed response.
+    Uses GATEWAY_LAMBDA if WORKER_LAMBDA doesn't exist (inline mode)."""
+    if function is None:
+        function = WORKER_LAMBDA
     try:
         subprocess.check_output([
             "aws", "lambda", "invoke",
-            "--function-name", WORKER_LAMBDA,
+            "--function-name", function,
             "--payload", json.dumps(payload),
             "/tmp/_bench_invoke.json"
         ], stderr=subprocess.DEVNULL)
         with open("/tmp/_bench_invoke.json") as f:
             return json.load(f)
     except Exception as e:
+        # Fallback to Gateway Lambda (inline mode — no separate Worker Lambda)
+        if function == WORKER_LAMBDA:
+            try:
+                subprocess.check_output([
+                    "aws", "lambda", "invoke",
+                    "--function-name", GATEWAY_LAMBDA,
+                    "--payload", json.dumps(payload),
+                    "/tmp/_bench_invoke.json"
+                ], stderr=subprocess.DEVNULL)
+                with open("/tmp/_bench_invoke.json") as f:
+                    return json.load(f)
+            except Exception as e2:
+                return {"error": str(e2)}
         return {"error": str(e)}
 
 def lambda_query(sql: str) -> list:
-    """Run SQL via Lambda manage:query, return rows."""
-    resp = lambda_invoke({"manage": {"command": "query", "sql": sql}})
+    """Run SQL query via Gateway /internal/manage."""
+    resp = manage_request("query", sql=sql)
     return resp.get("rows", [])
 
 def drain_once(idx: int) -> int:
@@ -155,8 +197,13 @@ async def place_orders(session, num_clients, run_id, deadline):
                         latencies.append(elapsed)
                     else:
                         errors += 1
-            except:
+                        if errors <= 3:
+                            body_text = await resp.text()
+                            print(f"  ⚠️  HTTP {resp.status}: {body_text[:120]}")
+            except Exception as e:
                 errors += 1
+                if errors <= 3:
+                    print(f"  ⚠️  Exception: {e}")
             # Schedule next send relative to when this send started (not when it completed)
             if interval > 0:
                 next_send = next_send_before + interval
@@ -267,13 +314,7 @@ async def run():
 
     # Reset
     print("\n  🔄 Resetting AWS data...")
-    lambda_invoke({"manage": {"command": "reset_all"}})
-    # Drain any leftover queue
-    for _ in range(3):
-        if drain_once(0) == 0:
-            break
-    # Warm up Worker Lambda containers
-    warmup_worker(concurrency=100)
+    pg_reset_all(num_users=NUM_USERS)
 
     all_results = []
 
@@ -287,30 +328,13 @@ async def run():
             seeded = await seed_liquidity(session, run_id)
         print(f"  📦 Seeded {seeded} resting orders")
 
-        # Start continuous drainer BEFORE placing orders
-        drainer = ContinuousDrainer(parallelism=DRAIN_PARALLELISM)
-        drainer.start()
-        print(f"  🔄 Drainer started ({DRAIN_PARALLELISM} parallel workers)")
-
-        # Let drainer process seeds first
-        await asyncio.sleep(3)
-
         # Place orders
         deadline = time.monotonic() + DURATION
         async with aiohttp.ClientSession() as session:
             placed, errors, latencies = await place_orders(session, num_clients, run_id, deadline)
 
-        # Let drainer catch up (max 60s)
-        print(f"  ⏳ Placed {placed} orders ({errors} errors), waiting for drain...")
-        for wait_round in range(12):
-            await asyncio.sleep(5)
-            unprocessed = query_unprocessed(run_id, num_clients)
-            if unprocessed == 0:
-                break
-            print(f"    {unprocessed} orders still in queue...")
-        
-        drainer.stop()
-        print(f"  ✅ Drainer stopped: {drainer.total_drained} orders processed in {drainer.drain_rounds} rounds")
+                # In inline mode, orders are already processed synchronously — no drain needed
+        print(f"  ⏳ Placed {placed} orders ({errors} errors)")
 
         # Query lifecycle
         lc = query_lifecycle(run_id, num_clients)
@@ -386,7 +410,7 @@ async def run_ramp(api_url: str, run_id: str, num_users: int,
     print("╚══════════════════════════════════════════════════════════════╝")
 
     print("\n  🔄 Resetting AWS data...")
-    lambda_invoke({"manage": {"command": "reset_all"}})
+    pg_reset_all(num_users=NUM_USERS)
 
     print(f"  📦 Seeding liquidity...")
     async with aiohttp.ClientSession() as session:
