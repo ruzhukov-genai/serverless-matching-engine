@@ -202,6 +202,19 @@ pub async fn get_orderbook(
     State(s): State<AppState>,
 ) -> HandlerResult<Response> {
     let cache_key = format!("cache:orderbook:{}", pair_id);
+
+    // Read directly from Valkey — authoritative, consistent across all Lambda instances.
+    // (In-memory cache is only used for WS fan-out; REST reads from Valkey directly.)
+    if let Ok(mut conn) = s.redis.get().await {
+        use deadpool_redis::redis::AsyncCommands;
+        if let Ok(Some(val)) = conn.get::<_, Option<String>>(&cache_key).await {
+            if !val.is_empty() {
+                return Ok(raw_json(truncate_orderbook_depth(Some(&val), q.depth)));
+            }
+        }
+    }
+
+    // Fallback: in-memory cache (e.g. if Valkey is unreachable)
     if let Some(cached) = s.cache.get_latest(&cache_key) {
         if q.depth.is_some() {
             return Ok(raw_json(truncate_orderbook_depth(Some(&cached), q.depth)));
