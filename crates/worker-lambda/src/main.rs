@@ -745,7 +745,7 @@ async fn process_order(state: &WorkerState, payload: &Value) -> Result<()> {
     persist_order(state, &order, &trades, &lua_result.trades).await
         .map_err(|e| { tracing::error!(error = %e, order_id = %order.id, "persist_order detail"); e })
         .context("DB persist failed")?;
-    // persisted_at is set by Postgres NOW() inside the INSERT — not Rust-side
+    // persisted_at is set in Rust (Utc::now()) before the INSERT — same clock as received_at/matched_at
     let persist_ms = persist_start.elapsed().as_millis() as u64;
 
     // 8. Update cache keys (orderbook, trades, ticker, portfolio)
@@ -820,10 +820,11 @@ async fn persist_order(
 ) -> Result<()> {
     let mut tx = state.pg.begin().await?;
 
-    // Insert the incoming order
+    // Insert the incoming order — persisted_at set in Rust (same clock as received_at/matched_at)
+    let persisted_at = chrono::Utc::now();
     sqlx::query(
         "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, created_at, updated_at, client_order_id, received_at, matched_at, persisted_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW())
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
          ON CONFLICT DO NOTHING",
     )
     .bind(order.id)
@@ -843,6 +844,7 @@ async fn persist_order(
     .bind(&order.client_order_id)
     .bind(order.received_at)
     .bind(order.matched_at)
+    .bind(persisted_at)
     .execute(&mut *tx)
     .await?;
 
