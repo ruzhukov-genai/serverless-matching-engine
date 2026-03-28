@@ -20,7 +20,6 @@ INFRA_DIR="$PROJECT_ROOT/infra"
 
 STACK_NAME="serverless-matching-engine"
 REGION="${AWS_REGION:-us-east-1}"
-GATEWAY_LAMBDA="${STACK_NAME}-gateway"
 
 SKIP_BUILD=false
 MIGRATE_ONLY=false
@@ -38,37 +37,33 @@ done
 log() { echo "▸ $*"; }
 err() { echo "✗ $*" >&2; exit 1; }
 
-invoke_manage() {
-    local func="$1"
-    local payload="$2"
-    local cmd
-    cmd=$(echo "$payload" | python3 -c 'import sys,json; print(json.load(sys.stdin)["manage"]["command"])')
-    log "Invoking manage:${cmd} on ${func}..."
-
-    local tmpfile
-    tmpfile=$(mktemp /tmp/lambda-result-XXXXX.json)
-
-    aws lambda invoke \
-        --function-name "$func" \
-        --invocation-type RequestResponse \
-        --payload "$payload" \
-        "$tmpfile" > /dev/null 2>&1
-
-    local body
-    body=$(cat "$tmpfile")
-    rm -f "$tmpfile"
-
-    if echo "$body" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('status')=='ok' else 1)" 2>/dev/null; then
-        log "  ✓ ${cmd} complete"
-    else
-        err "  ✗ ${cmd} failed: $body"
-    fi
+# ── Get API Gateway URL from CloudFormation stack outputs ─────────────
+get_api_url() {
+    aws cloudformation describe-stacks \
+        --stack-name "$STACK_NAME" \
+        --region "$REGION" \
+        --query "Stacks[0].Outputs[?OutputKey=='ApiGatewayUrl'].OutputValue" \
+        --output text 2>/dev/null
 }
 
 # ── Run migrations ───────────────────────────────────────────────────
 run_migrations() {
-    log "Running database migrations via ${GATEWAY_LAMBDA}..."
-    invoke_manage "$GATEWAY_LAMBDA" '{"manage":{"command":"run_migrations"}}'
+    local api_url
+    api_url=$(get_api_url)
+    if [ -z "$api_url" ]; then
+        err "Could not determine API Gateway URL from stack outputs"
+    fi
+    log "Running database migrations via ${api_url}/internal/manage ..."
+    local response
+    response=$(curl -sf -X POST "${api_url}/internal/manage" \
+        -H "Content-Type: application/json" \
+        -d '{"command":"run_migrations"}' \
+        --max-time 60 2>&1) || err "curl failed: $response"
+    if echo "$response" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('status')=='ok' else 1)" 2>/dev/null; then
+        log "  ✓ run_migrations complete"
+    else
+        err "  ✗ run_migrations failed: $response"
+    fi
 }
 
 if $MIGRATE_ONLY; then

@@ -39,9 +39,9 @@ Parameters:
 
   OrderDispatchMode:
     Type: String
-    Default: 'queue'
-    AllowedValues: ['inline', 'queue', 'sqs', 'sqs-direct', 'lambda']
-    Description: Order dispatch mode (inline/queue/sqs/sqs-direct/lambda).
+    Default: 'inline'
+    AllowedValues: ['inline', 'queue']
+    Description: Order dispatch mode. inline=production (matching in-process), queue=local dev (Valkey LPUSH).
 
 # ---------------------------------------------------------------------------
 # Resources -- Nested CloudFormation stacks (each is a SAM template)

@@ -31,22 +31,17 @@ docs/
   adr/          → Architecture Decision Records (READ THESE FIRST)
 ```
 
-**Core flow — three dispatch modes (see ADR-007, ADR-008):**
+**Core flow — two dispatch modes:**
 
-`queue` mode (local dev default):
+`inline` mode (**production default**):
+`POST /api/orders` → gateway validates → Lua EVAL match (Valkey, atomic) → persist (PG) → 201 Created
+All matching runs in-process in the Gateway Lambda. No Worker Lambda invoked.
+
+`queue` mode (local dev):
 `POST /api/orders` → gateway validates → `LPUSH queue:orders:{pair_id}` (Valkey) → 202 Accepted
-→ EventBridge schedule (`rate(1 minute)`) → Worker Lambda drains queue (up to 50 orders) → Lua EVAL match → persist (PG) → update cache
+→ local `sme-api` worker BRPOP → lock balance (PG) → Lua EVAL match (Valkey) → persist (PG) → update cache
 
-`sqs` mode:
-`POST /api/orders` → gateway validates → SQS FIFO enqueue → 202 Accepted
-→ Worker Lambda (ESM, batch 1–10) → Lua EVAL match → persist (PG) → update cache
-
-`sqs-direct` mode (**currently deployed**):
-`POST /api/orders` → API GW native SQS integration → SQS FIFO (bypasses gateway Lambda)
-→ Worker Lambda (ESM, batch 1–10) → validate + Lua EVAL match → persist (PG) → update cache
-All other routes → gateway Lambda via `$default`
-
-**Local dev flow (identical queue pattern):**
+**Local dev flow:**
 `POST /api/orders` → gateway validates → `LPUSH queue:orders:{pair_id}` → 202 Accepted
 → worker BRPOP → lock balance (PG) → Lua EVAL match (Valkey) → async persist (PG) → update cache
 
@@ -60,7 +55,7 @@ All other routes → gateway Lambda via `$default`
 - Per-pair queues with bounded concurrency, sem=3 (ADR-005)
 - WebSocket API Gateway for real-time feeds (ADR-006)
 - Queue-based Lambda dispatch replaces direct invoke (ADR-007)
-- SQS dispatch modes: `sqs` and `sqs-direct` (ADR-008); `sqs-direct` currently deployed
+- Inline mode is production (ADR-008 superseded: SQS/sqs-direct modes removed 2026-03-28)
 
 ## Stack
 
@@ -232,7 +227,6 @@ python3 tools/benchmark.py
 | `infra/stacks/backend.yaml` | Lambda ×3, API Gateway HTTP + WS, EventBridge schedule, ElastiCache |
 | `infra/stacks/frontend.yaml` | S3, CloudFront, OAC |
 | `infra/Dockerfile.gateway` | Gateway Lambda Docker build (x86_64, Lambda Web Adapter) |
-| `infra/Dockerfile.worker` | Worker Lambda Docker build (x86_64, native runtime) |
 | `infra/Dockerfile.ws-handler` | WS Handler Lambda Docker build (x86_64, native runtime) |
 | `tools/deploy.sh` | Build + push + deploy + run_migrations |
 | `tools/bench_aws.py` | AWS benchmark script with warmup |
@@ -261,28 +255,29 @@ tools/deploy.sh --migrate-only          # Just run migrations
 tools/deploy.sh --skip-build            # Deploy with existing images
 ```
 
-### Manage Commands (Worker Lambda)
-All admin operations via direct invocation:
-```json
-{"manage": {"command": "run_migrations"}}
-{"manage": {"command": "reset_all"}}
-{"manage": {"command": "reset_all", "users": 100}}
-{"manage": {"command": "reset_balances"}}
-{"manage": {"command": "reset_balances", "users": 100}}
-{"manage": {"command": "truncate_orders"}}
-{"manage": {"command": "exec_sql", "sql": "..."}}
-{"manage": {"command": "query", "sql": "..."}}
+### Manage Commands (Gateway Lambda — POST /internal/manage)
+All admin operations via HTTP:
+```bash
+# Run migrations (called by deploy.sh after deploy)
+curl -X POST $API_URL/internal/manage -d '{"command":"run_migrations"}'
+
+# Reset everything (orders + balances) for N users
+curl -X POST $API_URL/internal/manage -d '{"command":"reset_all","users":100}'
+
+# Reset balances only (no order truncation)
+curl -X POST $API_URL/internal/manage -d '{"command":"reset_balances","users":100}'
+
+# Truncate orders and trades tables + clear book cache
+curl -X POST $API_URL/internal/manage -d '{"command":"truncate_orders"}'
+
+# Execute arbitrary SQL (admin only)
+curl -X POST $API_URL/internal/manage -d '{"command":"exec_sql","sql":"..."}'
+
+# Run a SELECT query, returns rows as JSON
+curl -X POST $API_URL/internal/manage -d '{"command":"query","sql":"SELECT count(*) FROM orders"}'
 ```
 `reset_all` and `reset_balances` accept an optional `"users": N` parameter (default 100).
 More users = less balance contention under load (persist p99 dropped from 29ms at 10 users → 15ms at 100 users).
-
-### Queue Drain (Worker Lambda — ADR-007)
-Worker is invoked by EventBridge schedule (`rate(1 minute)`). Also supports manual trigger:
-```json
-{"drain_queue": true}
-```
-Drains up to 50 orders from all pair queues (`queue:orders:{pair_id}`) per invocation.
-EventBridge events (with `"source": "aws.events"`) trigger drain mode automatically.
 
 ### Deploy Gotchas
 - **SAM uses legacy Docker builder** — no BuildKit features (`COPY --chmod`). Use `COPY` + `RUN chmod` instead.
@@ -309,13 +304,10 @@ EventBridge events (with `"source": "aws.events"`) trigger drain mode automatica
 |-----------|---------|------|
 | Cache | ElastiCache Valkey | `cache.t4g.micro`, Valkey 8.0, **manually created** as `sme-valkey` (not CF-managed); endpoint is a CF Parameter |
 | Database | RDS PostgreSQL | `db.t4g.small`, PG 16.6 |
-| Connection Pool | RDS Proxy | `sme-proxy-v2`; endpoint is a CF Parameter |
-| Gateway | Lambda (x86_64) | 512MB, Lambda Web Adapter (buffered mode), `ORDER_DISPATCH_MODE` controls dispatch |
-| Worker | Lambda (x86_64) | 1024MB, 120s timeout, native Rust runtime; SQS ESM (batch 10) or EventBridge drain |
+| Connection Pool | RDS Proxy | `serverless-matching-engine-proxy`; endpoint is a CF Parameter |
+| Gateway | Lambda (x86_64) | 1024MB, Lambda Web Adapter (buffered mode), `ORDER_DISPATCH_MODE=inline` (production) |
 | WS Handler | Lambda (x86_64) | 256MB, native Rust runtime |
-| Scheduling | EventBridge | `rate(1 minute)` → Worker Lambda queue drain (queue mode only) |
-| SQS FIFO | SQS | `serverless-matching-engine-orders.fifo`, CF-managed (conditional on `sqs-direct` mode) |
-| VPC Endpoints | Interface | Lambda + STS + SQS (CF-managed, private DNS enabled) |
+| VPC Endpoints | Interface | Lambda + STS (CF-managed, private DNS enabled) |
 | Frontend | CloudFront + S3 | `d3ux5yer0uv7b5.cloudfront.net` |
 | HTTP API | API Gateway | `kpvhsf0ub8` |
 | WebSocket | API Gateway WS | `2shnq9yk0c` |

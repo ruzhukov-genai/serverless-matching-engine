@@ -28,11 +28,10 @@ Parameters:
   OrderDispatchMode:
     Type: String
     Default: 'inline'
-    AllowedValues: ['inline', 'queue', 'sqs', 'sqs-direct']
+    AllowedValues: ['inline', 'queue']
     Description: >
-      Order dispatch mode. inline=matching runs in Gateway Lambda (no cross-invoke, default),
-      queue=Valkey LPUSH+EventBridge drain, sqs=gateway Lambda sends to SQS,
-      sqs-direct=API GW sends to SQS directly (bypasses gateway Lambda for POST /api/orders).
+      Order dispatch mode. inline=matching runs in Gateway Lambda (no cross-invoke, production default),
+      queue=Valkey LPUSH (local dev / fallback).
 
   ValkeyEndpoint:
     Type: String
@@ -81,7 +80,6 @@ Parameters:
 # Resources
 # ---------------------------------------------------------------------------
 Conditions:
-  IsSqsDirect: !Equals [!Ref OrderDispatchMode, 'sqs-direct']
   IsInline: !Equals [!Ref OrderDispatchMode, 'inline']
 
 Resources:
@@ -114,18 +112,6 @@ Resources:
                   - ecr:GetDownloadUrlForLayer
                   - ecr:BatchGetImage
                 Resource: '*'
-        # SQS — gateway sends orders, worker receives via event source mapping
-        - PolicyName: SQSOrderQueue
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - sqs:SendMessage
-                  - sqs:ReceiveMessage
-                  - sqs:DeleteMessage
-                  - sqs:GetQueueAttributes
-                Resource: !GetAtt OrderQueue.Arn
         - PolicyName: ManageWebSocketConnections
           PolicyDocument:
             Version: '2012-10-17'
@@ -343,11 +329,7 @@ Resources:
           # Cache: ElastiCache Valkey
           REDIS_URL: !Sub 'redis://${ValkeyEndpoint}:6379'
           RUST_LOG: info
-          # Inline mode: Gateway runs matching in-process (no Worker Lambda invoke).
-          # sqs-direct doesn't need gateway dispatch (API GW sends to SQS directly),
-          # but gateway still handles other routes, so we fall back to inline.
-          ORDER_DISPATCH_MODE: !If [IsSqsDirect, 'inline', !Ref OrderDispatchMode]
-          ORDER_QUEUE_URL: !Ref OrderQueue
+          ORDER_DISPATCH_MODE: !Ref OrderDispatchMode
           # DATABASE_URL required for inline mode (PG connection for matching + persist)
           DATABASE_URL: !Sub 'postgres://sme:${DBPassword}@${RDSProxy.Endpoint}:5432/matching_engine'
       Tags:
@@ -361,22 +343,7 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
 
-  # =========================================================================
-  # SQS Standard Queue — order dispatch (used for sqs-direct mode)
-  # In inline mode (default), Gateway processes orders in-process.
-  # In sqs-direct mode, API GW routes POST /api/orders directly to SQS.
-  # The WorkerLambda has been merged into GatewayLambda (inline mode).
-  # =========================================================================
-  OrderQueue:
-    Type: AWS::SQS::Queue
-    Properties:
-      QueueName: !Sub '${ProjectName}-orders'
-      VisibilityTimeout: 180
-      MessageRetentionPeriod: 3600
-      ReceiveMessageWaitTimeSeconds: 0
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
+
 
   # =========================================================================
   # WebSocket API for real-time feeds (ADR-006)
@@ -517,55 +484,6 @@ Resources:
       IntegrationUri: !GetAtt GatewayLambda.Arn
       PayloadFormatVersion: '2.0'
       TimeoutInMillis: 30000
-
-  # =========================================================================
-  # API Gateway → SQS direct integration (POST /api/orders)
-  # Bypasses gateway Lambda entirely for order submission.
-  # Validation moved to worker Lambda (accept-then-reject model).
-  # Feature flag: set OrderDispatchMode parameter to 'sqs-direct' to enable.
-  # =========================================================================
-  ApiGwSqsRole:
-    Type: AWS::IAM::Role
-    Condition: IsSqsDirect
-    Properties:
-      RoleName: !Sub '${ProjectName}-apigw-sqs-role'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: apigateway.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: SQSSendMessage
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: sqs:SendMessage
-                Resource: !GetAtt OrderQueue.Arn
-
-  SqsDirectIntegration:
-    Type: AWS::ApiGatewayV2::Integration
-    Condition: IsSqsDirect
-    Properties:
-      ApiId: !Ref HttpApi
-      IntegrationType: AWS_PROXY
-      IntegrationSubtype: SQS-SendMessage
-      CredentialsArn: !GetAtt ApiGwSqsRole.Arn
-      PayloadFormatVersion: '1.0'
-      RequestParameters:
-        QueueUrl: !Ref OrderQueue
-        MessageBody: $request.body
-      TimeoutInMillis: 5000
-
-  SqsDirectRoute:
-    Type: AWS::ApiGatewayV2::Route
-    Condition: IsSqsDirect
-    Properties:
-      ApiId: !Ref HttpApi
-      RouteKey: 'POST /api/orders'
-      Target: !Sub 'integrations/${SqsDirectIntegration}'
 
   HttpApiRoute:
     Type: AWS::ApiGatewayV2::Route

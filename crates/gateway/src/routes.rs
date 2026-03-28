@@ -302,34 +302,6 @@ pub async fn create_order(
                 tracing::error!(order_id = %order_id, error = %e, "inline order processing failed");
             }
         }
-        crate::DispatchMode::Sqs => {
-            // Send to SQS — Lambda event source mapping triggers worker automatically
-            if let Some(ref sqs_client) = s.sqs_client {
-                tracing::info!(
-                    order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
-                    "sending order to SQS"
-                );
-                match sqs_client.send_message()
-                    .queue_url(&s.order_queue_url)
-                    .message_body(&order_str)
-                    .message_group_id(&req.pair_id)
-                    .message_deduplication_id(&order_id.to_string())
-                    .send()
-                    .await
-                {
-                    Ok(_) => tracing::info!(
-                        order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
-                        "order sent to SQS"
-                    ),
-                    Err(e) => tracing::error!(
-                        order_id = %order_id, pair_id = %req.pair_id, user_id = %user_id,
-                        error = %e, "SQS send failed"
-                    ),
-                }
-            } else {
-                tracing::error!("dispatch_mode=sqs but sqs_client is None");
-            }
-        }
         crate::DispatchMode::Queue => {
             // LPUSH to Valkey queue (local dev / EC2 worker)
             let mut conn = s.redis.get().await?;
@@ -876,13 +848,25 @@ async fn handle_orders_ws(user_id: String, state: AppState, mut socket: WebSocke
     }
 }
 
-// ── Internal manage endpoint (benchmark / admin use only) ─────────────────────
+// ── Internal manage endpoint (deploy / admin use only) ────────────────────────
+//
+// POST /internal/manage {"command": "...", ...args}
+//
+// Commands:
+//   run_migrations          — run sqlx migrations (embedded in binary)
+//   reset_all               — truncate orders/trades + reset balances for N users
+//   reset_balances          — reset balances only (no order truncation)
+//   truncate_orders         — truncate orders and trades tables + clear book cache
+//   exec_sql                — execute arbitrary SQL (admin only)
+//   query                   — SELECT query, returns rows as JSON array
 
 #[derive(serde::Deserialize)]
 pub struct ManageRequest {
     pub command: String,
     pub sql: Option<String>,
     pub num_users: Option<i64>,
+    /// Alias used by deploy.sh / bench scripts
+    pub users: Option<i64>,
 }
 
 pub async fn internal_manage(
@@ -892,66 +876,189 @@ pub async fn internal_manage(
     use axum::Json;
     use serde_json::json;
 
-    let state = match crate::worker::get_state().await {
-        Ok(s) => s,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("state init failed: {e}")}))).into_response();
-        }
-    };
-
     match req.command.as_str() {
-        "reset_all" => {
-            let n = req.num_users.unwrap_or(100);
-            let users: Vec<String> = (1..=n).map(|i| format!("user-{i}")).collect();
-            let r1 = sqlx::query("TRUNCATE TABLE orders, trades RESTART IDENTITY CASCADE")
-                .execute(&state.pg).await;
-            let r2 = sqlx::query(
-                "UPDATE balances SET available = 1000000, locked = 0 WHERE user_id = ANY($1)"
-            ).bind(&users).execute(&state.pg).await;
-            match (r1, r2) {
-                (Ok(_), Ok(_)) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
-                (Err(e), _) | (_, Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": e.to_string()}))).into_response(),
-            }
-        }
-        "query" => {
-            let sql = match req.sql.as_deref() {
-                Some(s) => s,
-                None => return (StatusCode::BAD_REQUEST,
-                    Json(json!({"error": "sql required"}))).into_response(),
+        // ── run_migrations: embedded migrations, no Valkey needed ────────────
+        "run_migrations" => {
+            tracing::info!("manage: run_migrations");
+            let database_url = match std::env::var("DATABASE_URL") {
+                Ok(u) => u,
+                Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "DATABASE_URL not set"}))).into_response(),
             };
-            match sqlx::query(sql).fetch_all(&state.pg).await {
-                Ok(rows) => {
-                    let result: Vec<serde_json::Value> = rows.iter().map(|row| {
-                        use sqlx::Row;
-                        let mut map = serde_json::Map::new();
-                        for (i, col) in row.columns().iter().enumerate() {
-                            use sqlx::Column;
-                            // Try common types in order; fall back to Null
-                            let val: serde_json::Value =
-                                if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
-                                    v.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
-                                } else if let Ok(v) = row.try_get::<Option<f64>, _>(i) {
-                                    v.map(|f| serde_json::json!(f)).unwrap_or(serde_json::Value::Null)
-                                } else if let Ok(v) = row.try_get::<Option<bool>, _>(i) {
-                                    v.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
-                                } else if let Ok(v) = row.try_get::<Option<String>, _>(i) {
-                                    v.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
-                                } else {
-                                    serde_json::Value::Null
-                                };
-                            map.insert(col.name().to_string(), val);
-                        }
-                        serde_json::Value::Object(map)
-                    }).collect();
-                    (StatusCode::OK, Json(json!({"rows": result}))).into_response()
+            let pg = match sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(std::time::Duration::from_secs(30))
+                .connect(&database_url)
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("PG connect failed: {e}")}))).into_response(),
+            };
+            match sqlx::migrate!("../../migrations").run(&pg).await {
+                Ok(_) => {
+                    tracing::info!("manage: migrations complete");
+                    (StatusCode::OK, Json(json!({"status": "ok", "command": "run_migrations"}))).into_response()
                 }
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": e.to_string()}))).into_response(),
+                    Json(json!({"error": format!("migrations failed: {e}")}))).into_response(),
             }
         }
-        _ => (StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("unknown command: {}", req.command)}))).into_response(),
+
+        // ── Commands that need full worker state (Valkey + PG) ───────────────
+        cmd => {
+            let state = match crate::worker::get_state().await {
+                Ok(s) => s,
+                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("state init failed: {e}")}))).into_response(),
+            };
+
+            match cmd {
+                "reset_all" => {
+                    let n = req.users.or(req.num_users).unwrap_or(100) as i32;
+                    tracing::info!(n, "manage: reset_all");
+                    if let Err(e) = sqlx::query("TRUNCATE orders CASCADE")
+                        .execute(&state.pg).await
+                    {
+                        return (StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": e.to_string()}))).into_response();
+                    }
+                    for i in 1..=n {
+                        let user = format!("user-{i}");
+                        let r1 = sqlx::query(
+                            "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'BTC', 10, 0) \
+                             ON CONFLICT (user_id, asset) DO UPDATE SET available = 10, locked = 0"
+                        ).bind(&user).execute(&state.pg).await;
+                        let r2 = sqlx::query(
+                            "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'USDT', 1000000, 0) \
+                             ON CONFLICT (user_id, asset) DO UPDATE SET available = 1000000, locked = 0"
+                        ).bind(&user).execute(&state.pg).await;
+                        if let Err(e) = r1.and(r2) {
+                            return (StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({"error": e.to_string()}))).into_response();
+                        }
+                    }
+                    if let Err(e) = sme_shared::cache::init_balances_from_pg(&state.redis, &state.pg).await {
+                        return (StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": format!("balance cache reinit failed: {e}")}))).into_response();
+                    }
+                    // Clear orderbook + queue cache for all pairs
+                    if let Ok(mut conn) = state.redis.get().await {
+                        for pair in &["BTC-USDT", "ETH-USDT", "SOL-USDT"] {
+                            let _: () = deadpool_redis::redis::cmd("DEL")
+                                .arg(format!("orderbook:{}:bids", pair))
+                                .arg(format!("orderbook:{}:asks", pair))
+                                .arg(format!("version:{}", pair))
+                                .arg(format!("queue:orders:{}", pair))
+                                .query_async(&mut *conn).await.unwrap_or(());
+                        }
+                    }
+                    tracing::info!(n, "manage: reset_all complete");
+                    (StatusCode::OK, Json(json!({"ok": true, "users": n}))).into_response()
+                }
+
+                "reset_balances" => {
+                    let n = req.users.or(req.num_users).unwrap_or(100) as i32;
+                    tracing::info!(n, "manage: reset_balances");
+                    for i in 1..=n {
+                        let user = format!("user-{i}");
+                        let r1 = sqlx::query(
+                            "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'BTC', 10, 0) \
+                             ON CONFLICT (user_id, asset) DO UPDATE SET available = 10, locked = 0"
+                        ).bind(&user).execute(&state.pg).await;
+                        let r2 = sqlx::query(
+                            "INSERT INTO balances (user_id, asset, available, locked) VALUES ($1, 'USDT', 1000000, 0) \
+                             ON CONFLICT (user_id, asset) DO UPDATE SET available = 1000000, locked = 0"
+                        ).bind(&user).execute(&state.pg).await;
+                        if let Err(e) = r1.and(r2) {
+                            return (StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({"error": e.to_string()}))).into_response();
+                        }
+                    }
+                    if let Err(e) = sme_shared::cache::init_balances_from_pg(&state.redis, &state.pg).await {
+                        return (StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": format!("balance cache reinit failed: {e}")}))).into_response();
+                    }
+                    tracing::info!(n, "manage: reset_balances complete");
+                    (StatusCode::OK, Json(json!({"status": "ok", "command": "reset_balances", "users": n}))).into_response()
+                }
+
+                "truncate_orders" => {
+                    tracing::info!("manage: truncate_orders");
+                    if let Err(e) = sqlx::query("TRUNCATE orders CASCADE")
+                        .execute(&state.pg).await
+                    {
+                        return (StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": e.to_string()}))).into_response();
+                    }
+                    if let Ok(mut conn) = state.redis.get().await {
+                        for pair in &["BTC-USDT", "ETH-USDT", "SOL-USDT"] {
+                            let _: () = deadpool_redis::redis::cmd("DEL")
+                                .arg(format!("orderbook:{}:bids", pair))
+                                .arg(format!("orderbook:{}:asks", pair))
+                                .arg(format!("version:{}", pair))
+                                .arg(format!("queue:orders:{}", pair))
+                                .query_async(&mut *conn).await.unwrap_or(());
+                        }
+                    }
+                    tracing::info!("manage: truncate_orders complete");
+                    (StatusCode::OK, Json(json!({"status": "ok", "command": "truncate_orders"}))).into_response()
+                }
+
+                "exec_sql" => {
+                    let sql = match req.sql.as_deref() {
+                        Some(s) => s,
+                        None => return (StatusCode::BAD_REQUEST,
+                            Json(json!({"error": "sql argument required"}))).into_response(),
+                    };
+                    tracing::info!(sql, "manage: exec_sql");
+                    match sqlx::query(sql).execute(&state.pg).await {
+                        Ok(r) => (StatusCode::OK, Json(json!({"status": "ok", "command": "exec_sql", "rows_affected": r.rows_affected()}))).into_response(),
+                        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": e.to_string()}))).into_response(),
+                    }
+                }
+
+                "query" => {
+                    let sql = match req.sql.as_deref() {
+                        Some(s) => s,
+                        None => return (StatusCode::BAD_REQUEST,
+                            Json(json!({"error": "sql required"}))).into_response(),
+                    };
+                    match sqlx::query(sql).fetch_all(&state.pg).await {
+                        Ok(rows) => {
+                            let result: Vec<serde_json::Value> = rows.iter().map(|row| {
+                                use sqlx::Row;
+                                use sqlx::Column;
+                                let mut map = serde_json::Map::new();
+                                for (i, col) in row.columns().iter().enumerate() {
+                                    let val: serde_json::Value =
+                                        if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
+                                            v.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
+                                        } else if let Ok(v) = row.try_get::<Option<f64>, _>(i) {
+                                            v.map(|f| serde_json::json!(f)).unwrap_or(serde_json::Value::Null)
+
+                                        } else if let Ok(v) = row.try_get::<Option<bool>, _>(i) {
+                                            v.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
+                                        } else if let Ok(v) = row.try_get::<Option<String>, _>(i) {
+                                            v.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
+                                        } else {
+                                            serde_json::Value::Null
+                                        };
+                                    map.insert(col.name().to_string(), val);
+                                }
+                                serde_json::Value::Object(map)
+                            }).collect();
+                            (StatusCode::OK, Json(json!({"rows": result}))).into_response()
+                        }
+                        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": e.to_string()}))).into_response(),
+                    }
+                }
+
+                _ => (StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("unknown command: {}", cmd)}))).into_response(),
+            }
+        }
     }
 }

@@ -1,6 +1,10 @@
 # ADR-008: SQS-Based Dispatch Modes
 
-**Status:** Accepted  
+> **Status: Superseded — inline mode is production as of 2026-03-28.**
+> SQS dispatch modes (`sqs`, `sqs-direct`) and queue drain have been removed.
+> Gateway Lambda processes orders inline. Only `inline` and `queue` (local dev) modes remain.
+
+**Status:** Superseded  
 **Date:** 2026-03-26  
 **Decision makers:** Roman Zhukov
 

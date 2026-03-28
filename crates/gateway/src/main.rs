@@ -70,10 +70,8 @@ impl CacheBroadcasts {
 pub enum DispatchMode {
     /// LPUSH to Valkey queue (local dev / EC2 worker)
     Queue,
-    /// Process order inline — matching runs in-process, no cross-Lambda invoke
+    /// Process order inline — matching runs in-process, no cross-Lambda invoke (production)
     Inline,
-    /// SQS message — gateway sends to SQS, Lambda triggered by event source mapping
-    Sqs,
 }
 
 #[derive(Clone)]
@@ -85,12 +83,8 @@ pub struct AppState {
     pub cache: CacheBroadcasts,
     /// Per-user TTL cache — avoids Valkey round-trips for orders/portfolio
     pub user_cache: routes::UserCache,
-    /// Order dispatch mode: "inline" (default prod), "queue" (local dev), or "sqs"
+    /// Order dispatch mode: "inline" (prod, matching in-process), "queue" (local dev)
     pub dispatch_mode: DispatchMode,
-    /// AWS SQS client — used when dispatch_mode == Sqs
-    pub sqs_client: Option<aws_sdk_sqs::Client>,
-    /// SQS queue URL — from ORDER_QUEUE_URL env var
-    pub order_queue_url: String,
 }
 
 /// Subscribe to Valkey pub/sub channel for cache updates.
@@ -270,29 +264,16 @@ async fn main() -> Result<()> {
         all_keys,
     ));
 
-    // Order dispatch mode — inline (prod, matches in-process), queue (local dev), sqs
+    // Order dispatch mode — inline (prod, matches in-process), queue (local dev)
     let dispatch_mode = match std::env::var("ORDER_DISPATCH_MODE").as_deref() {
         Ok("inline") => {
             tracing::info!("order dispatch mode: inline (matching runs in-process, no cross-invoke)");
             DispatchMode::Inline
         }
-        Ok("sqs") => {
-            tracing::info!("order dispatch mode: sqs");
-            DispatchMode::Sqs
-        }
         _ => {
             tracing::info!("order dispatch mode: queue (default, Valkey LPUSH)");
             DispatchMode::Queue
         }
-    };
-
-    let order_queue_url = std::env::var("ORDER_QUEUE_URL").unwrap_or_default();
-
-    let sqs_client = if dispatch_mode == DispatchMode::Sqs {
-        let aws_cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        Some(aws_sdk_sqs::Client::new(&aws_cfg))
-    } else {
-        None
     };
 
     let state = AppState {
@@ -301,8 +282,6 @@ async fn main() -> Result<()> {
         cache: cache.clone(),
         user_cache: routes::UserCache::new(),
         dispatch_mode,
-        sqs_client,
-        order_queue_url,
     };
 
     let app = Router::new()

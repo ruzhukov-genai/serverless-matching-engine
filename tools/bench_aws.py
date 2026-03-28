@@ -18,12 +18,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 # ── Config ────────────────────────────────────────────────────────────────────
 API_URL = "https://kpvhsf0ub8.execute-api.us-east-1.amazonaws.com"
-WORKER_LAMBDA = "serverless-matching-engine-worker"
 GATEWAY_LAMBDA = "serverless-matching-engine-gateway"
 PAIR = "BTC-USDT"
 DB_DSN = "postgres://sme:sme_prod_9b43c1802d8440e9666be882d925d933@serverless-matching-engine-proxy.proxy-cp3apgpybbhw.us-east-1.rds.amazonaws.com:5432/matching_engine"
 DURATION = 30  # seconds per level
-DRAIN_PARALLELISM = 5  # concurrent drain Lambdas
 CLIENT_COUNTS = [1, 40, 100]
 RATE_PER_CLIENT = 0  # orders/s per client (0 = unlimited)
 NUM_USERS = 100  # must match reset_all users count
@@ -53,107 +51,24 @@ def pg_reset_all(num_users: int = 100):
     if not resp.get("ok"):
         print(f"  ⚠️  reset_all failed: {resp}")
 
-def lambda_invoke(payload: dict, function: str = None) -> dict:
-    """Synchronous Lambda invoke, returns parsed response.
-    Uses GATEWAY_LAMBDA if WORKER_LAMBDA doesn't exist (inline mode)."""
-    if function is None:
-        function = WORKER_LAMBDA
+def lambda_invoke(payload: dict) -> dict:
+    """Synchronous Lambda invoke on the Gateway Lambda, returns parsed response."""
     try:
         subprocess.check_output([
             "aws", "lambda", "invoke",
-            "--function-name", function,
+            "--function-name", GATEWAY_LAMBDA,
             "--payload", json.dumps(payload),
             "/tmp/_bench_invoke.json"
         ], stderr=subprocess.DEVNULL)
         with open("/tmp/_bench_invoke.json") as f:
             return json.load(f)
     except Exception as e:
-        # Fallback to Gateway Lambda (inline mode — no separate Worker Lambda)
-        if function == WORKER_LAMBDA:
-            try:
-                subprocess.check_output([
-                    "aws", "lambda", "invoke",
-                    "--function-name", GATEWAY_LAMBDA,
-                    "--payload", json.dumps(payload),
-                    "/tmp/_bench_invoke.json"
-                ], stderr=subprocess.DEVNULL)
-                with open("/tmp/_bench_invoke.json") as f:
-                    return json.load(f)
-            except Exception as e2:
-                return {"error": str(e2)}
         return {"error": str(e)}
 
 def lambda_query(sql: str) -> list:
     """Run SQL query via Gateway /internal/manage."""
     resp = manage_request("query", sql=sql)
     return resp.get("rows", [])
-
-def drain_once(idx: int) -> int:
-    """Single drain invocation, returns orders processed."""
-    try:
-        subprocess.check_output([
-            "aws", "lambda", "invoke",
-            "--function-name", WORKER_LAMBDA,
-            "--payload", '{"drain_queue": true}',
-            f"/tmp/_drain_{idx}.json"
-        ], stderr=subprocess.DEVNULL)
-        with open(f"/tmp/_drain_{idx}.json") as f:
-            resp = json.load(f)
-        return resp.get("orders_processed", 0)
-    except:
-        return 0
-
-# ── Warmup ───────────────────────────────────────────────────────────────────
-def warmup_worker(concurrency=200):
-    """Fire N concurrent Worker Lambda pings to spin up containers before benchmark."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    print(f"  🔥 Warming up Worker Lambda ({concurrency} concurrent pings)...")
-    def ping(i):
-        try:
-            subprocess.check_output([
-                "aws", "lambda", "invoke",
-                "--function-name", WORKER_LAMBDA,
-                "--payload", '{"manage":{"command":"query","sql":"SELECT 1"}}',
-                f"/tmp/_warmup_{i}.json"
-            ], stderr=subprocess.DEVNULL)
-            return True
-        except:
-            return False
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        futs = [ex.submit(ping, i) for i in range(concurrency)]
-        ok = sum(1 for f in as_completed(futs) if f.result())
-    print(f"  🔥 Warmup complete: {ok}/{concurrency} workers responded")
-
-# ── Background drainer ────────────────────────────────────────────────────────
-class ContinuousDrainer:
-    def __init__(self, parallelism=5):
-        self.parallelism = parallelism
-        self.running = False
-        self.total_drained = 0
-        self.drain_rounds = 0
-        self.executor = ThreadPoolExecutor(max_workers=parallelism + 2)
-
-    def start(self):
-        self.running = True
-        self.total_drained = 0
-        self.drain_rounds = 0
-        self._thread_futures = []
-        for i in range(self.parallelism):
-            fut = self.executor.submit(self._drain_loop, i)
-            self._thread_futures.append(fut)
-
-    def stop(self):
-        self.running = False
-        for fut in self._thread_futures:
-            fut.result(timeout=180)  # wait for in-flight drains to finish
-
-    def _drain_loop(self, idx):
-        while self.running:
-            count = drain_once(idx)
-            self.total_drained += count
-            self.drain_rounds += 1
-            if count == 0:
-                time.sleep(0.5)  # brief pause if queue was empty
 
 # ── Order placer ──────────────────────────────────────────────────────────────
 async def place_orders(session, num_clients, run_id, deadline):
@@ -284,7 +199,6 @@ async def run():
     parser.add_argument("--clients", type=str, default=None)
     parser.add_argument("--duration", type=int, default=DURATION)
     parser.add_argument("--run-id", type=str, default=None)
-    parser.add_argument("--drain-parallel", type=int, default=DRAIN_PARALLELISM)
     parser.add_argument("--api", type=str, default=API_URL)
     parser.add_argument("--rate", type=float, default=RATE_PER_CLIENT, help="orders/s per client (0=unlimited)")
     parser.add_argument("--users", type=int, default=NUM_USERS, help="number of users (must match reset_all users count)")
@@ -292,7 +206,6 @@ async def run():
 
     API_URL = args.api
     DURATION = args.duration
-    DRAIN_PARALLELISM = args.drain_parallel
     RATE_PER_CLIENT = args.rate
     NUM_USERS = args.users
     if args.clients:
@@ -309,7 +222,6 @@ async def run():
     print(f"║  Duration: {DURATION}s/level, clients: {CLIENT_COUNTS!s:<28}║")
     print(f"║  Rate:     {rate_str:<48}║")
     print(f"║  Users:    {NUM_USERS:<48}║")
-    print(f"║  Drainers: {DRAIN_PARALLELISM} parallel Lambda invocations{' ':>21}║")
     print("╚══════════════════════════════════════════════════════════════╝")
 
     # Reset
@@ -416,9 +328,6 @@ async def run_ramp(api_url: str, run_id: str, num_users: int,
     async with aiohttp.ClientSession() as session:
         seeded = await seed_liquidity(session, run_id)
     print(f"  📦 Seeded {seeded} resting orders")
-
-    # Warmup AFTER seeding so containers are alive when ramp starts
-    warmup_worker(concurrency=200)
 
     # Token bucket state
     current_rate = step_size
@@ -600,7 +509,6 @@ async def main():
     # passthrough args for non-ramp mode
     parser.add_argument("--clients", type=str, default=None)
     parser.add_argument("--duration", type=int, default=DURATION)
-    parser.add_argument("--drain-parallel", type=int, default=DRAIN_PARALLELISM)
     parser.add_argument("--api", type=str, default=API_URL)
     parser.add_argument("--rate", type=float, default=RATE_PER_CLIENT)
     args = parser.parse_args()

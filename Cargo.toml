@@ -7,7 +7,6 @@ members = [
     "crates/transaction-service",
     "crates/api",
     "crates/gateway",
-    "crates/worker-lambda",
     "crates/ws-handler",
     "tools/loadtest",
 ]
