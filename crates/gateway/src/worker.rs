@@ -77,7 +77,7 @@ pub async fn get_state() -> Result<&'static WorkerState> {
 
     tracing::info!("get_state: creating PG pool (lazy)");
     let pg = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
+        .max_connections(3)  // 3 per container × 100 reserved slots = 300 total, within t4g.medium limit (400)
         .min_connections(0)
         .acquire_timeout(Duration::from_secs(10))
         .idle_timeout(Duration::from_secs(60))
