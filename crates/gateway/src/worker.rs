@@ -399,7 +399,7 @@ pub async fn process_order(state: &WorkerState, payload: &Value) -> Result<()> {
     persist_order(state, &order, &trades, &lua_result.trades).await
         .map_err(|e| { tracing::error!(error = %e, order_id = %order.id, "persist_order detail"); e })
         .context("DB persist failed")?;
-    // persisted_at is set in Rust (Utc::now()) at the top of persist_order — same clock as received_at/matched_at
+    // persisted_at is set by PG NOW() in the INSERT — no extra roundtrip needed
     let persist_ms = persist_start.elapsed().as_millis() as u64;
 
     // 8. Update cache keys (orderbook, trades, ticker, portfolio)
@@ -474,11 +474,14 @@ async fn persist_order(
 ) -> Result<()> {
     let mut tx = state.pg.begin().await?;
 
-    // Insert the incoming order
-    let persisted_at = Utc::now();
+    // Insert the incoming order.
+    // received_at and matched_at are Rust-side Utc::now() (Lambda clock).
+    // persisted_at uses PG NOW() — same clock as other DB timestamps, no extra roundtrip.
+    // Note: matched_at→persisted_at delta is all-PG-relative; received_at is Lambda-relative.
+    // For E2E benchmark use matched_at→persisted_at (pure PG) + match latency from Rust.
     sqlx::query(
         "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, created_at, updated_at, client_order_id, received_at, matched_at, persisted_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW())
          ON CONFLICT DO NOTHING",
     )
     .bind(order.id)
@@ -498,7 +501,6 @@ async fn persist_order(
     .bind(&order.client_order_id)
     .bind(order.received_at)
     .bind(order.matched_at)
-    .bind(persisted_at)
     .execute(&mut *tx)
     .await?;
 
