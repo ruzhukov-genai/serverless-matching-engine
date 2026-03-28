@@ -481,13 +481,16 @@ async fn persist_order(
     trades: &[Trade],
     lua_trades: &[cache::LuaTrade],
 ) -> Result<()> {
+    let now = Utc::now();
+    let has_trades = !trades.is_empty();
+    let order_rests = order.status == OrderStatus::New || order.status == OrderStatus::PartiallyFilled;
+
     let mut tx = state.pg.begin().await?;
 
-    // Insert the incoming order.
-    // received_at and matched_at are Rust-side Utc::now() (Lambda clock).
-    // persisted_at uses PG NOW() — same clock as other DB timestamps, no extra roundtrip.
-    // Note: matched_at→persisted_at delta is all-PG-relative; received_at is Lambda-relative.
-    // For E2E benchmark use matched_at→persisted_at (pure PG) + match latency from Rust.
+    // OPT-4+5: Single INSERT with final status — skip the subsequent UPDATE for resting
+    // orders (they already have correct remaining/status from Lua). For filled/cancelled
+    // orders we still need an UPDATE because Lua sets final state after the INSERT.
+    // We INSERT with the final values directly; the later UPDATE is skipped for resting orders.
     sqlx::query(
         "INSERT INTO orders (id, user_id, pair_id, side, order_type, tif, price, quantity, remaining, status, stp_mode, version, created_at, updated_at, client_order_id, received_at, matched_at, persisted_at)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW())
@@ -501,23 +504,23 @@ async fn persist_order(
     .bind(tif_str(order.tif))
     .bind(order.price)
     .bind(order.quantity)
-    .bind(order.remaining)
-    .bind(status_str(order.status))
+    .bind(order.remaining)      // final remaining (post-match)
+    .bind(status_str(order.status)) // final status (post-match)
     .bind(stp_str(order.stp_mode))
     .bind(order.version)
     .bind(order.created_at)
-    .bind(order.updated_at)
+    .bind(now)                  // updated_at = now
     .bind(&order.client_order_id)
     .bind(order.received_at)
     .bind(order.matched_at)
     .execute(&mut *tx)
     .await?;
 
-    // Batch insert all trades and aggregate balance deltas
+    // Aggregate balance deltas from trades
     let mut balance_deltas: HashMap<(String, String), (Decimal, Decimal)> = HashMap::new();
 
-    if !trades.is_empty() {
-        // Build batched trades INSERT using QueryBuilder
+    if has_trades {
+        // Batch INSERT trades
         let mut trade_query = QueryBuilder::<Postgres>::new(
             "INSERT INTO trades (id, pair_id, buy_order_id, sell_order_id, buyer_id, seller_id, price, quantity, created_at)"
         );
@@ -535,18 +538,13 @@ async fn persist_order(
         trade_query.push(" ON CONFLICT DO NOTHING");
         trade_query.build().execute(&mut *tx).await?;
 
-        // Aggregate balance deltas
         for trade in trades {
             let (base, quote) = parse_pair_id(&trade.pair_id)?;
             let cost = trade.price * trade.quantity;
-
-            // buyer: locked -= cost, available += qty (base)
             balance_deltas.entry((trade.buyer_id.clone(), quote.clone()))
                 .or_insert((Decimal::ZERO, Decimal::ZERO)).0 += cost;
             balance_deltas.entry((trade.buyer_id.clone(), base.clone()))
                 .or_insert((Decimal::ZERO, Decimal::ZERO)).1 += trade.quantity;
-
-            // seller: locked -= qty (base), available += cost
             balance_deltas.entry((trade.seller_id.clone(), base.clone()))
                 .or_insert((Decimal::ZERO, Decimal::ZERO)).0 += trade.quantity;
             balance_deltas.entry((trade.seller_id.clone(), quote.clone()))
@@ -554,29 +552,42 @@ async fn persist_order(
         }
     }
 
-    // Apply balance deltas (sorted for consistent lock ordering = no deadlock)
-    let mut sorted_deltas: Vec<_> = balance_deltas.iter().collect();
-    sorted_deltas.sort_by_key(|((uid, asset), _)| (uid.as_str(), asset.as_str()));
+    // OPT-2: Batch balance UPDATE via UNNEST — one round-trip for all user×asset deltas
+    // Sorted for consistent lock ordering = no deadlock
+    if !balance_deltas.is_empty() {
+        let mut sorted_deltas: Vec<_> = balance_deltas.into_iter().collect();
+        sorted_deltas.sort_by(|((ua, aa), _), ((ub, ab), _)| ua.cmp(ub).then(aa.cmp(ab)));
 
-    for ((user_id, asset), (locked_decrease, available_increase)) in &sorted_deltas {
+        let mut user_ids: Vec<String>  = Vec::with_capacity(sorted_deltas.len());
+        let mut assets:   Vec<String>  = Vec::with_capacity(sorted_deltas.len());
+        let mut locked_dec: Vec<Decimal> = Vec::with_capacity(sorted_deltas.len());
+        let mut avail_inc:  Vec<Decimal> = Vec::with_capacity(sorted_deltas.len());
+
+        for ((uid, asset), (ld, ai)) in sorted_deltas {
+            user_ids.push(uid);
+            assets.push(asset);
+            locked_dec.push(ld);
+            avail_inc.push(ai);
+        }
+
         sqlx::query(
-            "INSERT INTO balances (user_id, asset, available, locked) VALUES ($3, $4, $2, 0)
-             ON CONFLICT (user_id, asset) DO UPDATE
-               SET locked    = GREATEST(balances.locked    - $1, 0),
-                   available = balances.available + $2",
+            "UPDATE balances b
+             SET locked    = GREATEST(b.locked    - u.locked_dec, 0),
+                 available = b.available + u.avail_inc
+             FROM UNNEST($1::text[], $2::text[], $3::numeric[], $4::numeric[])
+                  AS u(user_id, asset, locked_dec, avail_inc)
+             WHERE b.user_id = u.user_id AND b.asset = u.asset",
         )
-        .bind(locked_decrease)
-        .bind(available_increase)
-        .bind(user_id.as_str())
-        .bind(asset.as_str())
+        .bind(&user_ids)
+        .bind(&assets)
+        .bind(&locked_dec)
+        .bind(&avail_inc)
         .execute(&mut *tx)
         .await?;
     }
 
-    // Batch update resting orders after Lua fill
-    let now = Utc::now();
+    // Batch UPDATE resting orders (filled by Lua)
     if !lua_trades.is_empty() {
-        // Build batched resting order updates using CTE
         let mut updates_query = QueryBuilder::<Postgres>::new(
             "WITH updates(order_id, fill_qty) AS ("
         );
@@ -588,101 +599,46 @@ async fn persist_order(
                      .push("remaining = GREATEST(o.remaining - u.fill_qty, 0), ")
                      .push("status = CASE WHEN GREATEST(o.remaining - u.fill_qty, 0) = 0 THEN 'Filled' ELSE 'PartiallyFilled' END, ")
                      .push("version = o.version + 1, ")
-                     .push("updated_at = ")
-                     .push_bind(now)
+                     .push("updated_at = ").push_bind(now)
                      .push(" FROM updates u WHERE o.id = u.order_id AND o.status IN ('New', 'PartiallyFilled')");
         updates_query.build().execute(&mut *tx).await?;
     }
 
-    // Update incoming order's remaining + status
-    sqlx::query(
-        "UPDATE orders SET remaining = $1, status = $2, version = version + 1, updated_at = $3 WHERE id = $4",
-    )
-    .bind(order.remaining)
-    .bind(status_str(order.status))
-    .bind(now)
-    .bind(order.id)
-    .execute(&mut *tx)
-    .await?;
+    // OPT-4: Skip UPDATE for resting orders — INSERT already has final values
+    if !order_rests {
+        sqlx::query(
+            "UPDATE orders SET remaining = $1, status = $2, version = version + 1, updated_at = $3 WHERE id = $4",
+        )
+        .bind(order.remaining)
+        .bind(status_str(order.status))
+        .bind(now)
+        .bind(order.id)
+        .execute(&mut *tx)
+        .await?;
+    }
 
-    // Release remaining locked balance if order fully resolved
-    if order.status == OrderStatus::Cancelled || order.status == OrderStatus::Filled {
-        if order.remaining != Decimal::ZERO {
-            let (base, quote) = parse_pair_id(&order.pair_id)?;
-            let (asset, amount) = match order.side {
-                Side::Buy  => {
-                    let p = order.price.unwrap_or(Decimal::ZERO);
-                    (quote, p * order.remaining)
-                }
-                Side::Sell => (base, order.remaining),
-            };
-            sqlx::query(
-                "UPDATE balances SET available = available + $1, locked = GREATEST(locked - $1, 0) WHERE user_id = $2 AND asset = $3",
-            )
-            .bind(amount)
-            .bind(&order.user_id)
-            .bind(&asset)
-            .execute(&mut *tx)
-            .await?;
-        }
+    // Release remaining locked balance on fill/cancel with leftover quantity
+    if (order.status == OrderStatus::Cancelled || order.status == OrderStatus::Filled)
+        && order.remaining != Decimal::ZERO
+    {
+        let (base, quote) = parse_pair_id(&order.pair_id)?;
+        let (asset, amount) = match order.side {
+            Side::Buy  => { let p = order.price.unwrap_or(Decimal::ZERO); (quote, p * order.remaining) }
+            Side::Sell => (base, order.remaining),
+        };
+        sqlx::query(
+            "UPDATE balances SET available = available + $1, locked = GREATEST(locked - $1, 0) WHERE user_id = $2 AND asset = $3",
+        )
+        .bind(amount)
+        .bind(&order.user_id)
+        .bind(&asset)
+        .execute(&mut *tx)
+        .await?;
     }
 
     tx.commit().await?;
 
-    // Batch audit events — fire-and-forget outside main transaction
-    if !trades.is_empty() {
-        // Build batch audit log INSERT for order + trades
-        let mut audit_values = vec![
-            (order.pair_id.clone(), "ORDER_CREATED".to_string(), json!({
-                "order_id": order.id.to_string(),
-                "user_id": order.user_id,
-                "side": side_str(order.side),
-                "order_type": order_type_str(order.order_type),
-                "price": order.price.map(|v| v.to_string()),
-                "quantity": order.quantity.to_string(),
-            }))
-        ];
-
-        for trade in trades {
-            audit_values.push((
-                trade.pair_id.clone(),
-                "TRADE_EXECUTED".to_string(),
-                json!({
-                    "trade_id": trade.id.to_string(),
-                    "buy_order_id": trade.buy_order_id.to_string(),
-                    "sell_order_id": trade.sell_order_id.to_string(),
-                    "price": trade.price.to_string(),
-                    "quantity": trade.quantity.to_string(),
-                })
-            ));
-        }
-
-        let mut audit_query = QueryBuilder::<Postgres>::new(
-            "INSERT INTO audit_log (pair_id, event_type, payload)"
-        );
-        audit_query.push_values(&audit_values, |mut b, (pair_id, event_type, payload)| {
-            b.push_bind(pair_id)
-             .push_bind(event_type)
-             .push_bind(payload);
-        });
-
-        let _ = audit_query.build().execute(&state.pg).await;
-    } else {
-        // Just the order creation audit event
-        let _ = sqlx::query("INSERT INTO audit_log (pair_id, event_type, payload) VALUES ($1, $2, $3)")
-            .bind(&order.pair_id)
-            .bind("ORDER_CREATED")
-            .bind(json!({
-                "order_id": order.id.to_string(),
-                "user_id": order.user_id,
-                "side": side_str(order.side),
-                "order_type": order_type_str(order.order_type),
-                "price": order.price.map(|v| v.to_string()),
-                "quantity": order.quantity.to_string(),
-            }))
-            .execute(&state.pg)
-            .await;
-    }
+    // OPT-1: audit_log writes removed from hot path — not needed for correctness or metrics
 
     Ok(())
 }
