@@ -51,7 +51,21 @@ SELLER = "user-2"  # pre-seeded with BTC + USDT
 BUYER  = "user-1"  # pre-seeded with BTC + USDT
 
 def cleanup_book(cfg):
-    """Cancel ALL open orders for both users across all pairs to start clean."""
+    """Reset orders/trades and balances to start with a clean slate.
+    Uses /internal/manage if available (AWS), otherwise cancels open orders.
+    """
+    try:
+        resp = requests.post(
+            f"{cfg.api_url}/internal/manage",
+            json={"command": "reset_all", "num_users": 100},
+            timeout=30,
+        )
+        if resp.status_code == 200 and resp.json().get("ok"):
+            # Also need to reseed balance for smoke test users
+            return
+    except Exception:
+        pass
+    # Fallback: cancel open orders for test users
     for user in (BUYER, SELLER):
         for pair in ("BTC-USDT", "ETH-USDT", "SOL-USDT"):
             cancel_all(cfg, user, pair)
@@ -387,6 +401,9 @@ async def run_all(cfg):
 
     t_start = time.monotonic()
 
+    # Cancel stale open orders from prior runs before starting
+    cleanup_book(cfg)
+
     # API tests
     print("── API Tests ──")
     test_01_pairs_load(cfg)
@@ -450,6 +467,7 @@ def main():
         print(f"  SME Smoke Tests — API only (unique price base: {UNIQUE})")
         print(f"  API: {cfg.api_url}")
         print(f"{'='*60}\n")
+        cleanup_book(cfg)  # cancel any stale open orders from prior runs
         test_01_pairs_load(cfg)
         test_02_limit_rests(cfg)
         test_03_crossing_trade(cfg)

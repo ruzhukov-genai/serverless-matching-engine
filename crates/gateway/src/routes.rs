@@ -942,13 +942,16 @@ pub async fn internal_manage(
                         return (StatusCode::INTERNAL_SERVER_ERROR,
                             Json(json!({"error": format!("balance cache reinit failed: {e}")}))).into_response();
                     }
-                    // Clear orderbook + queue cache for all pairs
+                    // Flush live book + cache keys for all pairs
                     if let Ok(mut conn) = state.redis.get().await {
                         for pair in &["BTC-USDT", "ETH-USDT", "SOL-USDT"] {
                             let _: () = deadpool_redis::redis::cmd("DEL")
-                                .arg(format!("orderbook:{}:bids", pair))
-                                .arg(format!("orderbook:{}:asks", pair))
+                                .arg(format!("book:{}:bids", pair))
+                                .arg(format!("book:{}:asks", pair))
                                 .arg(format!("version:{}", pair))
+                                .arg(format!("cache:orderbook:{}", pair))
+                                .arg(format!("cache:trades:{}", pair))
+                                .arg(format!("cache:ticker:{}", pair))
                                 .arg(format!("queue:orders:{}", pair))
                                 .query_async(&mut *conn).await.unwrap_or(());
                         }
@@ -994,9 +997,12 @@ pub async fn internal_manage(
                     if let Ok(mut conn) = state.redis.get().await {
                         for pair in &["BTC-USDT", "ETH-USDT", "SOL-USDT"] {
                             let _: () = deadpool_redis::redis::cmd("DEL")
-                                .arg(format!("orderbook:{}:bids", pair))
-                                .arg(format!("orderbook:{}:asks", pair))
+                                .arg(format!("book:{}:bids", pair))
+                                .arg(format!("book:{}:asks", pair))
                                 .arg(format!("version:{}", pair))
+                                .arg(format!("cache:orderbook:{}", pair))
+                                .arg(format!("cache:trades:{}", pair))
+                                .arg(format!("cache:ticker:{}", pair))
                                 .arg(format!("queue:orders:{}", pair))
                                 .query_async(&mut *conn).await.unwrap_or(());
                         }
