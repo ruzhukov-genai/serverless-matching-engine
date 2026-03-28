@@ -166,7 +166,7 @@ async def warmup_containers(num_containers: int, timeout: float = 30.0):
         body = {
             "pair_id": PAIR, "user_id": f"user-{(idx % NUM_USERS) + 1}",
             "side": "Buy", "order_type": "Limit",
-            "price": "69000",  # below market — rests without matching
+            "price": "70700",  # at market — matches immediately, doesn't accumulate in book
             "quantity": "0.001", "time_in_force": "GTC",
             "client_order_id": f"warmup-{idx}-{wave_ts}"
         }
@@ -268,10 +268,16 @@ async def run():
         print(f"  ▶ c={num_clients} — {DURATION}s")
         print(f"{'━' * 65}")
 
-        # Warmup containers before this level
+        # Warmup containers before this level — seed deep liquidity first so
+        # crossing-price warmup orders match cleanly without draining the book,
+        # then reset + re-seed for the actual benchmark run.
+        async with aiohttp.ClientSession() as session:
+            await seed_liquidity(session, f"{run_id}-warmup")
         await warmup_containers(num_clients)
+        # Reset after warmup (clears warmup orders + restores balances), then seed fresh
+        pg_reset_all(num_users=NUM_USERS)
 
-        # Seed liquidity
+        # Seed liquidity for benchmark
         async with aiohttp.ClientSession() as session:
             seeded = await seed_liquidity(session, run_id)
         print(f"  📦 Seeded {seeded} resting orders")
