@@ -55,21 +55,27 @@ static STATE: OnceCell<WorkerState> = OnceCell::new();
 /// Valkey key incremented by truncate_orders/reset_all to invalidate container state.
 const RESET_VERSION_KEY: &str = "state:reset_version";
 
+/// Check reset version every N invocations (not every request — Valkey RTT adds latency)
+static INVOCATION_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const VERSION_CHECK_INTERVAL: u64 = 20;
+
 pub async fn get_state() -> Result<&'static WorkerState> {
     if let Some(s) = STATE.get() {
-        // Check reset version — if truncate_orders ran since we initialized,
-        // exit so Lambda recycles this container with fresh state.
-        if let Ok(mut conn) = s.redis.get().await {
-            let current_ver: Option<u64> = deadpool_redis::redis::cmd("GET")
-                .arg(RESET_VERSION_KEY)
-                .query_async(&mut *conn)
-                .await
-                .unwrap_or(None);
-            let cached_ver = s.reset_version;
-            if let Some(v) = current_ver {
-                if v != cached_ver {
-                    tracing::warn!(cached_ver, current_ver = v, "reset version changed — exiting for container recycle");
-                    std::process::exit(0);
+        // Check reset version every VERSION_CHECK_INTERVAL invocations to avoid
+        // per-request Valkey RTT overhead, while still detecting resets quickly.
+        let count = INVOCATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count % VERSION_CHECK_INTERVAL == 0 {
+            if let Ok(mut conn) = s.redis.get().await {
+                let current_ver: Option<u64> = deadpool_redis::redis::cmd("GET")
+                    .arg(RESET_VERSION_KEY)
+                    .query_async(&mut *conn)
+                    .await
+                    .unwrap_or(None);
+                if let Some(v) = current_ver {
+                    if v != s.reset_version {
+                        tracing::warn!(cached = s.reset_version, current = v, "reset version changed — exiting for container recycle");
+                        std::process::exit(0);
+                    }
                 }
             }
         }
