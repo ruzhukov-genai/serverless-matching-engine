@@ -2,9 +2,6 @@
 resolver = "2"
 members = [
     "crates/shared",
-    "crates/matching-engine",
-    "crates/order-service",
-    "crates/transaction-service",
     "crates/api",
     "crates/gateway",
     "crates/ws-handler",

@@ -1,65 +1,29 @@
 # ADR-007: Queue-Based Lambda Dispatch (Replace Direct Invoke)
 
-**Status:** Accepted  
-**Date:** 2026-03-25  
+**Status:** Superseded — inline mode is production as of 2026-03-28.
+**Date:** 2026-03-25
 **Decision makers:** Roman Zhukov
 
-> **See also:** ADR-008 for SQS-based dispatch modes (`sqs` and `sqs-direct`).
+> **Superseded by inline matching (2026-03-28).** Gateway Lambda processes orders inline (Lua EVAL → PG persist in the same invocation). No Worker Lambda, no SQS, no queue drain. `queue` mode retained for local dev only. See ADR-008 for history of SQS experiments that led to this conclusion.
 
 ## Context
 
-The gateway Lambda currently invokes the worker Lambda directly (synchronous SDK call) for each order. This has several problems:
+(Historical — kept for reference)
 
-1. **Cold start tax per order** — each invoke can hit a cold start (1.9s observed), blocking the gateway response
-2. **No batching** — 1 invocation = 1 order. The batch persist code (`process_persist_batch`) can't batch across invocations
-3. **VPC endpoint fragility** — the gateway needs egress to the Lambda service endpoint (port 443). VPC endpoint SG misconfiguration caused a full outage (2026-03-25)
-4. **Cost** — N orders = N Lambda invocations, each billed for full duration including cold start
-5. **55ms LWA overhead** — the Lambda invoke SDK roundtrip adds ~55ms to the gateway's hot path (ADR noted in MEMORY.md 2026-03-25)
+Direct Lambda invoke had: cold start tax, no batching, VPC endpoint fragility, LWA 55ms overhead.
+Queue-based dispatch (this ADR) addressed those but introduced up-to-1-minute processing latency.
+Both approaches were superseded when benchmarks showed inline matching at ~200 orders/s sustained
+with p50=5ms E2E was simpler and faster than any queue/invoke scheme.
 
-The local `sme-api` worker already uses Valkey queues with BRPOP + batch drain (ADR-005). The Lambda worker should follow the same pattern.
+## Decision (original, 2026-03-25)
 
-## Decision
+Switch Lambda worker to queue-based dispatch using Valkey queues + EventBridge scheduled drain.
 
-**Switch Lambda worker to queue-based dispatch using Valkey queues + scheduled invocation.**
-
-### Architecture:
-1. Gateway does `LPUSH queue:orders:{pair_id}` (same as local mode) — returns 202 immediately
-2. Worker Lambda is invoked on a **1-second EventBridge schedule** (rate(1 minute) initially, can tune down)
-3. Each invocation: BRPOP from all pair queues, drain up to 50 orders, batch process + batch persist
-4. If queue is empty, return immediately (minimal cost — ~100ms billed)
-5. Gateway's `ORDER_DISPATCH_MODE` set to `queue` (same as local dev)
-
-### Benefits:
-- **Batch processing** — 1 invocation handles N orders in one PG transaction
-- **No cold start in hot path** — gateway returns instantly after LPUSH
-- **Simpler networking** — gateway only needs Valkey access, not Lambda service endpoint
-- **Lower cost** — fewer invocations, batch amortizes overhead
-- **Consistent architecture** — same queue pattern as local `sme-api` worker
-
-### Trade-offs:
-- **Added latency** — orders wait up to polling interval (up to 1 minute) before processing starts
-- **Polling cost** — Lambda invoked every minute even when idle
-- **Queue visibility** — harder to trace individual order → invocation mapping (mitigated by client_order_id tagging)
-
-### Tuning:
-- EventBridge schedule: `rate(1 minute)` — see ADR-008 for lower-latency SQS alternatives
-- Batch size: up to 50 per invocation (matches existing `process_persist_batch` limit)
+**Reverted 2026-03-28:** Worker Lambda deleted. Gateway runs matching inline. `ORDER_DISPATCH_MODE=inline` in production.
 
 ## Consequences
 
-- Gateway no longer needs Lambda VPC endpoint access (removes SG fragility)
-- Worker Lambda needs VPC endpoint for Valkey only (already has it)
-- EventBridge rule replaces direct invocation — add to CloudFormation
-- `ORDER_DISPATCH_MODE=queue` in gateway Lambda env vars
-- Remove Lambda invoke permissions from gateway role (simplifies IAM)
-
-## Alternatives Considered
-
-- **Keep direct invoke, fix SG:** Works but doesn't solve cold start, batching, or cost issues
-- **SQS trigger:** SQS → Lambda is native AWS but adds another service + double serialization. Valkey queue is already there and faster
-- **Valkey Streams + consumer groups:** More sophisticated but overkill for current scale. Good future option.
-- **Step Functions:** Too complex for simple queue drain
-
----
-
-_This ADR supersedes the direct invoke pattern. The gateway's `lambda` dispatch mode is deprecated._
+- No Worker Lambda deployed
+- No EventBridge rule
+- Gateway handles full order lifecycle: validate → Lua EVAL match → PG persist → respond 201
+- `queue` mode still works for local dev (sme-api BRPOP worker)

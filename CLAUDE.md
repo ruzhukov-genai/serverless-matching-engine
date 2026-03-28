@@ -12,14 +12,10 @@ Valkey (Redis-compatible) for distributed locking/caching, PostgreSQL for persis
 
 ```
 crates/
-  gateway/      → stateless HTTP/WS gateway (port 3001), reads Valkey cache
-  worker-lambda/ → Worker Lambda (processes individual orders, matching, PG writes)
-  ws-handler/   → WebSocket API Gateway handler ($connect/$disconnect/sendMessage)
-  api/          → local dev worker (BRPOP queue consumer), matching, PG writes
-  shared/       → types, config, cache (sorted sets + Lua matching), DB, engine
-  matching-engine/  → re-exports shared engine (standalone binary, unused in PoC)
-  order-service/    → stream consumer (reference impl, unused in PoC)
-  transaction-service/ → stream consumer (reference impl, unused in PoC)
+  gateway/    → stateless HTTP/WS gateway (port 3001); inline matching in production
+  ws-handler/ → WebSocket API Gateway handler ($connect/$disconnect/sendMessage)
+  api/        → local dev worker (BRPOP queue consumer), matching, PG writes
+  shared/     → types, config, cache (sorted sets + Lua matching), DB, engine
 infra/
   template.yaml → Root SAM template with nested stacks
   stacks/       → Network, backend, frontend CloudFormation stacks
@@ -246,7 +242,7 @@ python3 tools/benchmark.py
 - Root stack: `serverless-matching-engine` (deploy via `sam deploy` from repo root)
 - Nested: `BackendStack-7JBC7XEVQNKF`, `NetworkStack-1CC1NUX65RXPV`, `FrontendStack-156KD6ROT0G0S`
 - Individual `infra/stacks/*.yaml` files are NOT standalone — they reference parent parameters/conditions
-- Lambda function names: `serverless-matching-engine-gateway`, `serverless-matching-engine-worker`, `serverless-matching-engine-ws-handler`
+- Lambda function names: `serverless-matching-engine-gateway`, `serverless-matching-engine-ws-handler`
 
 ### Deploy Process
 ```bash
