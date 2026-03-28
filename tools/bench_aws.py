@@ -251,14 +251,9 @@ def query_lifecycle(run_id, num_clients):
         percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - matched_at) * 1000) as persist_p50,
         percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - matched_at) * 1000) as persist_p95,
         percentile_cont(0.99) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - matched_at) * 1000) as persist_p99,
-        -- E2E = match + persist (avoids cross-clock skew: received_at/matched_at are Lambda-side,
-        -- persisted_at is PG NOW(). Use match+persist sum which stays within each clock domain.)
-        percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from matched_at - received_at) * 1000)
-          + percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - matched_at) * 1000) as e2e_p50,
-        percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch from matched_at - received_at) * 1000)
-          + percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - matched_at) * 1000) as e2e_p95,
-        percentile_cont(0.99) WITHIN GROUP (ORDER BY extract(epoch from matched_at - received_at) * 1000)
-          + percentile_cont(0.99) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - matched_at) * 1000) as e2e_p99
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - received_at) * 1000) as e2e_p50,
+        percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - received_at) * 1000) as e2e_p95,
+        percentile_cont(0.99) WITHIN GROUP (ORDER BY extract(epoch from persisted_at - received_at) * 1000) as e2e_p99
     FROM orders 
     WHERE client_order_id LIKE '{prefix}%' 
       AND received_at IS NOT NULL 
