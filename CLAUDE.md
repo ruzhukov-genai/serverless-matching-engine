@@ -308,6 +308,20 @@ More users = less balance contention under load (persist p99 dropped from 29ms a
 | HTTP API | API Gateway | `kpvhsf0ub8` |
 | WebSocket | API Gateway WS | `2shnq9yk0c` |
 
+## Development Workflow — OpenSpec (opsx)
+
+All feature work and non-trivial changes MUST follow the OpenSpec workflow:
+
+1. **`/opsx:propose "description"`** — create a change proposal with specs, design, tasks
+2. **`/opsx:apply`** — implement through tasks.md
+3. **`/opsx:archive`** — merge delta specs into `docs/openspec/specs/`, move to archive
+
+Behavioral specs live in `docs/openspec/specs/` (symlinked as `openspec/`).
+Do NOT implement features that don't have a proposal in `docs/openspec/changes/`.
+Do NOT skip spec writing for "small" changes — if it modifies observable behavior, it gets a spec delta.
+
+CLI: `openspec list`, `openspec list --specs`, `openspec view`
+
 ## Don'ts
 
 - Don't use `f64` for prices or quantities
@@ -316,3 +330,4 @@ More users = less balance contention under load (persist p99 dropped from 29ms a
 - Don't touch the order book cache without holding the per-pair lock
 - Don't run destructive DB operations without asking
 - Don't commit code that doesn't compile or pass tests
+- Don't implement features without an OpenSpec proposal
