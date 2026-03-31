@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
   Serverless Matching Engine - Backend Stack
-  RDS db.t4g.micro (PostgreSQL) + ElastiCache Valkey (cache.t4g.micro) + Lambda (gateway + worker + ws-handler) + API Gateway HTTP API + WebSocket API.
+  RDS db.t4g.micro (PostgreSQL) + ElastiCache Valkey (cache.t4g.micro) + Lambda (gateway + ws-handler) + API Gateway HTTP API + WebSocket API.
   Lambda functions use AWS::Serverless::Function with PackageType: Image.
 
 # ---------------------------------------------------------------------------
@@ -58,10 +58,6 @@ Parameters:
   LambdaSecurityGroupId:
     Type: AWS::EC2::SecurityGroup::Id
     Description: Gateway Lambda security group ID from Network stack.
-
-  WorkerLambdaSecurityGroupId:
-    Type: AWS::EC2::SecurityGroup::Id
-    Description: Worker Lambda security group ID from Network stack.
 
   RDSSecurityGroupId:
     Type: AWS::EC2::SecurityGroup::Id
@@ -292,7 +288,7 @@ Resources:
       RetentionInDays: 14
 
   # =========================================================================
-  # Lambda Function - sme-gateway via AWS Lambda Web Adapter
+  # Lambda Function - sme-gateway via native lambda_http runtime
   # Uses AWS::Serverless::Function with PackageType: Image
   # SAM builds from infra/Dockerfile.gateway with DockerContext = .. (project root)
   # =========================================================================
@@ -305,7 +301,7 @@ Resources:
       Dockerfile: infra/Dockerfile.gateway
     Properties:
       FunctionName: !Sub '${ProjectName}-gateway'
-      Description: sme-gateway HTTP handler via AWS Lambda Web Adapter (zero code changes)
+      Description: sme-gateway HTTP handler via native lambda_http runtime (no LWA proxy)
       PackageType: Image
       Architectures:
         - x86_64
@@ -321,11 +317,6 @@ Resources:
           - !Ref LambdaSecurityGroupId
       Environment:
         Variables:
-          # Lambda Web Adapter settings
-          PORT: '3001'
-          AWS_LWA_PORT: '3001'
-          AWS_LWA_READINESS_CHECK_PATH: '/api/pairs'
-          AWS_LWA_PASS_THROUGH_PATH: '/'
           # Cache: ElastiCache Valkey
           REDIS_URL: !Sub 'redis://${ValkeyEndpoint}:6379'
           RUST_LOG: info

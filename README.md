@@ -1,8 +1,8 @@
 # Serverless Matching Engine
 
-> A high-performance, stateless order matching engine in **Rust**, deployed as AWS Lambda functions.
+> A high-performance, stateless order matching engine in **Rust**, deployed as AWS Lambda.
 
-Orders are queued in Valkey and batch-processed by a Lambda worker on an EventBridge schedule. Matching is atomic via Lua EVAL. Fully serverless — scales to zero when idle, scales out automatically under load.
+Fully serverless — inline matching runs inside the Gateway Lambda on every order request. Matching is atomic via Lua EVAL in Valkey. Scales to zero when idle, scales out automatically under load.
 
 ## Stack
 
@@ -19,37 +19,31 @@ Orders are queued in Valkey and batch-processed by a Lambda worker on an EventBr
 ## Architecture
 
 ```
-Client → CloudFront → API Gateway → Gateway Lambda (HTTP/WS)
-                                         │
-                                    LPUSH to Valkey queue
-                                    (returns 202 instantly)
-                                         │
-                              EventBridge (1 min schedule)
-                                         │
-                                    Worker Lambda
-                                    (drains up to 50 orders)
-                                    ┌────┴────┐
-                                    │ Lua EVAL │ ← Valkey (ElastiCache)
-                                    │ (match)  │
-                                    └────┬────┘
-                                         │
-                                    persist trades
-                                         │
-                                    PostgreSQL (RDS via Proxy)
+Client → API Gateway → Gateway Lambda (inline match)
+                              │
+                    ┌─────────┴─────────┐
+                    │    Lua EVAL       │ ← Valkey (ElastiCache)
+                    │  (atomic match)   │
+                    └─────────┬─────────┘
+                              │
+                        persist trades
+                              │
+                       PostgreSQL (RDS via Proxy)
 ```
 
-**Core flow (ADR-007):**
-`POST /api/orders` → Gateway validates → `LPUSH queue:orders:{pair_id}` → 202 Accepted
-→ EventBridge fires → Worker drains queue → Lua EVAL match (Valkey) → persist (PG) → update cache
+**Core flow (inline mode — production default):**
+`POST /api/orders` → Gateway validates → Lua EVAL match (Valkey, atomic) → persist (PG) → 201 Created
+
+All matching runs in-process in the Gateway Lambda. No Worker Lambda, no queue.
 
 ## Structure
 
 ```
 crates/
-  gateway/        → HTTP/WS gateway Lambda (reads Valkey cache, dispatches orders)
-  worker-lambda/  → Worker Lambda (matches orders, persists to PG)
+  gateway/        → HTTP/WS gateway Lambda (inline matching + persistence in production)
   shared/         → Types, config, cache (sorted sets + Lua matching), DB, engine
   api/            → Local dev worker (BRPOP queue consumer)
+  ws-handler/     → WebSocket API Gateway handler ($connect/$disconnect/sendMessage)
 infra/
   template.yaml   → Root SAM template (3 nested stacks)
   stacks/         → Network, backend, frontend CloudFormation
@@ -69,7 +63,7 @@ tests/            → Integration & smoke tests
 ```bash
 docker compose up -d                    # Start Valkey + PostgreSQL
 cargo build                             # Build all crates
-cargo run --bin sme-api                 # Start worker (queue consumer)
+cargo run --bin sme-api                 # Start worker (local queue consumer)
 cargo run --bin sme-gateway             # Start gateway (HTTP/WS)
 # http://localhost:3001/trading/        # Trading UI
 # http://localhost:3001/dashboard/      # Metrics dashboard
@@ -82,15 +76,16 @@ tools/deploy.sh --migrate-only          # Just run migrations
 tools/deploy.sh --skip-build            # Deploy with existing images
 ```
 
-### Manage Commands (Worker Lambda)
+### Manage Commands (Gateway Lambda — POST /internal/manage)
 ```bash
 # Run migrations after deploy
-aws lambda invoke --function-name serverless-matching-engine-worker \
-  --payload '{"manage":{"command":"run_migrations"}}' /tmp/out.json
+curl -X POST $API_URL/internal/manage -d '{"command":"run_migrations"}'
 
-# Reset benchmark data
-aws lambda invoke --function-name serverless-matching-engine-worker \
-  --payload '{"manage":{"command":"reset_all"}}' /tmp/out.json
+# Reset benchmark data (orders + balances) for N users
+curl -X POST $API_URL/internal/manage -d '{"command":"reset_all","users":100}'
+
+# Truncate orders/trades + clear book cache
+curl -X POST $API_URL/internal/manage -d '{"command":"truncate_orders"}'
 ```
 
 See [docs/aws-architecture.md](docs/aws-architecture.md) for detailed AWS architecture.
@@ -99,11 +94,10 @@ See [docs/aws-architecture.md](docs/aws-architecture.md) for detailed AWS archit
 
 | Component | Service | Spec |
 |-----------|---------|------|
-| Cache | ElastiCache Valkey | `cache.t4g.micro`, Valkey 8.1 |
+| Cache | ElastiCache Valkey | `cache.t4g.micro`, Valkey 8.0 |
 | Database | RDS PostgreSQL | `db.t4g.small`, PG 16.6 |
-| Connection Pool | RDS Proxy | `sme-proxy-v2` |
-| Gateway | Lambda + API Gateway | 512MB, arm64, Lambda Web Adapter |
-| Worker | Lambda | 1024MB, x86_64, native Rust runtime |
+| Connection Pool | RDS Proxy | `serverless-matching-engine-proxy` |
+| Gateway | Lambda + API Gateway | 1024MB, x86_64, Lambda Web Adapter |
 | Frontend | CloudFront + S3 | Static HTML/JS/CSS |
 | WebSocket | API Gateway WebSocket | Real-time orderbook + trades |
 

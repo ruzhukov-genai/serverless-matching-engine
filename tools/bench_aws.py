@@ -77,60 +77,78 @@ def lambda_query(sql: str) -> list:
 
 # ── Order placer ──────────────────────────────────────────────────────────────
 async def place_orders(session, num_clients, run_id, deadline):
-    """Place orders as fast as possible with num_clients concurrency."""
+    """Place orders at the configured rate, fire-and-forget style.
+
+    Each client coroutine maintains a wall-clock send schedule and fires
+    requests as background tasks — it does NOT await the response before
+    scheduling the next send. This decouples send rate from Lambda response
+    time so the configured rate/s is actually achieved.
+
+    In-flight requests are tracked via a set; we wait for all of them to
+    settle after the duration window before returning.
+    """
     placed = 0
     errors = 0
     latencies = []
+    inflight: set[asyncio.Task] = set()
     users = [f"user-{(i % NUM_USERS) + 1}" for i in range(num_clients)]
 
-    async def client_loop(client_id):
+    async def do_request(body: dict, t0: float):
         nonlocal placed, errors
+        try:
+            async with session.post(f"{API_URL}/api/orders", json=body) as resp:
+                elapsed = (time.monotonic() - t0) * 1000
+                if resp.status in (200, 201, 202):
+                    placed += 1
+                    latencies.append(elapsed)
+                else:
+                    errors += 1
+                    if errors <= 3:
+                        body_text = await resp.text()
+                        print(f"  ⚠️  HTTP {resp.status}: {body_text[:120]}")
+        except Exception as e:
+            errors += 1
+            if errors <= 3:
+                print(f"  ⚠️  Exception: {e}")
+
+    async def client_loop(client_id):
         seq = 0
         interval = 1.0 / RATE_PER_CLIENT if RATE_PER_CLIENT > 0 else 0
         next_send = time.monotonic()
         while time.monotonic() < deadline:
-            # Rate limiting: sleep until next allowed send time
-            # next_send is set BEFORE the request so interval is wall-clock, not request-completion relative
             if interval > 0:
                 now = time.monotonic()
                 if now < next_send:
                     await asyncio.sleep(next_send - now)
-            next_send_before = time.monotonic()  # capture before request
+                next_send += interval  # schedule relative to intended send time, not actual
 
             user = users[client_id % len(users)]
             side = "Buy" if seq % 2 == 0 else "Sell"
-            # Price that will cross with seeded liquidity
-            price = "70700" if side == "Buy" else "70700"
             coid = f"{run_id}-n{num_clients}-c{client_id}-{seq}"
             body = {
                 "pair_id": PAIR, "user_id": user, "side": side,
-                "order_type": "Limit", "price": price,
+                "order_type": "Limit", "price": "70700",
                 "quantity": "0.001", "time_in_force": "GTC",
                 "client_order_id": coid
             }
             t0 = time.monotonic()
-            try:
-                async with session.post(f"{API_URL}/api/orders", json=body) as resp:
-                    elapsed = (time.monotonic() - t0) * 1000
-                    if resp.status in (200, 201, 202):
-                        placed += 1
-                        latencies.append(elapsed)
-                    else:
-                        errors += 1
-                        if errors <= 3:
-                            body_text = await resp.text()
-                            print(f"  ⚠️  HTTP {resp.status}: {body_text[:120]}")
-            except Exception as e:
-                errors += 1
-                if errors <= 3:
-                    print(f"  ⚠️  Exception: {e}")
-            # Schedule next send relative to when this send started (not when it completed)
-            if interval > 0:
-                next_send = next_send_before + interval
+            # Fire and forget — don't await; schedule next send immediately
+            task = asyncio.create_task(do_request(body, t0))
+            inflight.add(task)
+            task.add_done_callback(inflight.discard)
             seq += 1
 
-    tasks = [asyncio.create_task(client_loop(i)) for i in range(num_clients)]
-    await asyncio.gather(*tasks, return_exceptions=True)
+            if interval == 0:
+                # Unlimited mode: yield control so other coroutines can run
+                await asyncio.sleep(0)
+
+    client_tasks = [asyncio.create_task(client_loop(i)) for i in range(num_clients)]
+    await asyncio.gather(*client_tasks, return_exceptions=True)
+
+    # Wait for all in-flight requests to complete before returning
+    if inflight:
+        await asyncio.gather(*list(inflight), return_exceptions=True)
+
     return placed, errors, latencies
 
 async def seed_liquidity(session, run_id):
@@ -157,13 +175,15 @@ async def seed_liquidity(session, run_id):
     return placed
 
 # ── Lifecycle query ───────────────────────────────────────────────────────────
-async def warmup_containers(num_containers: int, timeout: float = 30.0):
-    """Staggered warmup: send orders in small batches to avoid saturating reserved concurrency.
-    Triggers get_state() on each container (PG pool + Valkey worker state init)."""
+async def warmup_containers(num_containers: int, timeout: float = 60.0):
+    """Concurrent warmup: send all warmup orders simultaneously so each one hits a distinct
+    container. Semaphore is set to num_containers so all fire at once — this is intentional.
+    We need every container to init (PG pool + Valkey) before the benchmark starts.
+    Timeout raised to 60s to allow for LWA readiness check on cold containers."""
     print(f"  🔥 Warming {num_containers} containers...", end="", flush=True)
     t0 = time.monotonic()
     ok = 0
-    batch_size = 20  # stay well under 100 reserved slots at once
+    batch_size = num_containers  # all concurrent — each hits a different container
     wave_ts = int(t0)
     semaphore = asyncio.Semaphore(batch_size)
     async def ping(session, idx):
@@ -287,12 +307,13 @@ async def run():
             seeded = await seed_liquidity(session, run_id)
         print(f"  📦 Seeded {seeded} resting orders")
 
-        # Place orders
+        # Place orders — fire-and-forget mode: send rate is independent of response latency.
+        # Use an uncapped connector so many inflight requests don't stall on the connection pool.
         deadline = time.monotonic() + DURATION
-        async with aiohttp.ClientSession() as session:
+        connector = aiohttp.TCPConnector(limit=0)
+        async with aiohttp.ClientSession(connector=connector) as session:
             placed, errors, latencies = await place_orders(session, num_clients, run_id, deadline)
 
-                # In inline mode, orders are already processed synchronously — no drain needed
         print(f"  ⏳ Placed {placed} orders ({errors} errors)")
 
         # Query lifecycle

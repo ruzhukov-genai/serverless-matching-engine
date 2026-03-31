@@ -15,8 +15,6 @@ Read by the `benchmarking` skill. Do not duplicate general methodology here.
 ### AWS
 - **API:** `https://kpvhsf0ub8.execute-api.us-east-1.amazonaws.com`
 - **WebSocket:** `wss://2shnq9yk0c.execute-api.us-east-1.amazonaws.com/ws`
-- **Worker Lambda manage commands:** `aws lambda invoke --function-name serverless-matching-engine-worker`
-
 ## Benchmark Tool
 
 ```bash

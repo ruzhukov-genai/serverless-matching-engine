@@ -270,8 +270,18 @@ pub struct CreateOrderRequest {
 
 pub async fn create_order(
     State(s): State<AppState>,
+    maybe_ctx: Option<axum::extract::Extension<lambda_http::request::RequestContext>>,
     Json(req): Json<CreateOrderRequest>,
 ) -> HandlerResult<impl IntoResponse> {
+    let handler_start = std::time::Instant::now();
+    let apigw_epoch_ms: Option<i64> = maybe_ctx.and_then(|axum::extract::Extension(ctx)| {
+        if let lambda_http::request::RequestContext::ApiGatewayV2(ref r) = ctx {
+            Some(r.time_epoch)
+        } else {
+            None
+        }
+    });
+
     let user_id = req.user_id.unwrap_or_else(|| "user-1".to_string());
     let tif = req.tif.unwrap_or(TimeInForce::GTC);
     let stp_mode = req.stp_mode.unwrap_or(SelfTradePreventionMode::None);
@@ -327,6 +337,24 @@ pub async fn create_order(
             );
         }
     }
+
+    // ── Per-request timing instrumentation ───────────────────────────────────
+    // lambda_exec_ms: total handler time from entry to here (includes process_order_inline)
+    // apigw_to_lambda_ms: gap between API GW timestamping the request and handler entry
+    //   = wall-clock at handler entry - apigw_epoch
+    //   = (now - lambda_exec_ms) - apigw_epoch
+    let lambda_exec_ms = handler_start.elapsed().as_millis() as i64;
+    let now_epoch_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let apigw_to_lambda_ms = apigw_epoch_ms.map(|apigw| now_epoch_ms - lambda_exec_ms - apigw);
+    tracing::info!(
+        order_id = %order_id,
+        apigw_to_lambda_ms = ?apigw_to_lambda_ms,
+        lambda_exec_ms = lambda_exec_ms,
+        "request timing"
+    );
 
     Ok((
         StatusCode::CREATED,

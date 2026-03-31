@@ -212,29 +212,6 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
 
-  # ---- Worker Lambda Security Group ---------------------------------------
-  WorkerLambdaSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Lambda sme-worker - allows outbound to ElastiCache (Valkey) + RDS (PG)
-      VpcId: !Ref VPC
-      SecurityGroupEgress:
-        - IpProtocol: tcp
-          FromPort: 5432
-          ToPort: 5432
-          Description: PostgreSQL on RDS
-          DestinationSecurityGroupId: !Ref RDSSecurityGroup
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: 0.0.0.0/0
-          Description: HTTPS for ECR / CloudWatch
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-worker-lambda-sg'
-        - Key: Project
-          Value: !Ref ProjectName
-
   # ---- RDS Security Group -------------------------------------------------
   RDSSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -256,17 +233,6 @@ Resources:
           Value: !Sub '${ProjectName}-rds-sg'
         - Key: Project
           Value: !Ref ProjectName
-
-  # RDS ingress from Worker Lambda (added separately to avoid circular ref)
-  RDSIngressWorkerLambda:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref RDSSecurityGroup
-      IpProtocol: tcp
-      FromPort: 5432
-      ToPort: 5432
-      SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
-      Description: PostgreSQL from Worker Lambda
 
   # RDS SG self-referencing egress — required for RDS Proxy.
   # Proxy ENIs live in the same SG as RDS; proxy must open TCP to the DB backend.
@@ -319,17 +285,6 @@ Resources:
       SourceSecurityGroupId: !Ref LambdaSecurityGroup
       Description: Valkey from Gateway Lambda
 
-  # ElastiCache ingress from Worker Lambda
-  ElastiCacheIngressWorker:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref ElastiCacheSecurityGroup
-      IpProtocol: tcp
-      FromPort: 6379
-      ToPort: 6379
-      SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
-      Description: Valkey from Worker Lambda
-
   # ---- Lambda SG egress to ElastiCache (added separately to avoid circular refs) ----
 
   # Allow Gateway Lambda -> ElastiCache (6379)
@@ -342,17 +297,6 @@ Resources:
       ToPort: 6379
       DestinationSecurityGroupId: !Ref ElastiCacheSecurityGroup
       Description: Valkey on ElastiCache from Gateway Lambda
-
-  # Allow Worker Lambda -> ElastiCache (6379)
-  WorkerLambdaEgressElastiCache:
-    Type: AWS::EC2::SecurityGroupEgress
-    Properties:
-      GroupId: !Ref WorkerLambdaSecurityGroup
-      IpProtocol: tcp
-      FromPort: 6379
-      ToPort: 6379
-      DestinationSecurityGroupId: !Ref ElastiCacheSecurityGroup
-      Description: Valkey on ElastiCache from Worker Lambda
 
   # =========================================================================
   # VPC Endpoints — allow Lambda (in private subnets) to call AWS services
@@ -369,11 +313,6 @@ Resources:
           ToPort: 443
           SourceSecurityGroupId: !Ref LambdaSecurityGroup
           Description: HTTPS from Gateway Lambda
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          SourceSecurityGroupId: !Ref WorkerLambdaSecurityGroup
-          Description: HTTPS from Worker Lambda
       Tags:
         - Key: Name
           Value: !Sub '${ProjectName}-vpce-sg'
@@ -396,19 +335,6 @@ Resources:
     Properties:
       VpcId: !Ref VPC
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sts'
-      VpcEndpointType: Interface
-      PrivateDnsEnabled: true
-      SubnetIds:
-        - !Ref PrivateSubnetA
-        - !Ref PrivateSubnetB
-      SecurityGroupIds:
-        - !Ref VpcEndpointSecurityGroup
-
-  SqsVpcEndpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Properties:
-      VpcId: !Ref VPC
-      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sqs'
       VpcEndpointType: Interface
       PrivateDnsEnabled: true
       SubnetIds:
@@ -445,10 +371,6 @@ Outputs:
   LambdaSecurityGroupId:
     Description: Gateway Lambda security group ID
     Value: !Ref LambdaSecurityGroup
-
-  WorkerLambdaSecurityGroupId:
-    Description: Worker Lambda security group ID
-    Value: !Ref WorkerLambdaSecurityGroup
 
   RDSSecurityGroupId:
     Description: RDS security group ID

@@ -78,7 +78,6 @@ Resources:
         PrivateSubnetA: !GetAtt NetworkStack.Outputs.PrivateSubnetA
         PrivateSubnetB: !GetAtt NetworkStack.Outputs.PrivateSubnetB
         LambdaSecurityGroupId: !GetAtt NetworkStack.Outputs.LambdaSecurityGroupId
-        WorkerLambdaSecurityGroupId: !GetAtt NetworkStack.Outputs.WorkerLambdaSecurityGroupId
         RDSSecurityGroupId: !GetAtt NetworkStack.Outputs.RDSSecurityGroupId
         ElastiCacheSecurityGroupId: !GetAtt NetworkStack.Outputs.ElastiCacheSecurityGroupId
         PublicSubnetB: !GetAtt NetworkStack.Outputs.PublicSubnetB

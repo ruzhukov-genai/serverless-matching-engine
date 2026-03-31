@@ -1,0 +1,309 @@
+use anyhow::Result;
+use axum::{Router, routing::get};
+use deadpool_redis::Pool as RedisPool;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::broadcast;
+use tower_http::cors::CorsLayer;
+use tower_http::services::ServeDir;
+
+pub mod routes;
+pub mod worker;
+
+/// Per-key cache entry: watch channel for zero-contention reads + broadcast for WS fan-out.
+/// Values stored as Arc<str> — borrow() returns a refcount bump, zero allocation on read path.
+pub struct CacheEntry {
+    /// WS fan-out — subscribers get pushed new values (throttled to MAX_WS_BROADCASTS_PER_SEC)
+    broadcast_tx: broadcast::Sender<Arc<str>>,
+    /// Watch channel — REST handlers borrow() with zero allocation, no lock contention.
+    watch_tx: tokio::sync::watch::Sender<Option<Arc<str>>>,
+    watch_rx: tokio::sync::watch::Receiver<Option<Arc<str>>>,
+    /// Last time this key was broadcast to WS clients — for rate limiting
+    last_broadcast: std::sync::Mutex<std::time::Instant>,
+}
+
+/// Max WS broadcasts per key per second. Reduces fan-out from ~60/sec to 10/sec.
+const WS_BROADCAST_INTERVAL_MS: u128 = 100;
+
+/// Shared cache broadcasts — one poller per key, N subscribers.
+/// REST handlers read via watch::borrow() (zero contention, zero allocation).
+/// WS handlers subscribe to the broadcast channel.
+#[derive(Clone)]
+pub struct CacheBroadcasts {
+    pub entries: Arc<HashMap<String, Arc<CacheEntry>>>,
+}
+
+impl CacheBroadcasts {
+    /// Subscribe to updates for a cache key. Returns None if the key is unknown.
+    pub fn subscribe(&self, key: &str) -> Option<broadcast::Receiver<Arc<str>>> {
+        self.entries.get(key).map(|e| e.broadcast_tx.subscribe())
+    }
+
+    /// Get the last polled value for a cache key.
+    /// Uses watch::borrow() — returns Arc<str> clone (refcount bump only, zero allocation).
+    pub fn get_latest(&self, key: &str) -> Option<Arc<str>> {
+        self.entries.get(key).and_then(|e| e.watch_rx.borrow().clone())
+    }
+
+    /// Update a cache key. Watch channel (REST) always gets latest.
+    /// Broadcast channel (WS fan-out) is throttled to max 10/sec per key.
+    pub(crate) fn update(&self, key: &str, val: String) {
+        if let Some(e) = self.entries.get(key) {
+            let arc_val: Arc<str> = Arc::from(val);
+            // REST: always instant
+            let _ = e.watch_tx.send(Some(arc_val.clone()));
+            // WS: throttled — skip broadcast if <100ms since last
+            if let Ok(mut last) = e.last_broadcast.lock() {
+                if last.elapsed().as_millis() >= WS_BROADCAST_INTERVAL_MS {
+                    let _ = e.broadcast_tx.send(arc_val);
+                    *last = std::time::Instant::now();
+                }
+            }
+        }
+    }
+}
+
+/// Order dispatch mode — controls how gateway forwards orders to the worker.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DispatchMode {
+    /// LPUSH to Valkey queue (local dev / EC2 worker)
+    Queue,
+    /// Process order inline — matching runs in-process, no cross-Lambda invoke (production)
+    Inline,
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    pub redis: RedisPool,
+    /// Order events broadcast — single channel, WS clients filter by user_id
+    pub order_events_tx: broadcast::Sender<String>,
+    /// Shared cache broadcasts — one poller per key, N subscribers
+    pub cache: CacheBroadcasts,
+    /// Per-user TTL cache — avoids Valkey round-trips for orders/portfolio
+    pub user_cache: routes::UserCache,
+    /// Order dispatch mode: "inline" (prod, matching in-process), "queue" (local dev)
+    pub dispatch_mode: DispatchMode,
+}
+
+/// Subscribe to Valkey pub/sub channel for cache updates.
+async fn spawn_cache_subscriber(redis_url: String, cache: CacheBroadcasts) {
+    use deadpool_redis::redis::Client;
+    use futures_util::StreamExt;
+
+    loop {
+        let client = match Client::open(redis_url.as_str()) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to create redis client for pub/sub");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+
+        let mut pubsub = match client.get_async_pubsub().await {
+            Ok(ps) => ps,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to connect for pub/sub");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+
+        if let Err(e) = pubsub.subscribe(sme_shared::cache::CACHE_UPDATES_CHANNEL).await {
+            tracing::error!(error = %e, "failed to subscribe to cache_updates");
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            continue;
+        }
+
+        tracing::info!("cache subscriber connected to pub/sub channel");
+        let mut msg_stream = pubsub.on_message();
+
+        loop {
+            match msg_stream.next().await {
+                Some(msg) => {
+                    let payload: String = match msg.get_payload() {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    if let Some(newline_pos) = payload.find('\n') {
+                        let key = &payload[..newline_pos];
+                        let value = &payload[newline_pos + 1..];
+                        if !value.is_empty() && value != "{}" {
+                            cache.update(key, value.to_string());
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!("pub/sub stream ended, reconnecting...");
+                    break;
+                }
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// Slow fallback poller — refreshes all cache keys every 30s.
+async fn spawn_fallback_poller(pool: RedisPool, cache: CacheBroadcasts, keys: Vec<String>) {
+    use deadpool_redis::redis::AsyncCommands;
+    use tokio::time::{Duration, interval};
+
+    let mut ticker = interval(Duration::from_secs(30));
+    loop {
+        ticker.tick().await;
+        if let Ok(mut conn) = pool.get().await {
+            for key in &keys {
+                if let Ok(val) = conn.get::<_, String>(key).await {
+                    if !val.is_empty() && val != "{}" {
+                        cache.update(key, val);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Build the axum Router with all routes, middleware, and background tasks.
+/// Used by both the Lambda entrypoint (bootstrap) and local dev (sme-gateway).
+// Default worker_threads = num_cpus (2 on this machine).
+// Tested worker_threads=8: context-switch overhead on 2 vCPUs caused regression.
+pub async fn build_router() -> Result<Router> {
+    tracing::info!("sme-gateway starting");
+
+    let config = sme_shared::Config::from_env();
+    // Gateway needs fewer connections than default (200):
+    // - 15 cache pollers (transient checkout per interval)
+    // - Order LPUSH burst (~10 concurrent at peak)
+    // - Per-user fallback reads (declining with TTL cache)
+    let redis = sme_shared::cache::create_pool_sized(&config.redis_url, 30).await?;
+
+    let (order_events_tx, _) = broadcast::channel::<String>(1024);
+
+    // ── Build CacheBroadcasts ─────────────────────────────────────────────────
+    let pairs = ["BTC-USDT", "ETH-USDT", "SOL-USDT"];
+    let mut poll_specs: Vec<(String, u64)> = Vec::new();
+    for pair in &pairs {
+        poll_specs.push((format!("cache:orderbook:{}", pair), 500));
+        poll_specs.push((format!("cache:trades:{}", pair), 500));
+        poll_specs.push((format!("cache:ticker:{}", pair), 1000));
+    }
+    for key in &["cache:metrics", "cache:lock_metrics", "cache:throughput", "cache:latency_metrics", "cache:audit"] {
+        poll_specs.push((key.to_string(), 2000));
+    }
+    poll_specs.push(("cache:pairs".to_string(), 5000));
+
+    let mut entries: HashMap<String, Arc<CacheEntry>> = HashMap::new();
+    for (key, _interval_ms) in &poll_specs {
+        let (broadcast_tx, _) = broadcast::channel::<Arc<str>>(64);
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel::<Option<Arc<str>>>(None);
+        entries.insert(key.clone(), Arc::new(CacheEntry {
+            broadcast_tx,
+            watch_tx,
+            watch_rx,
+            last_broadcast: std::sync::Mutex::new(std::time::Instant::now()),
+        }));
+    }
+
+    let cache = CacheBroadcasts { entries: Arc::new(entries) };
+
+    // Warm cache: one-time GET for all keys (pub/sub only delivers new messages)
+    {
+        use deadpool_redis::redis::AsyncCommands;
+        if let Ok(mut conn) = redis.get().await {
+            for (key, _) in &poll_specs {
+                if let Ok(val) = conn.get::<_, String>(key).await {
+                    if !val.is_empty() && val != "{}" {
+                        cache.update(key, val);
+                    }
+                }
+            }
+        }
+        tracing::info!(keys = poll_specs.len(), "cache warmed from Valkey");
+    }
+
+    let all_keys: Vec<String> = poll_specs.iter().map(|(k, _)| k.clone()).collect();
+    tokio::spawn(spawn_cache_subscriber(config.redis_url.clone(), cache.clone()));
+    tokio::spawn(spawn_fallback_poller(redis.clone(), cache.clone(), all_keys));
+
+    let dispatch_mode = match std::env::var("ORDER_DISPATCH_MODE").as_deref() {
+        Ok("inline") => {
+            tracing::info!("order dispatch mode: inline (matching runs in-process, no cross-invoke)");
+            DispatchMode::Inline
+        }
+        _ => {
+            tracing::info!("order dispatch mode: queue (default, Valkey LPUSH)");
+            DispatchMode::Queue
+        }
+    };
+
+    let state = AppState {
+        redis: redis.clone(),
+        order_events_tx,
+        cache: cache.clone(),
+        user_cache: routes::UserCache::new(),
+        dispatch_mode,
+    };
+
+    let app = Router::new()
+        .route("/api/pairs", get(routes::list_pairs))
+        .route("/api/orderbook/{pair_id}", get(routes::get_orderbook))
+        .route("/api/trades/{pair_id}", get(routes::get_trades))
+        .route("/api/ticker/{pair_id}", get(routes::get_ticker))
+        .route("/api/orders", get(routes::list_orders).post(routes::create_order).delete(routes::cancel_all_orders))
+        .route(
+            "/api/orders/{order_id}",
+            axum::routing::delete(routes::cancel_order).put(routes::modify_order),
+        )
+        .route("/api/portfolio", get(routes::get_portfolio))
+        .route("/api/snapshot/{pair_id}", get(routes::get_snapshot))
+        .route("/api/stream/{pair_id}", get(routes::sse_stream))
+        .route("/ws/stream", get(routes::ws_stream))
+        .route("/ws/orderbook/{pair_id}", get(routes::ws_orderbook))
+        .route("/ws/trades/{pair_id}", get(routes::ws_trades))
+        .route("/ws/orders/{user_id}", get(routes::ws_orders))
+        .route("/api/metrics", get(routes::get_metrics))
+        .route("/api/metrics/locks", get(routes::get_lock_metrics))
+        .route("/api/metrics/throughput", get(routes::get_throughput))
+        .route("/api/metrics/latency", get(routes::get_latency_percentiles))
+        .route("/api/metrics/audit", get(routes::get_audit))
+        .route("/api/audit", get(routes::get_audit))
+        .route("/internal/manage", axum::routing::post(routes::internal_manage))
+        .nest_service("/trading", ServeDir::new("web/trading"))
+        .nest_service("/dashboard", ServeDir::new("web/dashboard"))
+        // CompressionLayer removed: on 2-vCPU machine, gzip CPU cost exceeds
+        // bandwidth savings for small cached JSON responses. Net regression.
+        .layer(CorsLayer::permissive())
+        .with_state(state);
+
+    // ── Gateway instrumentation — log request stats every 30s ───────────────
+    let request_count = Arc::new(AtomicU64::new(0));
+    let ws_connections = Arc::new(AtomicU64::new(0));
+    {
+        let req_count = request_count.clone();
+        let ws_conns = ws_connections.clone();
+        let cache_ref = cache.clone();
+        let pool_ref = redis.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                ticker.tick().await;
+                let reqs = req_count.swap(0, Ordering::Relaxed);
+                let ws = ws_conns.load(Ordering::Relaxed);
+                let pool_status = pool_ref.status();
+                let cache_keys = cache_ref.entries.len();
+                tracing::info!(
+                    requests_30s = reqs,
+                    ws_connections = ws,
+                    df_pool_size = pool_status.size,
+                    df_pool_available = pool_status.available,
+                    cache_keys = cache_keys,
+                    "[gateway-stats]"
+                );
+            }
+        });
+    }
+
+    Ok(app)
+}
